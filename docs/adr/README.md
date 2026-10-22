@@ -7,9 +7,9 @@
 |---|---|---|
 | ADR-01 | 从零开发，不迁移旧 Codex 代码 | 已定 |
 | ADR-02 | 服务器常驻交易核心 + 瘦客户端，所有数据存服务器 | 已定 |
-| ADR-03 | Python 3.12 + asyncio，FastAPI + Pydantic v2，Polars/pandas | 待确认 |
+| ADR-03 | Python 3.12 + asyncio，FastAPI + Pydantic v2，Polars/pandas；domain 层模型用 Pydantic v2 | 已定（2026-10-22） |
 | ADR-04 | Tauri 原生桌面 App 为主形态（同一套 React 前端），服务独立常驻 | 已定（修订，见 [ADR-04-desktop-client.md](ADR-04-desktop-client.md)） |
-| ADR-05 | SQLite（WAL、FULL）存账本；Parquet + DuckDB 存行情 | 待确认 |
+| ADR-05 | SQLite（WAL、FULL）存账本，SQLAlchemy Core + Alembic 迁移（不用 ORM）；Parquet + DuckDB 存行情 | 已定（2026-10-22） |
 | ADR-06 | 首家券商 IBKR，ib_async，经 BrokerAdapter 隔离；先用 TWS 自动连接（模拟盘端口白名单），IBC 后置；开发期延迟行情开关 | 已定（修订，见 [ADR-06-ibkr-tws.md](ADR-06-ibkr-tws.md)） |
 | ADR-07 | 回测数据供应商待选；M1 先用 IBKR 历史数据 | 待确认 |
 | ADR-08 | 自研薄回测引擎，复用 OMS、风控与 FakeBroker | 待确认 |
