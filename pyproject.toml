@@ -114,6 +114,16 @@ forbidden_modules = ["server.broker"]
 # 只限直接 import：risk 需要调用 oms 的提交入口，而 oms 依赖 broker
 allow_indirect_imports = true
 
+[[tool.importlinter.contracts]]
+id = "fake-broker-test-only"
+name = "FakeBroker 只给 backtest 与测试用（B-02）：其他包不能借它的控制面绕过 clientId 隔离与撤单保护"
+type = "forbidden"
+source_modules = [
+    "server.domain", "server.storage", "server.ipc", "server.oms", "server.risk",
+    "server.data", "server.strategy", "server.ai", "server.api", "server.guard",
+]
+forbidden_modules = ["server.broker.fake"]
+
 # ---------- pytest ----------
 [tool.pytest.ini_options]
 minversion = "8.4"

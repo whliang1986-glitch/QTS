@@ -41,3 +41,8 @@ def test_broker_allowlist_covers_every_layer() -> None:
     allowed = {a.split("/", 1)[0] for a in BROKER_IMPORT_ALLOWED}
     assert sources.isdisjoint(allowed)
     assert sources | allowed == set(KNOWN_LAYERS), "有分层既不在禁止列表也不在允许列表"
+
+
+def test_fake_broker_contract_covers_every_layer_but_broker_and_backtest() -> None:
+    sources = _layers(_contracts()["fake-broker-test-only"]["source_modules"])
+    assert sources == set(KNOWN_LAYERS) - {"broker", "backtest"}

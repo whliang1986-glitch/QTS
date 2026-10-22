@@ -210,6 +210,7 @@ class ErrorCategory(StrEnum):
     RESTART_WINDOW = "RESTART_WINDOW"
     RATE_LIMITED = "RATE_LIMITED"
     CONNECTIVITY = "CONNECTIVITY"
+    CANCEL_REJECTED = "CANCEL_REJECTED"  # 撤单无效（已成交、已到期等）
     OTHER = "OTHER"
 
 
@@ -250,6 +251,8 @@ class BrokerExecution(ValueModel):
     price: Price
     commission: Money | None = None
     executed_at: UtcDatetime
+    # 成交更正：指向被更正的 execution_id，OMS 冲正原成交后按本笔入账（B-02）
+    corrects: Identifier | None = None
 
 
 class ExecutionReport(ValueModel):

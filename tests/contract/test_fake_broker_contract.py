@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 from server.broker.base import BrokerAdapter, OrderTicket
-from server.broker.fake.broker import FakeBroker
+from server.broker.fake.broker import FakeBroker, FakeBrokerServer
 from server.domain.account import Account
 from server.domain.enums import AccountType, AssetClass, Side
 from server.domain.instrument import Instrument
@@ -52,7 +52,8 @@ class FakeDriver:
 class TestFakeBrokerContract(BrokerContract):
     @pytest.fixture
     def adapter(self) -> BrokerAdapter:
-        return FakeBroker(ACCOUNT)
+        # 契约只验证接口行为：关掉现金账户卖单检查，以便挂无持仓的止损单验证撤单保护
+        return FakeBroker(FakeBrokerServer(ACCOUNT, reject_uncovered_sells=False))
 
     @pytest.fixture
     def driver(self) -> MarketDriver:
