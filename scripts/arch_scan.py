@@ -9,6 +9,7 @@
 - cancel-exit：撤单方法名只能在 server/oms、server/guard 使用（broker 委托除外）。
 - global-cancel：全局撤单在任何包都禁止（会撤掉保护性止损，V4.1 7.6）。
 - risk-bypass：oms 的订单提交入口只能在 server/risk（及 oms 自身）使用。
+- mode-write：账本的模式变更写入只能在 server/risk/mode_manager.py（及 storage 自身）使用。
 - broker-forwarder：broker 包内的受保护名称只能出现在受保护名函数中，且该函数的允许调用方
   必须是被使用名称允许调用方的子集；broker 包内不得定义模块级 __getattr__；
   受保护名函数只能使用白名单装饰器。
@@ -51,6 +52,9 @@ CATEGORIES: dict[str, frozenset[str]] = {
     "cancel": frozenset({"cancel_order", "cancelOrder"}),
     "global-cancel": frozenset({"reqGlobalCancel", "global_cancel", "cancel_all_orders"}),
     "submit": frozenset({"submit_approved_intent"}),
+    # 模式变更只能经 ModeManager 写入账本（C-04）
+    # 以及账户类型基线所用的审计动作名（防止其他模块写同名审计伪造基线）
+    "mode-write": frozenset({"append_mode_change", "commit_mode_and_audits", "account_observed"}),
 }
 NAME_CATEGORY = {name: cat for cat, names in CATEGORIES.items() for name in names}
 CATEGORY_RULE = {
@@ -58,18 +62,21 @@ CATEGORY_RULE = {
     "cancel": "cancel-exit",
     "global-cancel": "global-cancel",
     "submit": "risk-bypass",
+    "mode-write": "mode-write",
 }
 CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "order": ("oms", "broker"),
     "cancel": ("oms", "guard", "broker"),
     "global-cancel": (),
     "submit": ("risk", "oms"),
+    "mode-write": ("storage", "risk/mode_manager.py"),
 }
 CATEGORY_HINT = {
     "order": "只能在 server/oms 中使用",
     "cancel": "只能在 server/oms 或 server/guard 中使用",
     "global-cancel": "任何包都不得使用全局撤单",
     "submit": "只能由 server/risk 调用",
+    "mode-write": "只能由 server/risk/mode_manager.py 调用",
 }
 # broker 包内受保护名函数允许使用的装饰器
 BROKER_DECORATOR_ALLOWLIST = frozenset(

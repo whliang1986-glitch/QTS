@@ -117,5 +117,7 @@ mode_changes = Table(
 LEDGER_TABLES = frozenset(metadata.tables)
 # 每张账本表必须存在的触发器；打开账本时缺一个即拒绝（防止迁移重建表时触发器丢失）
 LEDGER_TRIGGERS = frozenset(
-    f"{table}_no_{op}" for table in LEDGER_TABLES for op in ("update", "delete", "replace")
+    {f"{table}_no_{op}" for table in LEDGER_TABLES for op in ("update", "delete", "replace")}
+    # 迁移 0002：G7 之前账本里不得出现实盘模式（解除需要 Dylan 批准的新迁移）
+    | {"mode_changes_no_live"}
 )

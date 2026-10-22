@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -371,7 +371,52 @@ class LedgerRepository:
             row = conn.execute(stmt).first()
             return None if row is None else AuditEvent.model_validate_json(row.payload)
 
+    def audits(self, action: str) -> list[AuditEvent]:
+        """某类审计事件，按写入顺序从新到旧。"""
+        t = schema.audit_events
+        stmt = select(t.c.payload).where(t.c.action == action).order_by(t.c.seq.desc())
+        with self._reading("audit_events") as conn:
+            return [AuditEvent.model_validate_json(p) for (p,) in conn.execute(stmt)]
+
     # ---------- 模式与急停 ----------
+
+    def commit_mode_and_audits(
+        self,
+        audits: Sequence[AuditEvent],
+        change: tuple[str, Mode, HaltState, datetime, str] | None = None,
+    ) -> None:
+        """在同一个事务里写入（可选的）模式变更与若干审计事件：要么全部落盘，要么全部不落盘。
+
+        change 为（change_id, mode, halt, at, actor）。供 ModeManager 使用，
+        避免“审计已写、HALT 未写”这类中间状态（C-04 评审 B1、I8）。
+        任何键重复或数据库错误都抛 StorageError，整体回滚。
+        """
+        try:
+            with self._engine.begin() as conn:
+                if change is not None:
+                    change_id, mode, halt, at, actor = change
+                    conn.execute(
+                        schema.mode_changes.insert().values(
+                            change_id=change_id,
+                            mode=Mode(mode).value,
+                            halt=halt.model_dump_json(),
+                            changed_at=_iso(at),
+                            actor=actor,
+                        )
+                    )
+                for event in audits:
+                    conn.execute(
+                        schema.audit_events.insert().values(
+                            event_id=event.event_id,
+                            occurred_at=_iso(event.occurred_at),
+                            actor=event.actor,
+                            action=event.action,
+                            correlation_id=event.correlation_id,
+                            payload=event.model_dump_json(),
+                        )
+                    )
+        except DBAPIError as exc:
+            raise StorageError(f"写入模式与审计失败，已整体回滚：{exc.orig}") from exc
 
     def append_mode_change(
         self, change_id: str, mode: Mode, halt: HaltState, at: datetime, actor: str

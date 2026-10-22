@@ -352,6 +352,19 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "object.__setattr__(oi, 'side', 'SELL')\n",
         "dynamic-call",
     ),
+    # ---- C-04：模式变更只能经 ModeManager ----
+    "oms 直接写模式": ("server/oms/o.py", "repo.append_mode_change(c, m, h, t, a)\n", "mode-write"),
+    "risk 其他模块写模式": (
+        "server/risk/rules.py",
+        "repo.commit_mode_and_audits([], change)\n",
+        "mode-write",
+    ),
+    "其他模块伪造账户观察审计": (
+        "server/oms/o.py",
+        "repo.append_audit(AuditEvent(action='account_observed'))\n",
+        "dynamic-name",
+    ),
+    "api 直接写模式": ("server/api/r.py", "repo.commit_mode_and_audits(a)\n", "mode-write"),
     # ---- 失败即关闭 ----
     "语法错误": ("server/strategy/s.py", "def broken(:\n", "parse-error"),
 }
@@ -433,6 +446,10 @@ ALLOWED: dict[str, tuple[str, str]] = {
         "from pydantic import BaseModel\n",
     ),
     "strategy 读系统时钟不受 domain 规则约束": ("server/strategy/s.py", "x = datetime.now(UTC)\n"),
+    "ModeManager 写模式": (
+        "server/risk/mode_manager.py",
+        "self._repo.commit_mode_and_audits(a, c)\n",
+    ),
     "F16 builtins 前缀的普通名字": ("server/data/d.py", "builtins_cache.get(k)\nrunpy_like = 1\n"),
 }
 

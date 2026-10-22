@@ -481,3 +481,29 @@ def test_reads_on_broken_database_raise_storage_error(tmp_path: Path) -> None:
         conn.commit()
     with pytest.raises(StorageError):
         repo.order_history("int-1")
+
+
+# ---------- C-04：数据库层禁止实盘模式、模式与审计原子写入 ----------
+
+
+@pytest.mark.parametrize("mode", ["ASSISTED_LIVE", "LIMITED_AUTO_LIVE"])
+def test_live_modes_cannot_be_written_even_directly(db_path: Path, mode: str) -> None:
+    with raw(db_path) as conn, pytest.raises(sqlite3.IntegrityError, match="G7"):
+        conn.execute(
+            "INSERT INTO mode_changes (change_id, mode, halt, changed_at, actor) "
+            f"VALUES ('x', '{mode}', '{{}}', 'x', 'x')"
+        )
+
+
+def test_commit_mode_and_audits_is_atomic(repo: LedgerRepository) -> None:
+    repo.append_audit(make_audit())  # 占用 event_id a1
+    halt = HaltState(halted=True, reason="r", since=T0, set_by="dylan")
+    fresh = AuditEvent(event_id="a2", occurred_at=T0, actor="x", action="halt", correlation_id="c")
+    with pytest.raises(StorageError, match="回滚"):
+        repo.commit_mode_and_audits([fresh, make_audit()], ("mc-9", Mode.HALT, halt, T0, "dylan"))
+    assert repo.latest_mode() is None  # 模式变更随审计一起回滚
+    assert repo.latest_audit("halt") is None
+    repo.commit_mode_and_audits([fresh], ("mc-9", Mode.HALT, halt, T0, "dylan"))
+    latest = repo.latest_mode()
+    assert latest is not None and latest.mode is Mode.HALT
+    assert [a.event_id for a in repo.audits("halt")] == ["a2"]
