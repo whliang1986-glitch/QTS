@@ -6,6 +6,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.14,<2",
     "exchange-calendars>=4.13,<5",
+    "keyring>=25,<26",
     "pandas>=3.0,<4",
     "pydantic>=2.11,<3",
     "sqlalchemy>=2.0.36,<2.1",
