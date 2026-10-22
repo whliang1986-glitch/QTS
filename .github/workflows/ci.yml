@@ -40,6 +40,12 @@ jobs:
       - name: mypy
         run: uv run mypy
 
+      - name: import-linter 分层依赖契约
+        run: uv run lint-imports --config pyproject.toml --no-logo
+
+      - name: 唯一下单出口与风控绕过扫描
+        run: uv run python scripts/arch_scan.py
+
       - name: pytest
         run: uv run pytest --cov --cov-report=term-missing
 

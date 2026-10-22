@@ -57,6 +57,20 @@ repos:
         pass_filenames: false
         types: [python]
 
+      - id: lint-imports
+        name: import-linter 分层依赖契约
+        entry: uv run --no-sync lint-imports --config pyproject.toml --no-logo
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: arch-scan
+        name: 唯一下单出口与风控绕过扫描
+        entry: uv run --no-sync python scripts/arch_scan.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
       - id: arch-tests
         name: 架构与受保护路径测试
         entry: uv run --no-sync pytest -q tests/arch

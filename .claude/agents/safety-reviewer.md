@@ -17,7 +17,8 @@ tools: Read, Grep, Glob
 6. 订单类别：开仓、减仓、保护性止损三类创建后不可修改；撤单与急停默认不撤保护性止损；不使用全局撤单。
 7. 默认禁用：做空、杠杆、衍生品、市价单默认拒绝（保护性止损专项豁免除外）。
 8. 受保护路径：没有改动 config/risk、config/live、secrets/，也没有削弱 .claude/settings.json、.claude/hooks、
-   scripts/check_protected_paths.py、.pre-commit-config.yaml、CI 中的任何检查。
+   scripts/check_protected_paths.py、scripts/arch_scan.py、pyproject.toml 的 [tool.importlinter]、
+   .pre-commit-config.yaml、CI 中的任何检查。
 9. 密钥与日志：代码、测试、日志、提示词中没有密钥或账号明文。
 10. 测试真实性：任务单要求的失败场景都有测试；没有用 mock 冒充 IBKR 真实联调；跳过的测试已说明原因。
 11. 实盘隔离：没有新增连接实盘账户或切换到 ASSISTED_LIVE / LIMITED_AUTO_LIVE 的路径。

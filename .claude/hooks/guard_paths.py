@@ -69,7 +69,14 @@ CD_CONFIG_RE = re.compile(
     r"(?:[\\/]+(?:risk|live))?[\\/]*[\"']?(?=$|[\s;&|)])",
     re.IGNORECASE,
 )
-BYPASS_RE = re.compile(r"--no-verify|ALLOW_PROTECTED_CONFIG|\bcommit\b[^|;&]*\s-n\b", re.IGNORECASE)
+# 绕过提交钩子的写法：--no-verify、改 core.hooksPath、pre-commit 的 SKIP=，以及 git commit 的 -n
+# （含 -an 组合短选项与 -c alias.x=commit 别名）。-n 只在同一段 git ... commit 命令内匹配，
+# 避免 pre-commit-config.yaml 与 sed -n 这类无关组合误报
+BYPASS_RE = re.compile(
+    r"--no-verify|ALLOW_PROTECTED_CONFIG|core\.hooksPath|(?:^|[\s;&|(])(?-i:SKIP)="
+    r"|\bgit\b[^|;&\n]*\bcommit\b[^|;&\n]*\s-[a-z]*n[a-z]*\b",
+    re.IGNORECASE,
+)
 SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;&\n]")
 
 
@@ -122,7 +129,10 @@ def _segment_is_read_only(segment: str) -> bool:
 
 def check_command(command: str) -> str | None:
     if BYPASS_RE.search(command):
-        return "命令试图绕过提交钩子或受保护路径检查（--no-verify / ALLOW_PROTECTED_CONFIG）"
+        return (
+            "命令试图绕过提交钩子或受保护路径检查"
+            "（--no-verify、commit -n、core.hooksPath、SKIP=、ALLOW_PROTECTED_CONFIG）"
+        )
     if SECRETS_RE.search(command):
         return "命令涉及 secrets/，Claude Code 不得读取或写入密钥目录"
     mentions_config = PROTECTED_CONFIG_RE.search(command) or CD_CONFIG_RE.search(command)

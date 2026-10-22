@@ -122,6 +122,13 @@ BLOCKED_COMMANDS = [
     "ls secrets",
     "git commit --no-verify -m x",
     "git commit -n -m x",
+    "git commit -an -m x",
+    "git -c core.x=y commit -m x -n",
+    "cd repo && git commit -nm x",
+    "git -c alias.ci=commit ci -n",
+    "git -c alias.x='commit -n' x",
+    "git -c core.hooksPath=/dev/null commit -m x",
+    "SKIP=arch-scan,lint-imports git commit -m x",
     "ALLOW_PROTECTED_CONFIG=1 git commit -m x",
     "find config/risk -delete",
 ]
@@ -141,6 +148,11 @@ ALLOWED_COMMANDS = [
     "grep -n leverage config/risk/parameters.yaml | head -5",
     "uv run pre-commit run detect-secrets",  # 连字符名称不算 secrets 路径
     "git status",
+    # 曾误报：文件名含 commit，同一命令里另有 sed -n
+    "python fix.py .pre-commit-config.yaml; sed -n 1,5p a.py",
+    "git commit -m 'F-03: 架构扫描'",
+    "pre-commit run --all-files && git log -n 3",
+    "python -c 'pd.read_csv(f, skip=1)'",  # SKIP= 只认大写的环境变量
 ]
 
 

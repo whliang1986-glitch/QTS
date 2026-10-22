@@ -13,6 +13,7 @@ dev = [
     "pytest-asyncio>=1.2",
     "pytest-cov>=7.0",
     "hypothesis>=6.140",
+    "import-linter>=2.5",
 ]
 
 [build-system]
@@ -46,6 +47,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S603", "S607", "PLR0913"]
+"tests/arch/test_order_exit_scan.py" = ["E501"]  # 用例表一行一条更易读
 "scripts/**" = ["T20", "S603", "S607"]
 ".claude/hooks/**" = ["T20", "S603", "S607"]
 
@@ -56,6 +58,42 @@ strict = true
 files = ["server", "tests", "scripts", ".claude/hooks"]
 warn_unreachable = true
 explicit_package_bases = true
+
+# ---------- import-linter（F-03）----------
+# 分层依赖规则，CI 中 `uv run lint-imports` 违规即失败。调用级规则（唯一下单出口、
+# 不得绕过风控、券商 SDK 隔离）由 scripts/arch_scan.py 负责。
+[tool.importlinter]
+root_package = "server"
+
+[[tool.importlinter.contracts]]
+id = "domain-independent"
+name = "domain 不得依赖任何其他层"
+type = "forbidden"
+source_modules = ["server.domain"]
+forbidden_modules = [
+    "server.storage", "server.ipc", "server.broker", "server.oms", "server.risk",
+    "server.data", "server.strategy", "server.backtest", "server.ai", "server.api",
+    "server.guard",
+]
+
+[[tool.importlinter.contracts]]
+id = "no-broker-from-decision-layers"
+name = "strategy、ai、api 不得依赖 broker（直接或间接）"
+type = "forbidden"
+source_modules = ["server.strategy", "server.ai", "server.api"]
+forbidden_modules = ["server.broker"]
+
+[[tool.importlinter.contracts]]
+id = "broker-importers-allowlist"
+name = "只有 oms、guard、backtest、data 可以直接 import broker"
+type = "forbidden"
+source_modules = [
+    "server.domain", "server.storage", "server.ipc", "server.risk",
+    "server.strategy", "server.ai", "server.api",
+]
+forbidden_modules = ["server.broker"]
+# 只限直接 import：risk 需要调用 oms 的提交入口，而 oms 依赖 broker
+allow_indirect_imports = true
 
 # ---------- pytest ----------
 [tool.pytest.ini_options]

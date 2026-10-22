@@ -9,4 +9,7 @@
 /.claude/               @whliang1986-glitch
 /.github/               @whliang1986-glitch
 /scripts/check_protected_paths.py @whliang1986-glitch
+/scripts/arch_scan.py   @whliang1986-glitch
+/tests/arch/            @whliang1986-glitch
+/pyproject.toml         @whliang1986-glitch
 /CLAUDE.md              @whliang1986-glitch

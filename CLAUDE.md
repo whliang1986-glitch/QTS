@@ -51,7 +51,13 @@ docs/              adr specs tasks runbooks gates
 .claude/           权限规则、钩子、子代理
 ```
 
-依赖规则：domain 不 import 其他层；strategy、ai、api 不 import broker。F-03 起由 import-linter 在 CI 强制。
+依赖规则（F-03，CI 与 pre-commit 强制）：
+- import-linter（`pyproject.toml` 的 `[tool.importlinter]`）：domain 不依赖其他层；strategy、ai、api 不依赖 broker
+  （含间接，共享类型放 domain）；只有 oms、guard、backtest、data 可以直接 import broker。
+- `scripts/arch_scan.py`：下单/改单只在 oms，撤单只在 oms 与 guard，禁止全局撤单；oms 提交入口只由 risk 调用；
+  只有 risk、backtest 可 import oms；ib_async 只在 broker/ibkr。oms 以外反射只允许字面量直接调用
+  （不要写 `getattr(x, name)`、`dir()`、`__dict__`）。受保护名（如 `cancel_order`）不要用作变量或枚举值。
+  B-01、O-01、R-01 定接口时同步更新其名称常量；豁免表 `DYNAMIC_EXEMPTIONS` 需 Dylan 批准。
 
 ## 常用命令
 
@@ -62,6 +68,8 @@ uv run pytest -q tests/arch      # 架构与受保护路径测试
 uv run ruff check . --fix        # lint
 uv run ruff format .             # 格式化
 uv run mypy                      # 类型检查（strict）
+uv run lint-imports              # 分层依赖契约
+uv run python scripts/arch_scan.py  # 唯一下单出口扫描
 pre-commit run --all-files       # 提交前全套检查（含 gitleaks）
 ```
 
