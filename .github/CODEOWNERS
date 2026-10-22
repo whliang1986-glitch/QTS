@@ -1,0 +1,12 @@
+# 资金安全相关路径的修改必须由 Dylan 批准（V4.1 12.1）。
+# 需要在 GitHub 仓库设置中为 main 打开 “Require review from Code Owners” 才生效。
+*                       @whliang1986-glitch
+/config/                @whliang1986-glitch
+/server/risk/           @whliang1986-glitch
+/server/oms/            @whliang1986-glitch
+/server/guard/          @whliang1986-glitch
+/server/broker/         @whliang1986-glitch
+/.claude/               @whliang1986-glitch
+/.github/               @whliang1986-glitch
+/scripts/check_protected_paths.py @whliang1986-glitch
+/CLAUDE.md              @whliang1986-glitch

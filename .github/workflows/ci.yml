@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: 检查（${{ matrix.os }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.4"
+          enable-cache: true
+
+      - name: 安装依赖（锁文件必须最新）
+        run: uv sync --locked
+
+      - name: ruff check
+        run: uv run ruff check . --output-format github
+
+      - name: ruff format
+        run: uv run ruff format --check .
+
+      - name: mypy
+        run: uv run mypy
+
+      - name: pytest
+        run: uv run pytest --cov --cov-report=term-missing
+
+  secret-scan:
+    name: gitleaks 全历史扫描
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 安装 gitleaks
+        run: |
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version
+
+      - name: 扫描
+        run: ./gitleaks git . --redact --no-banner --exit-code 1
+
+      - name: 确认扫描器能拦截测试密钥
+        run: |
+          mkdir -p /tmp/canary
+          printf 'TOKEN = "%s_%s"\n' ghp R7xQ2mVt9LpZ4kHs8NbWc3YdJf6Ug1Ae5Ko0 > /tmp/canary/settings.py
+          if ./gitleaks dir /tmp/canary --no-banner --redact --exit-code 1; then
+            echo "gitleaks 没有拦截测试密钥" && exit 1
+          fi
+
+  protected-paths:
+    name: 受保护路径未被提交
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: secrets/ 不得入库
+        run: |
+          if git ls-files | grep -iE '(^|/)secrets/'; then
+            echo "仓库中出现 secrets/ 下的文件" && exit 1
+          fi

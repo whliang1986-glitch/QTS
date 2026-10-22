@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# 前端
+node_modules/
+web/dist/
+
+# 密钥与本地数据：永不入库
+secrets/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+data/
+lake/
+logs/
+spool/
+backups/
+
+# 本机 Claude Code 个人设置
+.claude/settings.local.json
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+~$*
