@@ -3,7 +3,11 @@ name = "quant"
 version = "0.0.1"
 description = "AI 量化自动交易系统：服务器常驻交易核心（tradingd / apid / workerd / guardd）"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "alembic>=1.14,<2",
+    "pydantic>=2.11,<3",
+    "sqlalchemy>=2.0.36,<2.1",
+]
 
 [dependency-groups]
 dev = [
@@ -58,6 +62,12 @@ strict = true
 files = ["server", "tests", "scripts", ".claude/hooks"]
 warn_unreachable = true
 explicit_package_bases = true
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
 
 # ---------- import-linter（F-03）----------
 # 分层依赖规则，CI 中 `uv run lint-imports` 违规即失败。调用级规则（唯一下单出口、

@@ -326,6 +326,32 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "dynamic-call",
     ),
     "X3 __builtins__": ("server/strategy/s.py", "__builtins__['getattr'](b, n)\n", "dynamic-call"),
+    # ---- C-01：domain 无 I/O、无时钟 ----
+    "domain 导入 sqlite3": ("server/domain/x.py", "import sqlite3\n", "domain-io"),
+    "domain 导入 os.path": ("server/domain/x.py", "import os.path\n", "domain-io"),
+    "domain from pathlib": ("server/domain/x.py", "from pathlib import Path\n", "domain-io"),
+    "domain 导入 time": ("server/domain/x.py", "import time\n", "domain-io"),
+    "domain 导入 logging": ("server/domain/x.py", "import logging\n", "domain-io"),
+    "domain 读系统时钟 now": (
+        "server/domain/x.py",
+        "from datetime import datetime\nx = datetime.now(UTC)\n",
+        "domain-clock",
+    ),
+    "domain 读系统时钟 today": ("server/domain/x.py", "x = date.today()\n", "domain-clock"),
+    "domain 字面量 getattr 取 now": (
+        "server/domain/x.py",
+        "x = getattr(datetime, 'now')()\n",
+        "domain-clock",
+    ),
+    "domain 导入白名单外模块 pickle": ("server/domain/x.py", "import pickle\n", "domain-io"),
+    "domain 导入白名单外模块 zoneinfo": ("server/domain/x.py", "import zoneinfo\n", "domain-io"),
+    "domain 使用内置 open": ("server/domain/x.py", "open('x').read()\n", "domain-io"),
+    "domain 使用内置 print": ("server/domain/x.py", "print(1)\n", "domain-io"),
+    "object.__setattr__ 改冻结对象": (
+        "server/strategy/s.py",
+        "object.__setattr__(oi, 'side', 'SELL')\n",
+        "dynamic-call",
+    ),
     # ---- 失败即关闭 ----
     "语法错误": ("server/strategy/s.py", "def broken(:\n", "parse-error"),
 }
@@ -397,6 +423,16 @@ ALLOWED: dict[str, tuple[str, str]] = {
         "import abc\nclass A(abc.ABC):\n    @abc.abstractmethod\n    def place_order(self, o): ...\n",
     ),
     "字面量 hasattr": ("server/api/r.py", "hasattr(model, 'id')\n"),
+    "domain 字段名与内置同名": (
+        "server/domain/x.py",
+        "class Bar:\n    open: int\n    x = self.open\n",
+    ),
+    "domain 用纯计算标准库与 pydantic": (
+        "server/domain/x.py",
+        "from datetime import UTC, datetime\nfrom decimal import Decimal\nfrom enum import StrEnum\n"
+        "from pydantic import BaseModel\n",
+    ),
+    "strategy 读系统时钟不受 domain 规则约束": ("server/strategy/s.py", "x = datetime.now(UTC)\n"),
     "F16 builtins 前缀的普通名字": ("server/data/d.py", "builtins_cache.get(k)\nrunpy_like = 1\n"),
 }
 

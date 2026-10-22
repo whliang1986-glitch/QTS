@@ -20,6 +20,8 @@
 - broker-import / oms-import / domain-import：静态导入白名单（含相对导入、`server.xxx`
   属性访问、导入函数的字面量参数；导入 server 根包视为导入全部分层）。
 - broker-sdk：ib_async / ib_insync 只能在 server/broker/ibkr 中导入。
+- domain-io：domain 只能导入白名单内的纯计算模块，不得使用 open / print / exec 等内置 I/O。
+- domain-clock：domain 不得读取系统时钟（.now / .utcnow / .today，含字符串形式），时间由调用方传入。
 - parse-error：无法解析的文件或相对导入按违规处理。
 
 受保护名称与豁免表集中在下面的常量里；B-01（BrokerAdapter）与 O-01 / R-01（oms 提交入口）
@@ -81,6 +83,20 @@ OMS_IMPORT_ALLOWED = ("oms", "risk", "backtest")
 SDK_ALLOWED = ("broker/ibkr",)
 BROKER_SDKS = frozenset({"ib_async", "ib_insync"})
 
+# ---- domain 无 I/O、无时钟（C-01）：导入白名单，新模块默认拒绝 ----
+DOMAIN_ALLOWED_MODULES = frozenset(
+    {
+        "__future__", "typing", "typing_extensions", "decimal", "datetime", "enum",
+        "dataclasses", "abc", "collections", "functools", "itertools", "re", "math",
+        "types", "pydantic", "annotated_types", "server",
+    }
+)  # fmt: skip
+# 不经 import 就能做 I/O 或执行代码的内置名
+DOMAIN_FORBIDDEN_BUILTINS = frozenset(
+    {"open", "input", "print", "exec", "eval", "compile", "breakpoint"}
+)
+DOMAIN_CLOCK_ATTRS = frozenset({"now", "utcnow", "today"})
+
 # ---- 反射原语 ----
 DYNAMIC_ALLOWED = ("oms",)
 # 登记的豁免：{"server/storage/mapping.py:to_row"}，需 Dylan 审批（CODEOWNERS）
@@ -104,7 +120,9 @@ REFLECTION: dict[str, tuple[int, ...] | None] = {
     "locals": None,
 }
 IMPORT_FUNCS = frozenset({"__import__", "import_module", "resolve_name"})
-FORBIDDEN_ATTRS = frozenset({"__dict__", "__getattribute__", "modules"})
+FORBIDDEN_ATTRS = frozenset(
+    {"__dict__", "__getattribute__", "__setattr__", "__delattr__", "modules"}
+)
 FORBIDDEN_MODULE_PREFIXES = ("runpy", "importlib.util", "builtins")
 # 以属性名为参数的反射函数：字面量参数也不得是 dunder 或敏感属性（getattr(x, "__dict__")）
 ATTR_NAME_FUNCS = frozenset({"getattr", "setattr", "delattr", "hasattr", "getattr_static"})
@@ -167,6 +185,7 @@ class _Visitor(ast.NodeVisitor):
         self.rel = rel
         self.found: list[Violation] = []
         self.in_broker = _in(rel, ("broker",))
+        self.in_domain = _in(rel, ("domain",))
         self.dynamic_ok = _in(rel, DYNAMIC_ALLOWED)
         self.functions: list[str] = []
         self.server_aliases = server_aliases
@@ -204,6 +223,8 @@ class _Visitor(ast.NodeVisitor):
     def _check_import_target(self, node: ast.AST, module: str) -> None:
         if _top(module) in BROKER_SDKS and not _in(self.rel, SDK_ALLOWED):
             self._add(node, "broker-sdk", f"{module} 只能在 server/broker/ibkr 中导入")
+        if self.in_domain and _top(module) not in DOMAIN_ALLOWED_MODULES:
+            self._add(node, "domain-io", f"domain 不得导入 {module}（领域层只允许纯计算模块）")
         parts = module.split(".")
         if parts[0] != "server":
             return
@@ -296,6 +317,13 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name) -> None:
         self._check_name_use(node, node.id)
+        # 只看读取：字段定义 `open: Price` 是赋值目标，不是在用内置 open
+        if (
+            self.in_domain
+            and node.id in DOMAIN_FORBIDDEN_BUILTINS
+            and isinstance(node.ctx, ast.Load)
+        ):
+            self._add(node, "domain-io", f"domain 不得使用内置 {node.id}")
         # 裸名（含 from inspect import getmembers 引入的）只要不是已核准的字面量直接调用就报
         if (
             node.id in REFLECTION and id(node) not in self.ok_reflection
@@ -304,6 +332,10 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         self._check_name_use(node, node.attr)
+        if self.in_domain and node.attr in DOMAIN_CLOCK_ATTRS:
+            self._add(
+                node, "domain-clock", f"domain 不得读取系统时钟（.{node.attr}），时间由调用方传入"
+            )
         if isinstance(node.value, ast.Name) and node.value.id in self.server_aliases:
             self._check_import_target(node, f"server.{node.attr}")
         dotted = _dotted(node) or ""
@@ -318,6 +350,9 @@ class _Visitor(ast.NodeVisitor):
     def visit_Constant(self, node: ast.Constant) -> None:
         if isinstance(node.value, str):
             self._check_name_use(node, node.value, as_string=True)
+            if self.in_domain and node.value in DOMAIN_CLOCK_ATTRS:
+                # 防 getattr(datetime, "now") 这类字面量绕过
+                self._add(node, "domain-clock", f"domain 不得以字符串引用时钟方法 {node.value!r}")
 
     # ---------- 导入 ----------
 
