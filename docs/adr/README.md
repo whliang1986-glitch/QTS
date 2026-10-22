@@ -8,9 +8,9 @@
 | ADR-01 | 从零开发，不迁移旧 Codex 代码 | 已定 |
 | ADR-02 | 服务器常驻交易核心 + 瘦客户端，所有数据存服务器 | 已定 |
 | ADR-03 | Python 3.12 + asyncio，FastAPI + Pydantic v2，Polars/pandas | 待确认 |
-| ADR-04 | React + TypeScript Web 客户端，可选 Tauri 桌面壳 | 待确认（见下方注 1） |
+| ADR-04 | Tauri 原生桌面 App 为主形态（同一套 React 前端），服务独立常驻 | 已定（修订，见 [ADR-04-desktop-client.md](ADR-04-desktop-client.md)） |
 | ADR-05 | SQLite（WAL、FULL）存账本；Parquet + DuckDB 存行情 | 待确认 |
-| ADR-06 | 首家券商 IBKR，ib_async，经 BrokerAdapter 隔离；IBC 自动登录 | 待确认（纪要已定“先接 IBKR、经 BrokerAdapter 隔离”） |
+| ADR-06 | 首家券商 IBKR，ib_async，经 BrokerAdapter 隔离；先用 TWS 自动连接（模拟盘端口白名单），IBC 后置；开发期延迟行情开关 | 已定（修订，见 [ADR-06-ibkr-tws.md](ADR-06-ibkr-tws.md)） |
 | ADR-07 | 回测数据供应商待选；M1 先用 IBKR 历史数据 | 待确认 |
 | ADR-08 | 自研薄回测引擎，复用 OMS、风控与 FakeBroker | 待确认 |
 | ADR-09 | 首期日线低频、仅多头、无杠杆、美股与 ETF 现货 + 冒烟策略 | 待确认（纪要已定范围） |
@@ -19,8 +19,6 @@
 | ADR-12 | 内部时间一律 UTC；金额与数量用 Decimal | 已定 |
 | ADR-13 | Claude Code + CLAUDE.md + CI + 架构测试；P0 双重审阅 | 待确认 |
 | ADR-14 | 本机套接字 / 命名管道 IPC + outbox + tradingd 侧去重 | 待确认 |
-| ADR-15 | 首期建议现金账户；区分已结算与未结算现金 | 待确认 |
+| ADR-15 | 以 IBKR 返回的账户类型为准；界面只能一键从严，放宽走受保护配置；类型变化进入 SAFE HALT | 已定（修订，见 [ADR-15-account-type.md](ADR-15-account-type.md)） |
 
-注 1：需求纪要写的是“最终打包成桌面应用；下单核心作为后台服务常驻，桌面应用只做界面”。这与
-ADR-04（Web 界面 + Tauri 桌面壳）方向一致，但桌面壳在 V4.1 中是 P2 可选项（S-06）。F-04 时请 Dylan
-确认桌面壳是否要提为必选。
+注：ADR-04、ADR-06、ADR-15 已按 Dylan 2026-10-22 的决定修订，原 V4.1 条文以修订文件为准。

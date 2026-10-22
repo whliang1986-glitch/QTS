@@ -7,5 +7,5 @@
 | [F-01](F-01.md) | 项目脚手架与工具链 | P0 | IMPLEMENTED（PASS，待验收） |
 | [F-02](F-02.md) | CLAUDE.md、docs、模板、权限规则与钩子、评审子代理 | P0 | IMPLEMENTED（PASS，待验收） |
 | [F-03](F-03.md) | 架构约束测试（import-linter、唯一下单出口扫描） | P0 | IMPLEMENTED（本机 PASS，CI 待推送） |
-| F-04 | 参数草案与 ADR 定稿（Dylan 批准） | P0 | NOT STARTED |
+| [F-04](F-04.md) | 参数草案与 ADR 定稿（Dylan 批准） | P0 | NOT STARTED（3 项 ADR 已修订定稿） |
 | F-05 | 环境联通性验证（IBKR 模拟账户、IBC、实时行情、供应商试用、告警通路） | P0 | NOT STARTED |
