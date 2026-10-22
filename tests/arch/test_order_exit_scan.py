@@ -16,6 +16,7 @@ from scripts.arch_scan import Violation, scan
 from tests.arch._layout import make_server_tree
 
 ROOT = Path(__file__).resolve().parents[2]
+NL = chr(10)  # 用例源码的换行
 
 
 def _scan(tmp_path: Path, files: dict[str, str]) -> list[Violation]:
@@ -359,6 +360,93 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "repo.commit_mode_and_audits([], change)\n",
         "mode-write",
     ),
+    "risk 构造订单票据": ("server/risk/r.py", "t = OrderTicket(intent=i)\n", "order-ticket"),
+    "backtest 构造订单票据": (
+        "server/backtest/b.py",
+        "from server.broker.base import OrderTicket\n",
+        "order-ticket",
+    ),
+    "broker 构造订单票据": ("server/broker/x.py", "t = OrderTicket(intent=i)" + NL, "order-ticket"),
+    "broker 用 model_validate 构造票据": (
+        "server/broker/x.py",
+        "t = OrderAmendment.model_validate(d)" + NL,
+        "order-ticket",
+    ),
+    "guard 撤保护性止损": (
+        "server/guard/g.py",
+        "await b.cancel_order(oid, allow_protective_stop=True)" + NL,
+        "protective-cancel",
+    ),
+    "__globals__ 拿模块字典": ("server/strategy/s.py", "f.__globals__['x']" + NL, "dynamic-call"),
+    "__subclasses__ 拿任意类": (
+        "server/strategy/s.py",
+        "object.__subclasses__()" + NL,
+        "dynamic-call",
+    ),
+    "get_type_hints": (
+        "server/ai/a.py",
+        "from typing import get_type_hints" + NL + "get_type_hints(f)" + NL,
+        "dynamic-call",
+    ),
+    # ---- B-01 第二轮评审 R2：guard 不得经 ** 展开传入止损撤单确认 ----
+    "guard 用 ** 展开撤单参数": (
+        "server/guard/g.py",
+        "await b.cancel_order(oid, **opts)" + NL,
+        "protective-cancel",
+    ),
+    "guard 用 partial 加 ** 撤单": (
+        "server/guard/g.py",
+        "f = functools.partial(b.cancel_order, **opts)" + NL,
+        "protective-cancel",
+    ),
+    "guard 取撤单方法对象再 ** 调用": (
+        "server/guard/g.py",
+        "c = b.cancel_order" + NL + "await c(oid, **opts)" + NL,
+        "protective-cancel",
+    ),
+    "guard 把撤单方法传给转发函数": (
+        "server/guard/g.py",
+        "go(b.cancel_order, opts)" + NL,
+        "protective-cancel",
+    ),
+    "guard 撤单带任意关键字参数": (
+        "server/guard/g.py",
+        "await b.cancel_order(oid, force=True)" + NL,
+        "protective-cancel",
+    ),
+    "guard 撤单用 * 展开位置参数": (
+        "server/guard/g.py",
+        "await b.cancel_order(*args)" + NL,
+        "protective-cancel",
+    ),
+    # ---- R3：broker 内票据类型名只能用于标注与类型判断 ----
+    "broker 导入时给票据类型取别名": (
+        "server/broker/x.py",
+        "from server.broker.base import OrderTicket as T" + NL + "T(intent=i)" + NL,
+        "order-ticket",
+    ),
+    "broker 经模块属性构造票据": (
+        "server/broker/x.py",
+        "t = base.OrderTicket(intent=i)" + NL,
+        "order-ticket",
+    ),
+    "broker 给票据类型取别名": ("server/broker/x.py", "T = OrderTicket" + NL, "order-ticket"),
+    "broker 把票据类型作为参数传出": (
+        "server/broker/x.py",
+        "make(OrderAmendment, d)" + NL,
+        "order-ticket",
+    ),
+    # ---- R5：执行任意代码与栈帧 ----
+    "eval": ("server/strategy/s.py", "eval(src)" + NL, "dynamic-call"),
+    "exec": ("server/ai/a.py", "exec(src)" + NL, "dynamic-call"),
+    "compile": ("server/api/r.py", "c = compile(src, 'x', 'exec')" + NL, "dynamic-call"),
+    "builtins.eval": ("server/api/r.py", "x = builtins.eval(src)" + NL, "dynamic-call"),
+    "sys._getframe": ("server/strategy/s.py", "f = sys._getframe(1)" + NL, "dynamic-call"),
+    "inspect.currentframe": ("server/ai/a.py", "f = inspect.currentframe()" + NL, "dynamic-call"),
+    "inspect.stack": ("server/ai/a.py", "s = inspect.stack()" + NL, "dynamic-call"),
+    "帧对象的全局字典": ("server/strategy/s.py", "g = frame.f_back.f_globals" + NL, "dynamic-call"),
+    "回溯对象的帧": ("server/data/d.py", "f = exc.__traceback__.tb_frame" + NL, "dynamic-call"),
+    "生成器的帧": ("server/data/d.py", "f = gen.gi_frame" + NL, "dynamic-call"),
     "其他模块伪造账户观察审计": (
         "server/oms/o.py",
         "repo.append_audit(AuditEvent(action='account_observed'))\n",
@@ -446,6 +534,27 @@ ALLOWED: dict[str, tuple[str, str]] = {
         "from pydantic import BaseModel\n",
     ),
     "strategy 读系统时钟不受 domain 规则约束": ("server/strategy/s.py", "x = datetime.now(UTC)\n"),
+    "oms 签发订单票据": ("server/oms/o.py", "t = OrderTicket(intent=i)\n"),
+    "broker 标注订单票据": ("server/broker/x.py", "def f(t: OrderTicket) -> None: ...\n"),
+    "broker 判断票据类型": ("server/broker/x.py", "ok = isinstance(t, OrderTicket)" + NL),
+    "broker 在返回与变量标注中用票据类型": (
+        "server/broker/x.py",
+        "def f() -> OrderTicket | None: ..." + NL + "x: list[base.OrderAmendment] = []" + NL,
+    ),
+    "broker 用 issubclass 判断票据类型": (
+        "server/broker/x.py",
+        "ok = issubclass(c, (OrderTicket, OrderAmendment))" + NL,
+    ),
+    "guard 逐单撤单不展开参数": ("server/guard/g.py", "await b.cancel_order(oid)" + NL),
+    "guard 其他调用可以用 ** 展开": ("server/guard/g.py", "log.info('x', **fields)" + NL),
+    "re.compile 与 DataFrame.eval 不算执行代码": (
+        "server/data/d.py",
+        "p = re.compile('x')" + NL + "y = df.eval('a + b')" + NL,
+    ),
+    "oms 撤保护性止损": (
+        "server/oms/o.py",
+        "await b.cancel_order(oid, allow_protective_stop=True)" + NL,
+    ),
     "ModeManager 写模式": (
         "server/risk/mode_manager.py",
         "self._repo.commit_mode_and_audits(a, c)\n",

@@ -9,6 +9,7 @@
 - cancel-exit：撤单方法名只能在 server/oms、server/guard 使用（broker 委托除外）。
 - global-cancel：全局撤单在任何包都禁止（会撤掉保护性止损，V4.1 7.6）。
 - risk-bypass：oms 的订单提交入口只能在 server/risk（及 oms 自身）使用。
+- order-ticket：OrderTicket 只能在 server/oms 构造（broker 只用于类型标注与处理）。
 - mode-write：账本的模式变更写入只能在 server/risk/mode_manager.py（及 storage 自身）使用。
 - broker-forwarder：broker 包内的受保护名称只能出现在受保护名函数中，且该函数的允许调用方
   必须是被使用名称允许调用方的子集；broker 包内不得定义模块级 __getattr__；
@@ -53,16 +54,29 @@ CATEGORIES: dict[str, frozenset[str]] = {
     "global-cancel": frozenset({"reqGlobalCancel", "global_cancel", "cancel_all_orders"}),
     "submit": frozenset({"submit_approved_intent"}),
     # 模式变更只能经 ModeManager 写入账本（C-04）
+    # 订单票据只能由 OMS 签发（B-01）：从类型上挡住“不经风控直接下单”
+    "order-ticket": frozenset({"OrderTicket", "OrderAmendment"}),
+    # 撤销保护性止损的显式确认参数：只能出现在 oms 的二次确认路径与 broker 实现中（B-01）
+    "protective-cancel": frozenset({"allow_protective_stop"}),
     # 以及账户类型基线所用的审计动作名（防止其他模块写同名审计伪造基线）
     "mode-write": frozenset({"append_mode_change", "commit_mode_and_audits", "account_observed"}),
 }
 NAME_CATEGORY = {name: cat for cat, names in CATEGORIES.items() for name in names}
+# broker 包内只对“动作”类名称做防洗名检查；OrderTicket 等类型名在 broker 内可以自由标注
+# （submit、mode-write 在 broker 包本就不允许出现，第一层检查已拦截，这里列出只为完整）
+FORWARDER_CATEGORIES = frozenset({"order", "cancel", "global-cancel", "submit", "mode-write"})
+# broker 包内这些票据类型名只能出现在类型标注、isinstance/issubclass 第二个参数与导入中：
+# 构造（含 base.OrderTicket(...)、别名 T = OrderTicket 后再构造）一律拒绝（B-01 评审 R3）
+TICKET_TYPES = frozenset({"OrderTicket", "OrderAmendment"})
+TYPE_CHECK_FUNCS = frozenset({"isinstance", "issubclass"})
 CATEGORY_RULE = {
     "order": "order-exit",
     "cancel": "cancel-exit",
     "global-cancel": "global-cancel",
     "submit": "risk-bypass",
     "mode-write": "mode-write",
+    "order-ticket": "order-ticket",
+    "protective-cancel": "protective-cancel",
 }
 CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "order": ("oms", "broker"),
@@ -70,6 +84,8 @@ CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "global-cancel": (),
     "submit": ("risk", "oms"),
     "mode-write": ("storage", "risk/mode_manager.py"),
+    "order-ticket": ("oms", "broker"),
+    "protective-cancel": ("oms", "broker"),
 }
 CATEGORY_HINT = {
     "order": "只能在 server/oms 中使用",
@@ -77,6 +93,8 @@ CATEGORY_HINT = {
     "global-cancel": "任何包都不得使用全局撤单",
     "submit": "只能由 server/risk 调用",
     "mode-write": "只能由 server/risk/mode_manager.py 调用",
+    "order-ticket": "只能由 server/oms 签发",
+    "protective-cancel": "只能在 server/oms 的二次确认路径中使用",
 }
 # broker 包内受保护名函数允许使用的装饰器
 BROKER_DECORATOR_ALLOWLIST = frozenset(
@@ -121,21 +139,49 @@ REFLECTION: dict[str, tuple[int, ...] | None] = {
     "methodcaller": (0,),
     "resolve_name": (0,),
     "getmembers": None,
+    "get_type_hints": None,
     "vars": None,
     "dir": None,
     "globals": None,
     "locals": None,
+    # 执行任意代码与栈帧访问：能拿到调用方的全局/局部名字空间（B-01 评审 R5）
+    "eval": None,
+    "exec": None,
+    "compile": None,
+    "_getframe": None,
+    "currentframe": None,
+    "stack": None,
+    "getouterframes": None,
+    "getinnerframes": None,
 }
 IMPORT_FUNCS = frozenset({"__import__", "import_module", "resolve_name"})
 FORBIDDEN_ATTRS = frozenset(
-    {"__dict__", "__getattribute__", "__setattr__", "__delattr__", "modules"}
-)
+    {
+        "__dict__", "__getattribute__", "__setattr__", "__delattr__", "modules",
+        # 能拿到模块字典或任意类的属性（B-01 评审 S1）
+        "__globals__", "__subclasses__", "__mro__", "__code__", "__closure__", "__annotations__",
+        # 栈帧、生成器与回溯对象上的名字空间入口（B-01 评审 R5）
+        "f_globals", "f_builtins", "f_locals", "f_back", "f_code",
+        "gi_frame", "cr_frame", "ag_frame", "tb_frame",
+    }
+)  # fmt: skip
 FORBIDDEN_MODULE_PREFIXES = ("runpy", "importlib.util", "builtins")
 # 以属性名为参数的反射函数：字面量参数也不得是 dunder 或敏感属性（getattr(x, "__dict__")）
 ATTR_NAME_FUNCS = frozenset({"getattr", "setattr", "delattr", "hasattr", "getattr_static"})
 FORBIDDEN_NAMES = frozenset({"__builtins__"})
 # getmembers 只在来自 inspect 时算反射（tarfile.getmembers 等无关）
-QUALIFIED_ONLY = {"getmembers": "inspect"}
+QUALIFIED_ONLY = {
+    "getmembers": "inspect",
+    "stack": "inspect",
+    "getouterframes": "inspect",
+    "getinnerframes": "inspect",
+    "currentframe": "inspect",
+    "_getframe": "sys",
+    # re.compile、df.eval 等与执行任意代码无关；裸名与 builtins.* 才算
+    "compile": "builtins",
+    "eval": "builtins",
+    "exec": "builtins",
+}
 
 
 @dataclass(frozen=True, order=True)
@@ -197,6 +243,12 @@ class _Visitor(ast.NodeVisitor):
         self.functions: list[str] = []
         self.server_aliases = server_aliases
         self.ok_reflection: set[int] = set()  # 已核准为“字面量直接调用”的 func 节点
+        self.ok_ticket: set[int] = set()  # broker 内允许出现票据类型名的节点（标注、类型判断）
+        self.ok_cancel: set[int] = set()  # guard 内已核准的“无关键字参数直接撤单”的 func 节点
+        # 能撤单但不能撤保护性止损的包（guard）：撤单名只能作为直接调用目标出现
+        self.cancel_only = _in(rel, CATEGORY_ALLOWED["cancel"]) and not _in(
+            rel, CATEGORY_ALLOWED["protective-cancel"]
+        )
         # 所在包的点分路径，用于解析相对导入（__init__.py 的包就是它所在的目录）
         self.package = rel.removesuffix(".py").split("/")[:-1]
 
@@ -213,7 +265,7 @@ class _Visitor(ast.NodeVisitor):
             rule = "dynamic-name" if as_string else CATEGORY_RULE[cat]
             self._add(node, rule, f"{name} {CATEGORY_HINT[cat]}")
             return
-        if self.in_broker:
+        if self.in_broker and cat in FORWARDER_CATEGORIES:
             enclosing = self.functions[-1] if self.functions else None
             outer = NAME_CATEGORY.get(enclosing or "")
             callers_ok = outer is not None and set(CATEGORY_ALLOWED[outer]) <= set(
@@ -272,6 +324,18 @@ class _Visitor(ast.NodeVisitor):
             return None
         return last
 
+    def _allow_ticket_names(self, node: ast.AST | None) -> None:
+        if node is not None:
+            self.ok_ticket.update(id(n) for n in ast.walk(node))
+
+    def _check_ticket_name(self, node: ast.AST, name: str) -> None:
+        if self.in_broker and name in TICKET_TYPES and id(node) not in self.ok_ticket:
+            self._add(
+                node,
+                "order-ticket",
+                f"broker 包内的 {name} 只能用于类型标注与类型判断，票据只能由 oms 签发",
+            )
+
     # ---------- 函数与装饰器 ----------
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
@@ -283,6 +347,11 @@ class _Visitor(ast.NodeVisitor):
                     target = deco.func if isinstance(deco, ast.Call) else deco
                     if (_dotted(target) or "") not in BROKER_DECORATOR_ALLOWLIST:
                         self._add(deco, "broker-forwarder", f"{node.name} 不得使用非白名单装饰器")
+        self._allow_ticket_names(node.returns)
+        all_args = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        all_args += [a for a in (node.args.vararg, node.args.kwarg) if a is not None]
+        for a in all_args:
+            self._allow_ticket_names(a.annotation)
         self.functions.append(node.name)
         self.generic_visit(node)
         self.functions.pop()
@@ -295,7 +364,43 @@ class _Visitor(ast.NodeVisitor):
 
     # ---------- 表达式 ----------
 
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._allow_ticket_names(node.annotation)
+        self.generic_visit(node)
+
+    def _check_cancel_use(self, node: ast.AST, name: str) -> None:
+        if self.cancel_only and name in CATEGORIES["cancel"] and id(node) not in self.ok_cancel:
+            self._add(
+                node,
+                "protective-cancel",
+                f"{name} 在这里只能直接调用且不带关键字参数"
+                "（不得取方法对象、作为参数传出或用 ** 展开），"
+                "撤保护性止损的确认只能在 server/oms 中使用",
+            )
+
     def visit_Call(self, node: ast.Call) -> None:
+        if (
+            self.in_broker
+            and isinstance(node.func, ast.Name)
+            and node.func.id in TYPE_CHECK_FUNCS
+            and len(node.args) == 2
+        ):
+            self._allow_ticket_names(node.args[1])
+        # guard 的撤单只能是 x.cancel_order(oid) 这样的直接调用：不带关键字参数、不用 ** 展开，
+        # 否则 allow_protective_stop 可以经字典拼名、方法对象别名或转发函数传入（B-01 评审 R2）
+        if (
+            self.cancel_only
+            and isinstance(node.func, ast.Name | ast.Attribute)
+            and (node.func.id if isinstance(node.func, ast.Name) else node.func.attr)
+            in CATEGORIES["cancel"]
+            and not node.keywords
+            and not any(isinstance(a, ast.Starred) for a in node.args)
+        ):
+            self.ok_cancel.add(id(node.func))
+        # 关键字参数名也算名称使用（例如 allow_protective_stop=True）
+        for keyword in node.keywords:
+            if keyword.arg is not None:
+                self._check_name_use(keyword, keyword.arg)
         name = self._reflection_name(node.func)
         if name is not None:
             literal_slots = REFLECTION[name]
@@ -324,6 +429,8 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name) -> None:
         self._check_name_use(node, node.id)
+        self._check_ticket_name(node, node.id)
+        self._check_cancel_use(node, node.id)
         # 只看读取：字段定义 `open: Price` 是赋值目标，不是在用内置 open
         if (
             self.in_domain
@@ -339,6 +446,8 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         self._check_name_use(node, node.attr)
+        self._check_ticket_name(node, node.attr)
+        self._check_cancel_use(node, node.attr)
         if self.in_domain and node.attr in DOMAIN_CLOCK_ATTRS:
             self._add(
                 node, "domain-clock", f"domain 不得读取系统时钟（.{node.attr}），时间由调用方传入"
@@ -383,6 +492,12 @@ class _Visitor(ast.NodeVisitor):
                 self._dynamic(node, f"from {module} import {alias.name}")
             if alias.name in REFLECTION and alias.asname not in (None, alias.name):
                 self._dynamic(node, f"{alias.name} 取别名为 {alias.asname}")
+            renamed = alias.asname not in (None, alias.name)
+            if self.in_broker and alias.name in TICKET_TYPES and renamed:
+                self._add(node, "order-ticket", f"broker 包内不得给 {alias.name} 取别名")
+            if self.cancel_only and alias.name in CATEGORIES["cancel"]:
+                hint = "撤单只能经适配器直接调用"
+                self._add(node, "protective-cancel", f"不得导入 {alias.name}（{hint}）")
             if alias.name != "*":
                 self._check_import_target(node, f"{module}.{alias.name}")
 
