@@ -69,7 +69,8 @@ def _whole(value: Decimal) -> Decimal:
     return value
 
 
-def _to_utc(value: object) -> datetime:
+def to_utc(value: object) -> datetime:
+    """把带时区的时间规范为纯 UTC datetime；不带时区或无法解析时抛 ValueError。"""
     if isinstance(value, str):
         try:
             value = datetime.fromisoformat(value)
@@ -106,7 +107,7 @@ ShareQuantity = Annotated[
 ]
 # 带符号数量：只用于记录券商事实（例如持仓），负值必须由对账与风控当作异常处理
 SignedQuantity = Annotated[Decimal, BeforeValidator(_to_decimal), _DecimalStr]
-UtcDatetime = Annotated[datetime, BeforeValidator(_to_utc)]
+UtcDatetime = Annotated[datetime, BeforeValidator(to_utc)]
 Currency = Literal["USD"]
 Identifier = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^\S+$")]
 
