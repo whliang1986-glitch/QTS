@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Windows runner 的控制台默认 cp1252，import-linter（rich）输出中文契约名会抛 UnicodeEncodeError
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
