@@ -5,6 +5,8 @@ description = "AI 量化自动交易系统：服务器常驻交易核心（tradi
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.14,<2",
+    "exchange-calendars>=4.13,<5",
+    "pandas>=3.0,<4",
     "pydantic>=2.11,<3",
     "sqlalchemy>=2.0.36,<2.1",
 ]
@@ -18,6 +20,7 @@ dev = [
     "pytest-cov>=7.0",
     "hypothesis>=6.140",
     "import-linter>=2.5",
+    "pandas-stubs>=3.0.5.260914",
 ]
 
 [build-system]
@@ -65,6 +68,10 @@ files = ["server", "tests", "scripts", ".claude/hooks"]
 warn_unreachable = true
 explicit_package_bases = true
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["exchange_calendars", "exchange_calendars.*"]
+ignore_missing_imports = true
 
 [tool.pydantic-mypy]
 init_forbid_extra = true
@@ -115,7 +122,11 @@ addopts = ["-ra", "--strict-markers", "--strict-config", "--import-mode=importli
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 xfail_strict = true
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # exchange_calendars 内部使用了 pandas 即将弃用的 Series.values（第三方，非本项目代码）
+    "ignore:Series.values returning an ndarray:pandas.errors.Pandas4Warning",
+]
 
 [tool.coverage.run]
 source = ["server"]
