@@ -232,3 +232,42 @@ def test_sessions_are_copied_defensively() -> None:
     cal = TradingCalendar(source, start=date(2026, 1, 1), end=date(2026, 12, 31))
     source.clear()
     assert cal.is_trading_day(day)
+
+
+def test_more_bad_override_registrations() -> None:
+    with pytest.raises(CalendarDataError):  # 提前收市的 key 是 datetime
+        TradingCalendar.nyse(
+            adhoc_early_closes={datetime(2026, 10, 30, tzinfo=UTC): utc(2026, 10, 30, 17)},
+            start=S0,
+            end=S1,
+        )
+    with pytest.raises(CalendarDataError):  # 提前收市日期超出范围
+        TradingCalendar.nyse(
+            adhoc_early_closes={date(2029, 1, 2): utc(2029, 1, 2, 17)}, start=S0, end=S1
+        )
+    with pytest.raises(CalendarDataError):  # 同一天既休市又提前收市
+        TradingCalendar.nyse(
+            adhoc_closures=frozenset({date(2026, 10, 30)}),
+            adhoc_early_closes={date(2026, 10, 30): utc(2026, 10, 30, 17)},
+            start=S0,
+            end=S1,
+        )
+    with pytest.raises(CalendarDataError):  # 收盘时间不是 datetime
+        TradingCalendar.nyse(
+            adhoc_early_closes={date(2026, 10, 30): "17:00"},  # type: ignore[dict-item]
+            start=S0,
+            end=S1,
+        )
+
+
+def test_non_utc_session_is_rejected() -> None:
+    est = timezone(timedelta(hours=-5))
+    day = date(2026, 1, 5)
+    bad = Session(
+        day=day,
+        open=datetime(2026, 1, 5, 9, 30, tzinfo=est),
+        close=datetime(2026, 1, 5, 16, 0, tzinfo=est),
+        early_close=False,
+    )
+    with pytest.raises(CalendarDataError):
+        TradingCalendar({day: bad}, start=date(2026, 1, 1), end=date(2026, 12, 31))

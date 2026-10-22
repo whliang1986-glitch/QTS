@@ -121,7 +121,10 @@ class TradingCalendar:
             session = sessions.get(day)
             if session is None:
                 raise CalendarDataError(f"临时提前收市 {day} 不是交易日：请检查登记")
-            new_close = _require_aware(close)
+            try:
+                new_close = to_utc(close)
+            except ValueError as exc:
+                raise CalendarDataError(f"{day} 的临时收盘时间不合法：{exc}") from exc
             if not session.open < new_close < session.close:
                 raise CalendarDataError(f"{day} 的临时收盘时间只能提前，且必须晚于开盘")
             sessions[day] = Session(day=day, open=session.open, close=new_close, early_close=True)
