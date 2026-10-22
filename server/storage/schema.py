@@ -1,0 +1,121 @@
+"""账本表结构（C-03，ADR-05）。SQLAlchemy Core，不用 ORM。
+
+所有账本表都只追加：订单、成交、风控决定、命令日志、审计、模式变更，以及状态变化都写成新行。
+每张表有三个触发器（迁移 0001 建立，打开账本时逐一核对）：
+- <表>_no_update / <表>_no_delete：禁止 UPDATE、DELETE
+- <表>_no_replace：BEFORE INSERT 检查唯一键已存在即中止，堵住 INSERT OR REPLACE / REPLACE INTO
+  （REPLACE 会先删后插，默认不触发 DELETE 触发器）；连接上另开 recursive_triggers 作为第二层
+金额与数量存 Decimal 字符串，时间存定长 UTC ISO 字符串。
+"""
+
+from __future__ import annotations
+
+from sqlalchemy import Column, ForeignKey, Integer, MetaData, Table, Text
+
+metadata = MetaData()
+
+orders = Table(
+    "orders",
+    metadata,
+    Column("intent_id", Text, primary_key=True),
+    Column("account_id", Text, nullable=False),
+    Column("symbol", Text, nullable=False),
+    Column("side", Text, nullable=False),
+    Column("order_class", Text, nullable=False),
+    Column("created_at", Text, nullable=False),
+    Column("payload", Text, nullable=False),
+)
+
+broker_orders = Table(
+    "broker_orders",
+    metadata,
+    Column("broker_order_id", Text, primary_key=True),
+    Column("intent_id", Text, ForeignKey("orders.intent_id"), nullable=False, unique=True),
+    Column("order_class", Text, nullable=False),
+    Column("submitted_at", Text, nullable=False),
+    Column("payload", Text, nullable=False),
+)
+
+perm_ids = Table(
+    "perm_ids",
+    metadata,
+    Column("perm_id", Text, primary_key=True),
+    Column("intent_id", Text, ForeignKey("orders.intent_id"), nullable=False, unique=True),
+    Column("recorded_at", Text, nullable=False),
+)
+
+order_events = Table(
+    "order_events",
+    metadata,
+    Column("seq", Integer, primary_key=True, autoincrement=True),
+    Column("event_id", Text, nullable=False, unique=True),
+    Column("intent_id", Text, ForeignKey("orders.intent_id"), nullable=False, index=True),
+    Column("kind", Text, nullable=False),
+    Column("status", Text, nullable=False),
+    Column("occurred_at", Text, nullable=False),
+    Column("correlation_id", Text, nullable=False),
+    Column("payload", Text, nullable=False),
+)
+
+executions = Table(
+    "executions",
+    metadata,
+    Column("execution_id", Text, primary_key=True),
+    Column("intent_id", Text, ForeignKey("orders.intent_id"), nullable=False, index=True),
+    Column("broker_order_id", Text, nullable=False),
+    Column("symbol", Text, nullable=False),
+    Column("side", Text, nullable=False),
+    Column("quantity", Text, nullable=False),
+    Column("price", Text, nullable=False),
+    Column("commission", Text, nullable=False),
+    Column("executed_at", Text, nullable=False),
+    Column("payload", Text, nullable=False),
+)
+
+risk_decisions = Table(
+    "risk_decisions",
+    metadata,
+    Column("decision_id", Text, primary_key=True),
+    Column("intent_id", Text, ForeignKey("orders.intent_id"), nullable=False, index=True),
+    Column("verdict", Text, nullable=False),
+    Column("decided_at", Text, nullable=False),
+    Column("payload", Text, nullable=False),
+)
+
+command_log = Table(
+    "command_log",
+    metadata,
+    Column("request_id", Text, primary_key=True),
+    Column("command", Text, nullable=False),
+    Column("result", Text, nullable=False),
+    Column("recorded_at", Text, nullable=False),
+)
+
+audit_events = Table(
+    "audit_events",
+    metadata,
+    Column("seq", Integer, primary_key=True, autoincrement=True),
+    Column("event_id", Text, nullable=False, unique=True),
+    Column("occurred_at", Text, nullable=False),
+    Column("actor", Text, nullable=False),
+    Column("action", Text, nullable=False),
+    Column("correlation_id", Text, nullable=False),
+    Column("payload", Text, nullable=False),
+)
+
+mode_changes = Table(
+    "mode_changes",
+    metadata,
+    Column("seq", Integer, primary_key=True, autoincrement=True),
+    Column("change_id", Text, nullable=False, unique=True),
+    Column("mode", Text, nullable=False),
+    Column("halt", Text, nullable=False),
+    Column("changed_at", Text, nullable=False),
+    Column("actor", Text, nullable=False),
+)
+
+LEDGER_TABLES = frozenset(metadata.tables)
+# 每张账本表必须存在的触发器；打开账本时缺一个即拒绝（防止迁移重建表时触发器丢失）
+LEDGER_TRIGGERS = frozenset(
+    f"{table}_no_{op}" for table in LEDGER_TABLES for op in ("update", "delete", "replace")
+)

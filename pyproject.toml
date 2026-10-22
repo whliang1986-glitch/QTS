@@ -52,6 +52,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S603", "S607", "PLR0913"]
 "tests/arch/test_order_exit_scan.py" = ["E501"]  # 用例表一行一条更易读
+# 故意拼接原生 SQL 模拟绕过 Repository 直接改库（REPLACE / UPDATE / DELETE 攻击用例）
+"tests/integration/storage/test_ledger.py" = ["E501", "S608"]
 "scripts/**" = ["T20", "S603", "S607"]
 ".claude/hooks/**" = ["T20", "S603", "S607"]
 
