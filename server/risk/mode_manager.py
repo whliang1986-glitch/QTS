@@ -29,6 +29,7 @@ from server.domain.enums import LIVE_MODES, AccountType, Mode
 from server.domain.modes import AuditEvent, HaltState
 from server.domain.values import Identifier, ValueModel
 from server.storage.ledger import LedgerRepository, ModeChange
+from server.storage.logs import mask_account
 
 SYSTEM_ACTOR = "system"
 # 这些名字代表程序而不是人，不能用来恢复交易（比较时不区分大小写）
@@ -90,13 +91,6 @@ class ResumeChecks(ValueModel):
     risk_ok: StrictBool
     database_ok: StrictBool
     reconciled: StrictBool
-
-
-def mask_account(account_id: str) -> str:
-    """账户号脱敏后才能进入原因文本（会被界面与日志转发）。"""
-    if len(account_id) <= 5:
-        return "*" * len(account_id)
-    return f"{account_id[:2]}{'*' * (len(account_id) - 5)}{account_id[-3:]}"
 
 
 def _normalize_actor(actor: str) -> str:

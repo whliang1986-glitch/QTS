@@ -20,10 +20,10 @@ from server.risk.mode_manager import (
     ResumeChecks,
     StartupRefusedError,
     TradingHaltedError,
-    mask_account,
 )
 from server.storage.errors import StorageError
 from server.storage.ledger import LedgerRepository, open_ledger
+from server.storage.logs import mask_account
 from server.storage.migrate import upgrade
 
 T0 = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
