@@ -78,12 +78,14 @@ Windows 下 uv 由 winget 安装；若当前终端找不到 `uv`，重开终端�
 ## 任务流程（V4.1 第 12 章）
 
 1. 每个任务先有任务单：`docs/tasks/<ID>.md`，按 `docs/tasks/TEMPLATE.md` 填写。
-2. 先读现有代码，给出计划（改动文件、接口、迁移、风险、测试、回滚）。**P0 任务等 Dylan 批准计划后才实施。**
+2. 先读现有代码，给出计划（改动文件、接口、迁移、风险、测试、回滚）。
+   **授权（Dylan，2026-10-22）**：常规开发决策、计划批准、验收、推送由 Claude 自主决定并事后报告；
+   涉及实盘、真实资金、风控参数与限额、受保护配置、密钥、账户权限的事项仍须 Dylan 本人批准。
 3. 先写测试（含失败场景），再实现。
 4. 运行 ruff、mypy、pytest 及任务要求的测试，**如实**报告实际执行的命令与结果；没跑的明确标注。
 5. 调用 `safety-reviewer` 子代理在全新上下文审查差异，修复问题。
 6. 提交最终报告：改动文件、行为变化、测试证据、PASS / FAIL / BLOCKED、剩余风险、回滚说明。
-7. P0 由 Dylan 验收；P1/P2 在评审与 CI 通过后合并，Dylan 抽查。
+7. 按上面的授权，评审与 CI 通过即可合并，并向 Dylan 报告结果；门禁（G0–G9）的放行仍须 Dylan 签字。
 
 任务状态：NOT STARTED → READY → IN PROGRESS → BLOCKED → IMPLEMENTED → IN REVIEW → ACCEPTED / REJECTED（另有 DEFERRED）。
 实现完成 ≠ 验收通过。测试失败不得标 ACCEPTED。

@@ -22,3 +22,9 @@
 | ADR-15 | 以 IBKR 返回的账户类型为准；界面只能一键从严，放宽走受保护配置；类型变化进入 SAFE HALT | 已定（修订，见 [ADR-15-account-type.md](ADR-15-account-type.md)） |
 
 注：ADR-04、ADR-06、ADR-15 已按 Dylan 2026-10-22 的决定修订，原 V4.1 条文以修订文件为准。
+
+## 第 2 批选型（2026-10-22，按建议执行，Dylan 已授权）
+
+- 交易日历：exchange_calendars（XNYS），另以 2026–2027 已知休市与提前收市日期独立核对。
+- 配置文件格式：TOML（标准库 tomllib 解析，无隐式类型转换）；附录 A 的 parameters.yaml 改为 parameters.toml。
+- 数据处理：Polars + DuckDB，Parquet 存储（ADR-03、ADR-05）。

@@ -9,3 +9,7 @@
 | [F-03](F-03.md) | 架构约束测试（import-linter、唯一下单出口扫描） | P0 | ACCEPTED |
 | [F-04](F-04.md) | 参数草案与 ADR 定稿（Dylan 批准） | P0 | NOT STARTED（3 项 ADR 已修订定稿） |
 | F-05 | 环境联通性验证（IBKR 模拟账户、IBC、实时行情、供应商试用、告警通路） | P0 | NOT STARTED |
+| [C-01](C-01.md) | 领域模型 | P0 | ACCEPTED |
+| [C-02](C-02.md) | 事件与状态语义 | P0 | ACCEPTED |
+| [C-03](C-03.md) | SQLite 存储层与迁移 | P0 | ACCEPTED |
+| [C-04](C-04.md) | ModeManager 与实盘切换门禁 | P0 | ACCEPTED |
