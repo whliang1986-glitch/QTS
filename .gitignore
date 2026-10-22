@@ -28,11 +28,12 @@ secrets/
 *.db-wal
 *.db-shm
 *.sqlite
-data/
-lake/
-logs/
-spool/
-backups/
+# 运行数据目录只忽略仓库根目录下的（不能写成 data/，否则会误伤 server/data 包）
+/data/
+/lake/
+/logs/
+/spool/
+/backups/
 
 # 本机 Claude Code 个人设置
 .claude/settings.local.json
