@@ -14,12 +14,14 @@ import pytest_asyncio
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from server.broker.base import (
+    AmendmentRejectedError,
     BrokerEvent,
     BrokerExecution,
     BrokerOrderState,
     BrokerUnavailableError,
     ErrorCategory,
     ExecutionReport,
+    OrderAmendment,
     OrderLookup,
     OrderRecord,
     OrderStatusUpdate,
@@ -41,6 +43,7 @@ from server.domain.order_state import EventKind, OrderStatus
 from server.domain.orders import BrokerOrder, OrderIntent, RiskDecision, RuleHit
 from server.oms.manager import (
     DISCREPANCY,
+    AmendRefusedError,
     CancelRefusedError,
     OrderManager,
     SubmissionRefusedError,
@@ -919,3 +922,602 @@ async def test_two_waiting_corrections_for_one_execution_are_flagged(env: Env) -
     await env.om.on_broker_event(execution(env, "e-1", "4"))
     assert env.om.filled_quantity("i-1") in {Decimal(3), Decimal(2)}  # 只有一笔取代成功
     assert "correction_conflict" in env.discrepancies()
+
+
+# ---------- O-03：改单与撤单竞态 ----------
+
+
+async def amend(
+    env: Env, amendment_id: str, price: str, qty: int, *, decision_id: str | None = None
+) -> OrderStatus:
+    intent = env.repo.get_intent("i-1")
+    assert intent is not None
+    did = decision_id or f"d-{amendment_id}"
+    existing = [d for d in env.repo.risk_decisions_for("i-1") if d.decision_id == did]
+    # 改单的决定必须晚于本订单已用过的全部决定：每个新决定往后推一秒
+    later = T0 + timedelta(seconds=len(env.repo.risk_decisions_for("i-1")))
+    if existing:
+        decision = existing[0]
+    elif qty == intent.quantity:
+        decision = env.allow(intent, did, decided_at=later)
+    else:
+        hit = (RuleHit(rule_id="r", rule_version="1", message="缩量"),)
+        decision = env.allow(
+            intent, did, verdict=RiskVerdict.REDUCE, approved_quantity=Decimal(qty),
+            rule_hits=hit, decided_at=later,
+        )  # fmt: skip
+    return await env.om.request_amend(
+        "i-1", amendment_id=amendment_id, new_price=Decimal(price), new_quantity=Decimal(qty),
+        decision=decision,
+    )  # fmt: skip
+
+
+@pytest.mark.asyncio
+async def test_amend_price_and_quantity_with_new_decision(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    assert await amend(env, "am-1", "99.50", 6) is S.SUBMITTED
+    (order,) = await env.broker.open_orders()
+    assert (order.price, order.total_quantity) == (Decimal("99.50"), Decimal(6))
+    env.server.fill(env.oid(), Decimal(6), Decimal("99.50"))
+    await env.pump()
+    assert env.om.status("i-1") is S.FILLED  # 按改单后的数量判定全部成交
+    assert [a.result for a in env.repo.amendments_for("i-1")] == ["ACCEPTED"]
+
+
+@pytest.mark.asyncio
+async def test_amend_is_idempotent_and_needs_a_fresh_decision(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "99.50", 10)
+    await amend(env, "am-1", "99.50", 10)  # 同一 amendment_id 不再调用券商
+    assert len(env.repo.amendments_for("i-1")) == 1
+    with pytest.raises(AmendRefusedError, match="用过"):  # 原签发的决定
+        await env.om.request_amend(
+            "i-1", amendment_id="am-2", new_price=Decimal(99), new_quantity=Decimal(10),
+            decision=env.repo.risk_decisions_for("i-1")[0],
+        )  # fmt: skip
+    used = next(d for d in env.repo.risk_decisions_for("i-1") if d.decision_id == "d-am-1")
+    with pytest.raises(AmendRefusedError, match="用过"):  # 上一次改单的决定
+        await env.om.request_amend(
+            "i-1", amendment_id="am-3", new_price=Decimal(99), new_quantity=Decimal(10),
+            decision=used,
+        )  # fmt: skip
+    hit = (RuleHit(rule_id="r", rule_version="1", message="x"),)
+    unpersisted = RiskDecision(
+        decision_id="d-x", intent_id="i-1", verdict=RiskVerdict.REDUCE,
+        approved_quantity=Decimal(5), rule_hits=hit, rule_set_version="1",
+        decided_at=T0 + timedelta(hours=1),
+    )  # fmt: skip
+    with pytest.raises(AmendRefusedError, match="未落账"):
+        await env.om.request_amend(
+            "i-1", amendment_id="am-4", new_price=Decimal(99), new_quantity=Decimal(5),
+            decision=unpersisted,
+        )  # fmt: skip
+
+
+@pytest.mark.asyncio
+async def test_amend_refused_in_wrong_states(env: Env) -> None:
+    env.server.hold_events()
+    await env.submit()
+    with pytest.raises(AmendRefusedError, match="SUBMITTING"):
+        await amend(env, "am-1", "99", 10)
+    env.server.release_events()
+    await env.pump()
+    env.server.fill(env.oid(), Decimal(4), Decimal(100))
+    await env.pump()
+    with pytest.raises(AmendRefusedError, match="已成交"):
+        await amend(env, "am-2", "99", 4)
+    env.server.manual_cancel_confirm = True
+    await env.om.request_cancel("i-1")
+    with pytest.raises(AmendRefusedError, match="CANCEL_PENDING"):
+        await amend(env, "am-3", "99", 10)
+    assert env.repo.amendments_for("i-1") == []  # 被拒的改单不落账、不调用券商
+
+
+class AmendFailBroker(FakeBroker):
+    async def modify_order(self, amendment: OrderAmendment) -> None:
+        raise RuntimeError("socket closed")
+
+
+@pytest.mark.asyncio
+async def test_amend_rejected_or_unknown_keeps_quantity(tmp_path: Path, env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    env.server.broker_side_cancel(env.oid())  # 券商侧已撤：改单被拒
+    await amend(env, "am-1", "99", 6)
+    assert env.repo.amendments_for("i-1")[0].result == "REJECTED"
+    assert "amend_rejected" in env.discrepancies()
+    other = Env(tmp_path / "b")
+    other.use(AmendFailBroker(other.server))
+    await other.broker.connect()
+    await other.submit()
+    await other.pump()
+    await amend(other, "am-1", "99", 6)
+    assert other.repo.amendments_for("i-1")[0].result == "UNKNOWN"
+    assert other.om._ordered("i-1") == Decimal(10)  # 结果未知：有效数量保持原值
+    assert "amend_unknown" in other.discrepancies()
+
+
+ACTIONS = st.lists(
+    st.sampled_from(["fill1", "fill3", "cancel", "confirm", "reject", "amend_up", "amend_down"]),
+    max_size=12,
+)
+
+
+@settings(
+    max_examples=60, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture]
+)
+@given(actions=ACTIONS)
+def test_random_cancel_amend_fill_sequences_stay_consistent(
+    tmp_path_factory: pytest.TempPathFactory, actions: list[str]
+) -> None:
+    """随机交错成交、撤单、确认 / 拒绝撤单、改单后：成交量、剩余量、终态与券商事实一致。"""
+
+    async def run() -> None:
+        env = Env(tmp_path_factory.mktemp("race"))
+        env.server.manual_cancel_confirm = True
+        await env.broker.connect()
+        await env.submit()
+        await env.pump()
+        oid = env.oid()
+        for n, action in enumerate(actions):
+            (order,) = (await env.broker.lookup_order("i-1")).orders
+            active = order.state in {
+                BrokerOrderState.ACKNOWLEDGED, BrokerOrderState.PARTIALLY_FILLED,
+                BrokerOrderState.CANCEL_PENDING,
+            }  # fmt: skip
+            remaining = order.remaining_quantity
+            if action.startswith("fill") and active and remaining > 0:
+                env.server.fill(oid, min(Decimal(action[4:]), remaining), Decimal(100))
+            elif action == "cancel":
+                await env.om.request_cancel("i-1")
+            elif action in {"confirm", "reject"} and order.state is BrokerOrderState.CANCEL_PENDING:
+                if action == "confirm":
+                    env.server.confirm_cancel(oid)
+                else:
+                    env.server.reject_cancel(oid, "拒绝")
+            elif action.startswith("amend") and env.om.status("i-1") in {
+                S.SUBMITTED,
+                S.PARTIALLY_FILLED,
+            }:
+                qty = 10 if action == "amend_up" else int(env.om.filled_quantity("i-1")) + 1
+                if qty <= 10:
+                    await amend(env, f"am-{n}", "100", qty)
+            await env.pump()
+        (order,) = (await env.broker.lookup_order("i-1")).orders
+        status = env.om.status("i-1")
+        assert env.om.filled_quantity("i-1") == order.filled_quantity
+        assert env.om._ordered("i-1") == order.total_quantity
+        expected = {
+            BrokerOrderState.FILLED: {S.FILLED},
+            BrokerOrderState.CANCELLED: {S.CANCELLED},
+            BrokerOrderState.CANCEL_PENDING: {S.CANCEL_PENDING},
+            BrokerOrderState.PARTIALLY_FILLED: {S.PARTIALLY_FILLED},
+            BrokerOrderState.ACKNOWLEDGED: {S.SUBMITTED},
+        }[order.state]
+        assert status in expected, (status, order.state, actions)
+        assert "illegal_transition" not in env.discrepancies()
+
+    asyncio.run(run())
+
+
+# ---------- O-03 第一轮评审补充 ----------
+
+
+class InFlightBroker(FakeBroker):
+    """真实适配器在 await modify_order 期间会处理回报：改单生效后、返回前先送达一笔成交。"""
+
+    om: OrderManager | None = None
+    fill_during_modify: Decimal = Decimal(0)
+    raise_after_apply: bool = False
+
+    async def modify_order(self, amendment: OrderAmendment) -> None:
+        await super().modify_order(amendment)
+        if self.fill_during_modify:
+            self.server.fill(amendment.broker_order_id, self.fill_during_modify, Decimal(100))
+            assert self.om is not None
+            while not self._queue.empty():
+                await self.om.on_broker_event(self._queue.get_nowait())
+        if self.raise_after_apply:
+            raise RuntimeError("connection reset after send")
+
+
+def in_flight_env(tmp_path: Path) -> tuple[Env, InFlightBroker]:
+    env = Env(tmp_path)
+    broker = InFlightBroker(env.server)
+    env.use(broker)
+    broker.om = env.om
+    return env, broker
+
+
+@pytest.mark.asyncio
+async def test_fill_while_increase_amendment_in_flight_is_not_full(tmp_path: Path) -> None:
+    env, broker = in_flight_env(tmp_path)
+    await env.broker.connect()
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "100", 6)  # 先减到 6
+    broker.fill_during_modify = Decimal(6)
+    await amend(env, "am-2", "100", 10)  # 加回 10，在途时成交 6 股
+    assert env.om.status("i-1") is S.PARTIALLY_FILLED  # 没有按旧数量 6 提前判全部成交
+    assert env.om._ordered("i-1") == Decimal(10)
+
+
+@pytest.mark.asyncio
+async def test_unknown_amendment_blocks_new_ones_and_is_resolved_by_lookup(tmp_path: Path) -> None:
+    env, broker = in_flight_env(tmp_path)
+    await env.broker.connect()
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "100", 6)
+    broker.raise_after_apply = True
+    await amend(env, "am-2", "100", 10)  # 券商实际改成了 10，但调用抛异常 → UNKNOWN
+    assert env.repo.amendments_for("i-1")[-1].result == "UNKNOWN"
+    assert env.unresolved == ["i-1"]
+    broker.raise_after_apply = False
+    with pytest.raises(AmendRefusedError, match="结果未定"):
+        await amend(env, "am-3", "100", 8)
+    env.server.fill(env.oid(), Decimal(6), Decimal(100))
+    await env.pump()
+    assert env.om.status("i-1") is S.PARTIALLY_FILLED  # 未定期间按较大数量 10 判定
+    await env.om.resolve_amendments("i-1")
+    assert env.repo.amendments_for("i-1")[-1].result == "ACCEPTED"
+    assert env.om._ordered("i-1") == Decimal(10)
+
+
+@pytest.mark.asyncio
+async def test_unknown_amendment_not_applied_on_live_order_stays_unknown(tmp_path: Path) -> None:
+    env = Env(tmp_path)
+    env.use(AmendFailBroker(env.server))
+    await env.broker.connect()
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "99", 6)
+    await env.om.resolve_amendments("i-1")
+    # 订单还活着：券商可能还没处理完，不能提前记成终结的 REJECTED
+    assert env.repo.amendments_for("i-1")[-1].result == "UNKNOWN"
+    assert env.om._ordered("i-1") == Decimal(10)
+
+
+@pytest.mark.asyncio
+async def test_amendment_replay_with_different_content_is_refused(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "99.50", 10)
+    with pytest.raises(AmendRefusedError, match="不同的改单内容"):
+        await amend(env, "am-1", "99.40", 10)
+    env.intent("i-2")
+    with pytest.raises(AmendRefusedError, match="别的意图"):
+        await env.om.request_amend(
+            "i-2", amendment_id="am-1", new_price=Decimal("99.50"), new_quantity=Decimal(10),
+            decision=env.repo.risk_decisions_for("i-1")[-1],
+        )  # fmt: skip
+
+
+@pytest.mark.asyncio
+async def test_protective_stop_amendment_is_refused(env: Env) -> None:
+    intent = env.intent(
+        "stop", side=Side.SELL, order_type=OrderType.STOP, limit_price=None,
+        stop_price=Decimal(90), order_class=OrderClass.PROTECTIVE_STOP,
+        time_in_force=TimeInForce.GTC,
+    )  # fmt: skip
+    await env.om.submit_approved_intent(intent, env.allow(intent))
+    await env.pump()
+    decision = env.allow(intent, "d-stop-2", decided_at=T0 + timedelta(seconds=5))
+    with pytest.raises(AmendRefusedError, match="保护性止损"):
+        await env.om.request_amend(
+            "stop", amendment_id="am-s", new_price=Decimal(50), new_quantity=Decimal(10),
+            decision=decision,
+        )  # fmt: skip
+    assert env.repo.amendments_for("stop") == []
+
+
+@pytest.mark.parametrize("case", ["other_intent", "reject", "not_later", "off_tick"])
+@pytest.mark.asyncio
+async def test_amendment_decision_checks(env: Env, case: str) -> None:
+    intent, _ = await env.submit()
+    await env.pump()
+    later = T0 + timedelta(seconds=30)
+    hit = (RuleHit(rule_id="r", rule_version="1", message="x"),)
+    price = Decimal("99.50")
+    if case == "other_intent":
+        other = env.intent("i-2")
+        decision = env.allow(other, "d-o", decided_at=later)
+    elif case == "reject":
+        decision = env.allow(
+            intent, "d-r", verdict=RiskVerdict.REJECT, rule_hits=hit, decided_at=later
+        )
+    elif case == "not_later":
+        decision = env.allow(intent, "d-n", decided_at=T0)  # 与签发决定同一时刻
+    else:
+        decision = env.allow(intent, "d-t", decided_at=later)
+        price = Decimal("99.505")
+    with pytest.raises(AmendRefusedError):
+        await env.om.request_amend(
+            "i-1", amendment_id=f"am-{case}", new_price=price, new_quantity=Decimal(10),
+            decision=decision,
+        )  # fmt: skip
+    assert env.repo.amendments_for("i-1") == []  # 不落账、不调用券商
+    (order,) = await env.broker.open_orders()
+    assert order.price == Decimal("100.00")
+
+
+class RaceBroker(FakeBroker):
+    """随机测试用：可让改单在途时送达回报、可让改单抛错，并统计撤单调用次数。"""
+
+    om: OrderManager | None = None
+    deliver_during_modify: bool = False
+    modify_mode: str = "ok"  # ok / reject / raise_after_apply / raise_before_apply
+    cancel_calls: int = 0
+
+    async def cancel_order(
+        self, broker_order_id: str, *, allow_protective_stop: bool = False
+    ) -> None:
+        self.cancel_calls += 1
+        await super().cancel_order(broker_order_id, allow_protective_stop=allow_protective_stop)
+
+    async def modify_order(self, amendment: OrderAmendment) -> None:
+        if self.modify_mode == "reject":
+            raise AmendmentRejectedError("random reject")
+        if self.modify_mode == "raise_before_apply":
+            raise RuntimeError("lost before send")
+        await super().modify_order(amendment)
+        if self.deliver_during_modify and self.om is not None:
+            while not self._queue.empty():
+                await self.om.on_broker_event(self._queue.get_nowait())
+        if self.modify_mode == "raise_after_apply":
+            raise RuntimeError("lost after send")
+
+
+RACE_ACTIONS = st.lists(
+    st.sampled_from(
+        ["fill1", "fill3", "cancel", "confirm", "reject_cancel", "amend_up", "amend_down",
+         "hold", "release", "mode_ok", "mode_reject", "mode_raise_after", "mode_raise_before",
+         "resolve", "inflight"]
+    ),
+    max_size=16,
+)  # fmt: skip
+
+
+@settings(
+    max_examples=80, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture]
+)
+@given(actions=RACE_ACTIONS)
+def test_random_race_sequences_with_delayed_reports_stay_consistent(  # noqa: PLR0915
+    tmp_path_factory: pytest.TempPathFactory, actions: list[str]
+) -> None:
+    """回报可被暂存、改单可在途送达回报或随机失败；查证之后本地与券商事实一致。"""
+
+    async def run() -> None:  # noqa: PLR0912, PLR0915 - 随机动作的分派
+        env = Env(tmp_path_factory.mktemp("race2"))
+        broker = RaceBroker(env.server)
+        env.use(broker)
+        broker.om = env.om
+        env.server.manual_cancel_confirm = True
+        await env.broker.connect()
+        await env.submit()
+        await env.pump()
+        oid = env.oid()
+        cancel_requests = 0
+        for n, action in enumerate(actions):
+            (order,) = (await env.broker.lookup_order("i-1")).orders
+            live = order.state in {
+                BrokerOrderState.ACKNOWLEDGED, BrokerOrderState.PARTIALLY_FILLED,
+                BrokerOrderState.CANCEL_PENDING,
+            }  # fmt: skip
+            if action.startswith("fill") and live and order.remaining_quantity > 0:
+                env.server.fill(
+                    oid, min(Decimal(action[4:]), order.remaining_quantity), Decimal(100)
+                )
+            elif action == "cancel":
+                before = env.om.status("i-1")
+                await env.om.request_cancel("i-1")
+                cancel_requests += before in {S.SUBMITTED, S.PARTIALLY_FILLED}
+            elif (
+                action in {"confirm", "reject_cancel"}
+                and order.state is BrokerOrderState.CANCEL_PENDING
+            ):
+                if action == "confirm":
+                    env.server.confirm_cancel(oid)
+                else:
+                    env.server.reject_cancel(oid, "拒绝")
+            elif action.startswith("amend"):
+                qty = 10 if action == "amend_up" else int(env.om.filled_quantity("i-1")) + 1
+                if qty <= 10:
+                    recorded = len(env.repo.amendments_for("i-1"))
+                    try:
+                        await amend(env, f"am-{n}", "100", qty)
+                    except AmendRefusedError:
+                        assert len(env.repo.amendments_for("i-1")) == recorded  # 被拒不落账
+            elif action == "hold":
+                env.server.hold_events()
+            elif action == "release":
+                env.server.release_events(reverse=n % 2 == 0)
+            elif action.startswith("mode_"):
+                broker.modify_mode = {
+                    "mode_ok": "ok", "mode_reject": "reject",
+                    "mode_raise_after": "raise_after_apply",
+                    "mode_raise_before": "raise_before_apply",
+                }[action]  # fmt: skip
+            elif action == "resolve":
+                await env.om.resolve_amendments("i-1")
+            elif action == "inflight":
+                broker.deliver_during_modify = not broker.deliver_during_modify
+            if action not in {"hold"}:
+                await env.pump()
+        # 收尾：放出暂存的回报、查证未定的改单，再与券商事实比对
+        env.server.release_events()
+        await env.pump()
+        await env.om.resolve_amendments("i-1")
+        await env.pump()
+        (order,) = (await env.broker.lookup_order("i-1")).orders
+        assert env.om.filled_quantity("i-1") == order.filled_quantity
+        assert env.om._ordered("i-1") == order.total_quantity
+        assert broker.cancel_calls == cancel_requests  # 每次真正的撤单请求只调用券商一次
+        expected = {
+            BrokerOrderState.FILLED: {S.FILLED},
+            BrokerOrderState.CANCELLED: {S.CANCELLED},
+            BrokerOrderState.CANCEL_PENDING: {S.CANCEL_PENDING},
+            BrokerOrderState.PARTIALLY_FILLED: {S.PARTIALLY_FILLED},
+            BrokerOrderState.ACKNOWLEDGED: {S.SUBMITTED},
+        }[order.state]
+        assert env.om.status("i-1") in expected, (env.om.status("i-1"), order.state, actions)
+        assert "illegal_transition" not in env.discrepancies()
+
+    asyncio.run(run())
+
+
+# ---------- O-03 第二轮评审补充 ----------
+
+
+class DelayedApplyBroker(FakeBroker):
+    """改单请求发出后连接中断，券商稍后才应用改单（IBKR 改单是异步的）。"""
+
+    held: OrderAmendment | None = None
+
+    async def modify_order(self, amendment: OrderAmendment) -> None:
+        self.held = amendment
+        raise RuntimeError("connection reset; broker will apply later")
+
+    def apply_later(self) -> None:
+        assert self.held is not None
+        self.server._modify(self.client_id, self.held)
+
+
+@pytest.mark.asyncio
+async def test_unknown_amendment_not_yet_applied_stays_unknown_until_applied(
+    tmp_path: Path,
+) -> None:
+    env = Env(tmp_path)
+    broker = DelayedApplyBroker(env.server)
+    env.use(broker)
+    await env.broker.connect()
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "99.50", 10)
+    await env.om.resolve_amendments("i-1")  # 券商还没处理：订单仍活着，保持 UNKNOWN
+    assert env.repo.amendments_for("i-1")[-1].result == "UNKNOWN"
+    assert "amend_still_pending" in env.discrepancies()
+    broker.apply_later()
+    await env.pump()
+    await env.om.resolve_amendments("i-1")
+    assert env.repo.amendments_for("i-1")[-1].result == "ACCEPTED"
+
+
+@pytest.mark.asyncio
+async def test_unknown_amendment_on_terminal_order_resolves_rejected(tmp_path: Path) -> None:
+    env = Env(tmp_path)
+    env.use(DelayedApplyBroker(env.server))
+    await env.broker.connect()
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "99.50", 10)
+    env.server.broker_side_cancel(env.oid())  # 订单已终结，改单不可能再生效
+    await env.pump()
+    await env.om.resolve_amendments("i-1")
+    assert env.repo.amendments_for("i-1")[-1].result == "REJECTED"
+
+
+class ResolveDuringModifyBroker(FakeBroker):
+    """改单在途时，另一路协程（对账循环）调用了 resolve_amendments。"""
+
+    om: OrderManager | None = None
+
+    async def modify_order(self, amendment: OrderAmendment) -> None:
+        assert self.om is not None
+        await self.om.resolve_amendments(amendment.order_ref)  # 在途改单必须被跳过
+        await super().modify_order(amendment)
+
+
+@pytest.mark.asyncio
+async def test_resolve_skips_amendments_in_flight(tmp_path: Path) -> None:
+    env = Env(tmp_path)
+    broker = ResolveDuringModifyBroker(env.server)
+    env.use(broker)
+    broker.om = env.om
+    await env.broker.connect()
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "99.50", 6)
+    assert env.repo.amendments_for("i-1")[-1].result == "ACCEPTED"
+    assert "amend_result_conflict" not in env.discrepancies()
+    assert env.om._ordered("i-1") == Decimal(6)
+
+
+# ---------- O-03 第三轮评审补充 ----------
+
+
+class CancelledModifyBroker(FakeBroker):
+    async def modify_order(self, amendment: OrderAmendment) -> None:
+        raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_cancelled_amendment_is_recorded_unknown_and_not_stuck(tmp_path: Path) -> None:
+    env = Env(tmp_path)
+    env.use(CancelledModifyBroker(env.server))
+    await env.broker.connect()
+    await env.submit()
+    await env.pump()
+    with pytest.raises(asyncio.CancelledError):
+        await amend(env, "am-1", "99.50", 10)
+    assert env.repo.amendments_for("i-1")[-1].result == "UNKNOWN"
+    assert env.om._amending == set()  # 不会卡在在途状态
+    assert env.unresolved == ["i-1"]
+
+
+class FailingLookupBroker(DelayedApplyBroker):
+    async def lookup_order(self, order_ref: str) -> OrderLookup:
+        raise RuntimeError("lookup timed out")
+
+
+@pytest.mark.asyncio
+async def test_amendment_lookup_failure_keeps_it_pending(tmp_path: Path) -> None:
+    env = Env(tmp_path)
+    env.use(FailingLookupBroker(env.server))
+    await env.broker.connect()
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "99.50", 10)
+    await env.om.resolve_amendments("i-1")
+    assert env.repo.amendments_for("i-1")[-1].result == "UNKNOWN"
+    assert "amend_lookup_failed" in env.discrepancies()
+
+
+class ConflictingResultBroker(FakeBroker):
+    """改单在途时账本里已被别处记成 REJECTED（模拟另一路写入），随后券商报接受。"""
+
+    repo: LedgerRepository | None = None
+
+    async def modify_order(self, amendment: OrderAmendment) -> None:
+        assert self.repo is not None
+        self.repo.record_amendment_result(amendment.amendment_id, "REJECTED", T0)
+        await super().modify_order(amendment)
+
+
+@pytest.mark.asyncio
+async def test_amendment_result_conflict_is_flagged_not_raised(tmp_path: Path) -> None:
+    env = Env(tmp_path)
+    broker = ConflictingResultBroker(env.server)
+    env.use(broker)
+    broker.repo = env.repo
+    await env.broker.connect()
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "99.50", 10)  # 不抛异常
+    assert "amend_result_conflict" in env.discrepancies()
+    assert env.unresolved == ["i-1"]
+
+
+@pytest.mark.asyncio
+async def test_long_pending_amendment_escalates_again(tmp_path: Path) -> None:
+    env = Env(tmp_path)
+    env.use(DelayedApplyBroker(env.server))
+    await env.broker.connect()
+    await env.submit()
+    await env.pump()
+    await amend(env, "am-1", "99.50", 10)  # UNKNOWN 时通知一次
+    for _ in range(3):
+        await env.om.resolve_amendments("i-1")
+    assert env.unresolved == ["i-1", "i-1"]  # 第 3 轮仍对不上，再次通知

@@ -52,7 +52,8 @@ CATEGORIES: dict[str, frozenset[str]] = {
     "order": frozenset({"place_order", "submit_order", "modify_order", "placeOrder"}),
     "cancel": frozenset({"cancel_order", "cancelOrder"}),
     "global-cancel": frozenset({"reqGlobalCancel", "global_cancel", "cancel_all_orders"}),
-    "submit": frozenset({"submit_approved_intent"}),
+    # 提交与改单都会把意图交给券商，只能由 server/risk 调用（O-03：改单入口与提交同等对待）
+    "submit": frozenset({"submit_approved_intent", "request_amend"}),
     # 模式变更只能经 ModeManager 写入账本（C-04）
     # 订单票据只能由 OMS 签发（B-01）：从类型上挡住“不经风控直接下单”
     "order-ticket": frozenset({"OrderTicket", "OrderAmendment"}),

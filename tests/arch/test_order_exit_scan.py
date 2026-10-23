@@ -447,6 +447,8 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
     "帧对象的全局字典": ("server/strategy/s.py", "g = frame.f_back.f_globals" + NL, "dynamic-call"),
     "回溯对象的帧": ("server/data/d.py", "f = exc.__traceback__.tb_frame" + NL, "dynamic-call"),
     "生成器的帧": ("server/data/d.py", "f = gen.gi_frame" + NL, "dynamic-call"),
+    "api 直接改单": ("server/api/r.py", "await oms.request_amend('i-1')" + NL, "risk-bypass"),
+    "strategy 直接改单": ("server/strategy/s.py", "om.request_amend" + NL, "risk-bypass"),
     "其他模块伪造账户观察审计": (
         "server/oms/o.py",
         "repo.append_audit(AuditEvent(action='account_observed'))\n",
@@ -551,6 +553,7 @@ ALLOWED: dict[str, tuple[str, str]] = {
         "server/data/d.py",
         "p = re.compile('x')" + NL + "y = df.eval('a + b')" + NL,
     ),
+    "risk 调用改单": ("server/risk/r.py", "await oms.request_amend('i-1')" + NL),
     "oms 撤保护性止损": (
         "server/oms/o.py",
         "await b.cancel_order(oid, allow_protective_stop=True)" + NL,
