@@ -120,6 +120,7 @@ def full_repo(repo: LedgerRepository) -> LedgerRepository:
     repo.record_perm_id("int-1", "9001", T0)
     repo.append_order_event(make_event("ev-1", EventKind.RISK_APPROVED), OrderStatus.RISK_APPROVED)
     repo.add_execution(make_execution())
+    repo.add_correction(make_execution("exec-2", "3"), "exec-1", T0)
     repo.record_command("req-1", "halt_new_orders", "{}", T0)
     repo.append_audit(make_audit())
     halt = HaltState(halted=True, reason="急停", since=T0, set_by="dylan")
@@ -282,6 +283,8 @@ REPLACE_CASES: dict[str, tuple[str, str]] = {
                         "VALUES ('101','int-1','d-1','999','x')"),
     "unmatched_executions": ("reason = 'x'", "(execution_id, reason, recorded_at, payload) "
                              "VALUES ('foreign-1','x','x','{}')"),
+    "execution_supersessions": ("recorded_at = 'x'", "(superseded_execution_id, "
+                                "superseding_execution_id, recorded_at) VALUES ('exec-1','exec-2','x')"),
 }  # fmt: skip
 
 
@@ -589,3 +592,50 @@ def test_unmatched_executions_are_kept(repo: LedgerRepository) -> None:
     with pytest.raises(ConflictError):
         repo.add_unmatched_execution("x-1", "no_order_ref", '{"q": "1"}', T0)
     assert repo.unmatched_executions() == [("x-1", "no_order_ref", '{"q": "0.5"}')]
+
+
+# ---------- O-02：成交更正 ----------
+
+
+def test_correction_supersedes_once_and_is_idempotent(repo: LedgerRepository) -> None:
+    repo.add_intent(make_intent())
+    repo.add_broker_order(make_broker_order())
+    repo.add_execution(make_execution())
+    fix = make_execution("exec-2", "3")
+    assert repo.add_correction(fix, "exec-1", T0) is True
+    assert repo.add_correction(fix, "exec-1", T0) is False
+    assert [e.execution_id for e in repo.effective_executions_for("int-1")] == ["exec-2"]
+    with pytest.raises(ConflictError):  # 同一笔不能被取代两次
+        repo.add_correction(make_execution("exec-3", "2"), "exec-1", T0)
+    assert repo.superseded_executions("int-1") == {"exec-1"}
+    assert [e.execution_id for e in repo.executions_for("int-1")] == ["exec-1", "exec-2"]
+
+
+def test_correction_cannot_cross_orders(repo: LedgerRepository) -> None:
+    for intent_id, boid in (("int-1", "101"), ("int-2", "102")):
+        repo.add_intent(make_intent(intent_id))
+        repo.add_broker_order(make_broker_order(intent_id, boid))
+    repo.add_execution(make_execution())
+    with pytest.raises(ConflictError):
+        repo.add_correction(make_execution("exec-9", "1", "int-2", "102"), "exec-1", T0)
+    assert repo.superseded_executions("int-1") == set()
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [("exec-3", "exec-3"), ("exec-2", "exec-1")],  # 自取代（从未被取代的成交）；成环
+)
+def test_supersession_trigger_rejects_self_and_cycles(
+    db_path: Path, repo: LedgerRepository, pair: tuple[str, str]
+) -> None:
+    repo.add_intent(make_intent())
+    repo.add_broker_order(make_broker_order())
+    repo.add_execution(make_execution())
+    repo.add_correction(make_execution("exec-2", "3"), "exec-1", T0)
+    repo.add_execution(make_execution("exec-3", "1"))
+    with raw(db_path) as conn, pytest.raises(sqlite3.IntegrityError, match="within one order"):
+        conn.execute(
+            "INSERT INTO execution_supersessions (superseded_execution_id, "
+            "superseding_execution_id, recorded_at) VALUES (?, ?, 'x')",
+            pair,
+        )

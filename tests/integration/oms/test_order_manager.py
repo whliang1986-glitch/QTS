@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any
 
 import pytest
 import pytest_asyncio
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 from server.broker.base import (
     BrokerEvent,
     BrokerExecution,
@@ -42,6 +44,7 @@ from server.oms.manager import (
     CancelRefusedError,
     OrderManager,
     SubmissionRefusedError,
+    canonical,
 )
 from server.storage.errors import StorageError
 from server.storage.ledger import LedgerRepository, open_ledger
@@ -370,7 +373,7 @@ async def test_fill_after_cancel_is_booked_with_discrepancy(env: Env) -> None:
 
 
 @pytest.mark.asyncio
-async def test_foreign_and_corrected_executions_are_kept_unmatched(env: Env) -> None:
+async def test_foreign_execution_is_unmatched_and_correction_supersedes(env: Env) -> None:
     await env.submit()
     await env.pump()
     env.server.inject_foreign_execution("SPY", Side.SELL, Decimal("0.5"), Decimal(100))
@@ -378,8 +381,8 @@ async def test_foreign_and_corrected_executions_are_kept_unmatched(env: Env) -> 
     env.server.correct_execution(ex.execution_id, Decimal(3), Decimal(100))
     await env.pump()
     reasons = sorted(r for _, r, _ in env.repo.unmatched_executions())
-    assert reasons == ["correction", "no_order"]
-    assert env.om.filled_quantity("i-1") == Decimal(4)  # 更正先不计入（O-02 冲正）
+    assert reasons == ["no_order"]
+    assert env.om.filled_quantity("i-1") == Decimal(3)  # 更正取代原成交（O-02）
 
 
 @pytest.mark.asyncio
@@ -671,3 +674,248 @@ async def test_cancel_before_submit_is_recorded(env: Env) -> None:
     env.intent()
     assert await env.om.request_cancel("i-1") is S.CREATED
     assert "cancel_before_submit" in env.discrepancies()
+
+
+# ---------- O-02：成交更正、数值规范化、重复提交与重复回报 ----------
+
+
+@pytest.mark.asyncio
+async def test_correction_after_filled_reduces_quantity_and_flags_missing_fills(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    ex = env.server.fill(env.oid(), Decimal(10), Decimal(100))
+    await env.pump()
+    assert env.om.status("i-1") is S.FILLED
+    env.server.correct_execution(ex.execution_id, Decimal(8), Decimal(100))
+    await env.pump()
+    assert env.om.filled_quantity("i-1") == Decimal(8)
+    assert env.om.status("i-1") is S.FILLED  # 终态不变，差异交对账
+    assert {"execution_corrected", "fills_missing"} <= set(env.discrepancies())
+
+
+@pytest.mark.asyncio
+async def test_correction_chain_and_replays(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    ex = env.server.fill(env.oid(), Decimal(4), Decimal(100))
+    first = env.server.correct_execution(ex.execution_id, Decimal(3), Decimal(100))
+    second = env.server.correct_execution(first.execution_id, Decimal(5), Decimal(100))
+    env.server.duplicate_execution(second.execution_id)  # 更正重放
+    await env.pump()
+    assert env.om.filled_quantity("i-1") == Decimal(5)
+    assert env.repo.superseded_executions("i-1") == {ex.execution_id, first.execution_id}
+    # 重放不写任何新记录：不进未匹配表，不记“更正已取代成交”的差异
+    assert env.repo.unmatched_executions() == []
+    assert "correction_of_superseded" not in env.discrepancies()
+    audits_before = len(env.repo.audits(DISCREPANCY))
+    for fid in (ex.execution_id, first.execution_id, second.execution_id):
+        env.server.duplicate_execution(fid)
+    await env.pump()
+    assert len(env.repo.audits(DISCREPANCY)) == audits_before
+    # 再拿已被取代的那笔做更正：不计入，照实进未匹配表
+    await env.om.on_broker_event(execution(env, "late-fix", "1", corrects=ex.execution_id))
+    assert env.om.filled_quantity("i-1") == Decimal(5)
+    assert [r for e, r, _ in env.repo.unmatched_executions() if e == "late-fix"] == [
+        "correction_of_superseded"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_correction_before_its_target_is_kept_unmatched(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    await env.om.on_broker_event(execution(env, "fix", "3", corrects="not-yet"))
+    assert env.om.filled_quantity("i-1") == 0
+    assert "correction_unknown_target" in env.discrepancies()
+
+
+@pytest.mark.asyncio
+async def test_replay_with_different_decimal_representation_is_not_a_conflict(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    await env.om.on_broker_event(execution(env, "e-1", "4", price=Decimal("99.50")))
+    await env.om.on_broker_event(execution(env, "e-1", "4.0", price=Decimal("99.500")))
+    assert env.om.filled_quantity("i-1") == Decimal(4)
+    assert "execution_conflict" not in env.discrepancies()
+
+
+@pytest.mark.asyncio
+async def test_resubmission_after_restart_never_places_again(env: Env) -> None:
+    intent, _ = await env.submit()
+    decision = env.repo.risk_decisions_for("i-1")[0]
+    restarted = OrderManager(
+        env.repo, env.broker, instruments={"SPY": SPY}, clock=env.clock, on_unresolved=print
+    )
+    for _ in range(3):
+        await restarted.submit_approved_intent(intent, decision)
+    assert len(await env.broker.open_orders()) == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_status_reports_write_no_duplicate_events(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    for _ in range(5):
+        await env.om.on_broker_event(status_update(env, BrokerOrderState.ACKNOWLEDGED))
+    kinds = [e.kind for e, _ in env.repo.order_history("i-1")]
+    assert kinds.count(EventKind.BROKER_ACK) == 1
+
+
+FILL_PLANS = st.lists(st.integers(min_value=1, max_value=4), min_size=1, max_size=6).filter(
+    lambda xs: sum(xs) <= 10
+)
+
+
+@settings(
+    max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture]
+)
+@given(
+    plan=FILL_PLANS,
+    duplicates=st.lists(st.integers(min_value=0, max_value=5), max_size=6),
+    seed=st.randoms(use_true_random=False),
+)
+def test_duplicated_and_shuffled_reports_book_each_fill_once(
+    tmp_path_factory: pytest.TempPathFactory,
+    plan: list[int],
+    duplicates: list[int],
+    seed: Any,
+) -> None:
+    async def run() -> None:
+        env = Env(tmp_path_factory.mktemp("prop"))
+        await env.broker.connect()
+        await env.submit()
+        await env.pump()
+        reports = [execution(env, f"e-{i}", str(q)) for i, q in enumerate(plan)]
+        stream = reports + [reports[i % len(reports)] for i in duplicates]
+        seed.shuffle(stream)
+        for report in stream:
+            await env.om.on_broker_event(report)
+        assert env.om.filled_quantity("i-1") == Decimal(sum(plan))
+        expected = S.FILLED if sum(plan) == 10 else S.PARTIALLY_FILLED
+        assert env.om.status("i-1") is expected
+        assert len(env.repo.executions_for("i-1")) == len(plan)
+
+    asyncio.run(run())
+
+
+# ---------- O-02 第一轮评审补充 ----------
+
+
+@pytest.mark.asyncio
+async def test_correction_arriving_first_is_paired_when_target_arrives(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    # 更正链整体先到，原成交最后到
+    await env.om.on_broker_event(execution(env, "e-1.02", "6", corrects="e-1.01"))
+    await env.om.on_broker_event(execution(env, "e-1.01", "5", corrects="e-1"))
+    assert env.om.filled_quantity("i-1") == 0
+    (_, _, payload), *_ = env.repo.unmatched_executions()
+    assert json.loads(payload)["corrects"]  # 存的是券商原文（含 corrects），便于对账配对
+    await env.om.on_broker_event(execution(env, "e-1", "4"))
+    assert env.om.filled_quantity("i-1") == Decimal(6)  # 逐级配对，只剩最后一笔有效
+    assert env.repo.superseded_executions("i-1") == {"e-1", "e-1.01"}
+    assert env.om.status("i-1") is S.PARTIALLY_FILLED
+
+
+@pytest.mark.asyncio
+async def test_lookup_books_plain_executions_before_corrections(env: Env) -> None:
+    env.server.lose_next_ack()
+    await env.submit()
+    env.clock.advance(11)
+    env.om.check_timeouts()
+    ex = env.server.fill(env.oid(), Decimal(10), Decimal(100))
+    env.server.correct_execution(ex.execution_id, Decimal(9), Decimal(100))
+    env.broker._queue = type(env.broker._queue)()  # 丢掉推送，只靠查单
+    assert await env.om.resolve_unknown("i-1") is S.FILLED  # 券商仍报 FILLED
+    assert env.om.filled_quantity("i-1") == Decimal(9)  # 先入账原成交、再入账更正
+    assert "fills_missing" in env.discrepancies()
+    assert env.repo.unmatched_executions() == []
+
+
+@pytest.mark.asyncio
+async def test_correction_overfilling_a_filled_order_is_flagged(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    ex = env.server.fill(env.oid(), Decimal(10), Decimal(100))
+    await env.pump()
+    await env.om.on_broker_event(execution(env, "fix", "12", corrects=ex.execution_id))
+    assert env.om.filled_quantity("i-1") == Decimal(12)
+    assert "overfill" in env.discrepancies()
+
+
+def test_canonical_is_exact_and_context_independent() -> None:
+    assert canonical(Decimal("500.050")) == Decimal("500.05")
+    assert str(canonical(Decimal("100.00"))) == "100"
+    assert str(canonical(Decimal("-0.00"))) == "0"
+    big = Decimal("123456789012345.1234567891")
+    with localcontext() as ctx:
+        ctx.prec = 6  # 调用方把精度调低也不影响
+        assert canonical(big) == big
+
+
+CHAINS = st.lists(
+    st.lists(st.integers(min_value=1, max_value=3), min_size=1, max_size=3),
+    min_size=1,
+    max_size=3,
+)
+
+
+@settings(
+    max_examples=40, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture]
+)
+@given(chains=CHAINS, duplicates=st.lists(st.integers(0, 20), max_size=6), seed=st.randoms())
+def test_corrections_duplicated_and_shuffled_end_with_final_values(
+    tmp_path_factory: pytest.TempPathFactory,
+    chains: list[list[int]],
+    duplicates: list[int],
+    seed: Any,
+) -> None:
+    """每笔成交带一条更正链（第一个值是原成交，之后是逐次更正）；随机重复、打乱后有效量等于各链最后的值。"""
+
+    async def run() -> None:
+        env = Env(tmp_path_factory.mktemp("prop-fix"))
+        await env.broker.connect()
+        await env.submit()
+        await env.pump()
+        reports = []
+        for i, chain in enumerate(chains):
+            ids = [f"e-{i}"] + [f"e-{i}.{k:02d}" for k in range(1, len(chain))]
+            for k, qty in enumerate(chain):
+                corrects = ids[k - 1] if k else None
+                reports.append(execution(env, ids[k], str(qty), corrects=corrects))
+        stream = reports + [reports[d % len(reports)] for d in duplicates]
+        seed.shuffle(stream)
+        for report in stream:
+            await env.om.on_broker_event(report)
+        final = sum(chain[-1] for chain in chains)
+        assert env.om.filled_quantity("i-1") == Decimal(final)
+        assert "correction_of_superseded" not in env.discrepancies()
+        # 未匹配表里只可能有等待过配对的更正，且最后都已配对入账
+        assert all(env.repo.has_execution(e) for e, _, _ in env.repo.unmatched_executions())
+
+    asyncio.run(run())
+
+
+# ---------- O-02 第二轮评审补充 ----------
+
+
+@pytest.mark.asyncio
+async def test_correction_replay_with_changed_content_is_flagged(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    await env.om.on_broker_event(execution(env, "e-1", "4"))
+    await env.om.on_broker_event(execution(env, "e-1.01", "3", corrects="e-1"))
+    await env.om.on_broker_event(execution(env, "e-1.01", "2", corrects="e-1"))  # 内容变了
+    assert env.om.filled_quantity("i-1") == Decimal(3)  # 保留第一次的事实
+    assert "correction_conflict" in env.discrepancies()
+
+
+@pytest.mark.asyncio
+async def test_two_waiting_corrections_for_one_execution_are_flagged(env: Env) -> None:
+    await env.submit()
+    await env.pump()
+    await env.om.on_broker_event(execution(env, "fix-a", "3", corrects="e-1"))
+    await env.om.on_broker_event(execution(env, "fix-b", "2", corrects="e-1"))
+    await env.om.on_broker_event(execution(env, "e-1", "4"))
+    assert env.om.filled_quantity("i-1") in {Decimal(3), Decimal(2)}  # 只有一笔取代成功
+    assert "correction_conflict" in env.discrepancies()

@@ -17,8 +17,9 @@
 4. 撤单：SUBMITTING / UNKNOWN 的订单不能直接撤，挂起到确认后再撤；保护性止损不走这里（R-05）。
 5. 提交超时：离开 SUBMITTING 即取消定时；迟到的超时记录后忽略。
 
-不做的事（后续任务）：改单与撤单竞态（O-03）、崩溃恢复与启动对账（O-05、R-07）、成交更正冲正（O-02）、
-佣金后到的入账（B-03）。
+成交更正（O-02）：更正另起一行并记录取代关系，有效成交量只看未被取代的成交。
+
+不做的事（后续任务）：改单与撤单竞态（O-03）、崩溃恢复与启动对账（O-05、R-07）、佣金后到的入账（B-03）。
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import logging
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 from server.broker.base import (
     BrokerAdapter,
@@ -74,6 +75,19 @@ OBSERVED: Mapping[BrokerOrderState, OrderStatus] = {
 }
 
 
+def canonical(value: Decimal) -> Decimal:
+    """去掉末尾的 0：500.050 → 500.05，100.00 → 100（不用科学计数法），-0 → 0。
+
+    用独立的高精度上下文，不受调用方 decimal 上下文影响；结果与原值不等即拒绝（绝不静默舍入）。
+    """
+    with localcontext() as ctx:
+        ctx.prec = 60
+        result = Decimal(format(value.normalize(), "f"))
+    if result != value:
+        raise ValueError(f"数值规范化改变了取值：{value}")
+    return Decimal(0) if result.is_zero() else result
+
+
 class SubmissionRefusedError(Exception):
     """拒绝签发：风控决定未落账或不匹配、已被使用、标的规格缺失等（失败即关闭，不下单）。"""
 
@@ -113,7 +127,9 @@ class OrderManager:
         return self._repo.latest_status(intent_id) or S.CREATED
 
     def filled_quantity(self, intent_id: str) -> Decimal:
-        return sum((e.quantity for e in self._repo.executions_for(intent_id)), Decimal(0))
+        """有效成交量：被更正取代的成交不计（O-02）。"""
+        executions = self._repo.effective_executions_for(intent_id)
+        return sum((e.quantity for e in executions), Decimal(0))
 
     # ---------- 提交 ----------
 
@@ -238,7 +254,8 @@ class OrderManager:
             return self._miss(intent_id, f"lookup_failed:{type(exc).__name__}")
         if self.status(intent_id) is not S.UNKNOWN:  # 等待查询期间已被并发查证转出
             return self.status(intent_id)
-        for execution in lookup.executions:
+        # 先入账普通成交、再入账更正：同一批查单结果里的更正不会因顺序落到“更正先到”
+        for execution in sorted(lookup.executions, key=lambda e: e.corrects is not None):
             self._book_execution(execution)
         record = self._verified_record(intent_id, lookup.orders)
         if record is None:
@@ -440,51 +457,134 @@ class OrderManager:
             execution.broker_order_id, execution.order_ref, execution.perm_id
         )
         reason = self._unmatched_reason(execution, intent_id)
-        now = self._clock()
+        perm_ok = (
+            reason is not None
+            or intent_id is None
+            or execution.perm_id is None
+            or self._record_perm_id(intent_id, execution.perm_id)
+        )
+        if not perm_ok:
+            reason = "perm_conflict"  # permId 已属于别的意图：不计入本意图（失败即关闭）
         if reason is not None or intent_id is None:
-            try:
-                self._repo.add_unmatched_execution(
-                    execution.execution_id, reason or "unmatched", execution.model_dump_json(), now
-                )
-            except ConflictError:  # 同一成交重放时内容变了：记差异，不中断事件流
-                self._discrepancy(
-                    intent_id, "unmatched_execution_conflict", execution_id=execution.execution_id
-                )
-                return None
-            self._discrepancy(
-                intent_id, "unmatched_execution", execution_id=execution.execution_id,
-                reason=reason or "unmatched",
-            )  # fmt: skip
+            self._park_unmatched(execution, intent_id, reason or "unmatched")
             return None
-        if execution.perm_id is not None and not self._record_perm_id(intent_id, execution.perm_id):
-            self._repo.add_unmatched_execution(
-                execution.execution_id, "perm_conflict", execution.model_dump_json(), now
-            )
-            return None  # permId 已属于别的意图：不计入本意图（失败即关闭）
         booked = Execution(
             execution_id=execution.execution_id,
             intent_id=intent_id,
             broker_order_id=execution.broker_order_id or "",
             symbol=execution.symbol,
             side=execution.side,
-            quantity=execution.quantity,
-            price=execution.price,
+            # 数值规范化：同一成交重放时 500.05 与 500.050 视为相同（C-03 移交）
+            quantity=canonical(execution.quantity),
+            price=canonical(execution.price),
             # 佣金后到时先记 0，最终值由 CommissionReport 入账（B-03 定口径）
-            commission=execution.commission if execution.commission is not None else Decimal(0),
+            commission=canonical(execution.commission or Decimal(0)),
             executed_at=execution.executed_at,
         )
+        if execution.corrects is not None:
+            return self._book_correction(execution, booked, execution.corrects)
         try:
             inserted = self._repo.add_execution(booked)
         except ConflictError:
             self._discrepancy(intent_id, "execution_conflict", execution_id=execution.execution_id)
             return None
-        if inserted and self.status(intent_id) in TERMINAL:
+        if not inserted:
+            return None
+        if self.status(intent_id) in TERMINAL:
             self._discrepancy(intent_id, "fill_after_terminal", execution_id=execution.execution_id)
-        return intent_id if inserted else None
+        self._pair_waiting_corrections(execution.execution_id)
+        return intent_id
+
+    def _park_unmatched(
+        self, execution: BrokerExecution, intent_id: str | None, reason: str
+    ) -> None:
+        """照实（券商原文）存入未匹配成交表；重放不重复记差异，内容变化记冲突差异。"""
+        try:
+            fresh = self._repo.add_unmatched_execution(
+                execution.execution_id, reason, execution.model_dump_json(), self._clock()
+            )
+        except ConflictError:  # 同一成交重放时内容变了：记差异，不中断事件流
+            self._discrepancy(
+                intent_id, "unmatched_execution_conflict", execution_id=execution.execution_id
+            )
+            return
+        if fresh:
+            self._discrepancy(
+                intent_id, "unmatched_execution", execution_id=execution.execution_id, reason=reason
+            )
+
+    def _book_correction(self, fact: BrokerExecution, booked: Execution, target: str) -> str | None:
+        """成交更正：被更正的成交必须是本意图里仍然有效的一笔；更正另起一行并记录取代关系。
+
+        - 同一更正重放（取代关系已经存在）：静默忽略，不写任何新记录；
+        - 被更正的成交还没入账（更正先到）：照实（券商原文）放进未匹配成交表等待配对，
+          原成交入账时自动补做取代；
+        - 被更正的成交已被别的更正取代：照实放进未匹配成交表并记差异，交对账处理。
+        """
+        intent_id = booked.intent_id
+        if self._repo.superseding_of(target) == booked.execution_id:
+            # 重放：内容相同静默忽略；内容变了（数量、价格、佣金）记冲突差异，保留第一次的事实
+            try:
+                self._repo.add_correction(booked, target, self._clock())
+            except ConflictError:
+                self._discrepancy(
+                    intent_id, "correction_conflict", execution_id=booked.execution_id
+                )
+            return None
+        effective = {e.execution_id for e in self._repo.effective_executions_for(intent_id)}
+        if target not in effective:
+            reason = (
+                "correction_of_superseded"
+                if target in self._repo.superseded_executions(intent_id)
+                else "correction_unknown_target"
+            )
+            try:
+                fresh = self._repo.add_unmatched_execution(
+                    fact.execution_id, reason, fact.model_dump_json(), self._clock()
+                )
+            except ConflictError:
+                fresh = False
+            if fresh:  # 重放的未配对更正不重复记差异
+                self._discrepancy(
+                    intent_id, reason, execution_id=booked.execution_id, corrects=target
+                )
+            return None
+        try:
+            inserted = self._repo.add_correction(booked, target, self._clock())
+        except ConflictError:
+            self._discrepancy(intent_id, "correction_conflict", execution_id=booked.execution_id)
+            return None
+        if not inserted:
+            return None
+        self._discrepancy(
+            intent_id, "execution_corrected", execution_id=booked.execution_id, corrects=target
+        )
+        self._pair_waiting_corrections(booked.execution_id)  # 更正链：后面的更正可能先到了
+        return intent_id
+
+    def _pair_waiting_corrections(self, execution_id: str) -> None:
+        """有成交（或更正）入账后，把先到的、更正它的那笔从等待中取出入账。
+
+        未匹配成交表只追加：配对后原行保留；
+        同一 execution_id 出现在成交表即表示已配对（R-07 据此判断）。
+        """
+        for waiting_id, reason, payload in self._repo.unmatched_executions():
+            if reason != "correction_unknown_target" or self._repo.has_execution(waiting_id):
+                continue
+            try:
+                fact = BrokerExecution.model_validate_json(payload)
+            except ValueError:  # 无法解析的旧行：记差异后跳过，不中断事件处理
+                self._discrepancy(None, "unparsable_waiting_correction", execution_id=waiting_id)
+                continue
+            if fact.corrects != execution_id:
+                continue
+            if self._book_execution(fact) is None and not self._repo.has_execution(waiting_id):
+                # 配对仍失败：通常是另一笔更正先取代了同一成交
+                self._discrepancy(
+                    None, "correction_conflict", execution_id=waiting_id, corrects=execution_id
+                )
 
     def _unmatched_reason(self, execution: BrokerExecution, intent_id: str | None) -> str | None:
-        if execution.corrects is not None:
-            return "correction"  # 冲正由 O-02 处理：先照实保存，不计入成交量
         if intent_id is None:
             return "no_order"
         intent = self._repo.get_intent(intent_id)
@@ -503,8 +603,14 @@ class OrderManager:
     def _sync_fills(self, intent_id: str, status: OrderStatus) -> OrderStatus:
         """按累计成交推进 PARTIAL_FILL / FULL_FILL（成交数量只由已入账的成交决定）。"""
         if status not in FILLABLE:
-            if status is S.FILLED and self.filled_quantity(intent_id) < self._ordered(intent_id):
-                self._discrepancy(intent_id, "fills_missing")
+            if status is S.FILLED:
+                filled, ordered = self.filled_quantity(intent_id), self._ordered(intent_id)
+                if filled < ordered:
+                    self._discrepancy(intent_id, "fills_missing")
+                elif filled > ordered:
+                    self._discrepancy(
+                        intent_id, "overfill", filled=str(filled), ordered=str(ordered)
+                    )
             return status
         filled, ordered = self.filled_quantity(intent_id), self._ordered(intent_id)
         if filled > ordered:
