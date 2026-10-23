@@ -98,6 +98,19 @@ class Issuance:
 
 
 @dataclass(frozen=True)
+class Amendment:
+    """一次改单请求及其当前结果（O-03）。result 为空表示券商调用之前就停下了（崩溃窗口）。"""
+
+    amendment_id: str
+    intent_id: str
+    decision_id: str
+    new_price: Decimal
+    new_quantity: Decimal
+    requested_at: str
+    result: str | None
+
+
+@dataclass(frozen=True)
 class ModeChange:
     change_id: str
     mode: Mode
@@ -507,6 +520,107 @@ class LedgerRepository:
         )
         with self._reading("unmatched_executions") as conn:
             return [(str(e), str(r), str(p)) for e, r, p in conn.execute(stmt)]
+
+    # ---------- 改单（O-03） ----------
+
+    def add_amendment(  # noqa: PLR0913 - 改单请求的字段全部显式给出
+        self,
+        *,
+        amendment_id: str,
+        intent_id: str,
+        decision_id: str,
+        new_price: Decimal,
+        new_quantity: Decimal,
+        at: datetime,
+    ) -> bool:
+        """改单请求在调用券商之前落账。
+
+        相同请求重写返回 False；决定已被别的改单用过抛 ConflictError。
+        """
+        row = {
+            "amendment_id": amendment_id,
+            "intent_id": intent_id,
+            "decision_id": decision_id,
+            "new_price": str(new_price),
+            "new_quantity": str(new_quantity),
+            "requested_at": _iso(at),
+        }
+        same = (amendment_id, intent_id, decision_id, str(new_price), str(new_quantity))
+        return self._insert_once(
+            schema.order_amendments,
+            row,
+            [{"amendment_id": amendment_id}, {"decision_id": decision_id}],
+            lambda r: (
+                (r.amendment_id, r.intent_id, r.decision_id, r.new_price, r.new_quantity) == same
+            ),
+        )
+
+    def record_amendment_result(self, amendment_id: str, result: str, at: datetime) -> bool:
+        """追加一条改单结果。与当前结果相同返回 False（重放）；先后关系不合法抛 ConflictError。
+
+        合法的先后：无 → 任意；UNKNOWN → ACCEPTED / REJECTED；ACCEPTED → REJECTED（券商异步拒绝）。
+        """
+        if self.amendment_result(amendment_id) == result:
+            return False
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(
+                    schema.order_amendment_results.insert().values(
+                        amendment_id=amendment_id, result=result, recorded_at=_iso(at)
+                    )
+                )
+        except IntegrityError as exc:
+            current = self.amendment_result(amendment_id)
+            raise ConflictError(
+                f"改单 {amendment_id} 的结果不能从 {current} 变为 {result}"
+            ) from exc
+        except DBAPIError as exc:
+            raise StorageError(f"写入改单结果失败：{exc.orig}") from exc
+        return True
+
+    def amendment_result(self, amendment_id: str) -> str | None:
+        """当前结果（最后一条）；没有结果返回 None。"""
+        t = schema.order_amendment_results
+        stmt = (
+            select(t.c.result)
+            .where(t.c.amendment_id == amendment_id)
+            .order_by(t.c.seq.desc())
+            .limit(1)
+        )
+        with self._reading("order_amendment_results") as conn:
+            value = conn.execute(stmt).scalar()
+        return None if value is None else str(value)
+
+    def amendment_owner(self, amendment_id: str) -> str | None:
+        """amendment_id 属于哪个意图（全局唯一）。"""
+        row = self._fetch(schema.order_amendments, {"amendment_id": amendment_id})
+        return None if row is None else str(row.intent_id)
+
+    def amendments_for(self, intent_id: str) -> list[Amendment]:
+        """某意图的全部改单，按请求顺序。"""
+        a = schema.order_amendments
+        stmt = select(a).where(a.c.intent_id == intent_id).order_by(a.c.seq)
+        with self._reading("order_amendments") as conn:
+            rows = list(conn.execute(stmt))
+        return [
+            Amendment(
+                amendment_id=row.amendment_id,
+                intent_id=row.intent_id,
+                decision_id=row.decision_id,
+                new_price=Decimal(row.new_price),
+                new_quantity=Decimal(row.new_quantity),
+                requested_at=row.requested_at,
+                result=self.amendment_result(row.amendment_id),
+            )
+            for row in rows
+        ]
+
+    def decision_is_used(self, decision_id: str) -> bool:
+        """风控决定是否已被签发或改单用过（一个决定只能用一次）。"""
+        return (
+            self._fetch(schema.ticket_issuance, {"decision_id": decision_id}) is not None
+            or self._fetch(schema.order_amendments, {"decision_id": decision_id}) is not None
+        )
 
     # ---------- 风控决定 ----------
 

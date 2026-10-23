@@ -117,6 +117,12 @@ def full_repo(repo: LedgerRepository) -> LedgerRepository:
         OrderStatus.SUBMITTING,
     )
     repo.add_unmatched_execution("foreign-1", "no_order_ref", "{}", T0)
+    repo.add_risk_decision(make_decision("d-2"))
+    repo.add_amendment(
+        amendment_id="am-1", intent_id="int-1", decision_id="d-2", new_price=Decimal(1),
+        new_quantity=Decimal(1), at=T0,
+    )  # fmt: skip
+    repo.record_amendment_result("am-1", "ACCEPTED", T0)
     repo.record_perm_id("int-1", "9001", T0)
     repo.append_order_event(make_event("ev-1", EventKind.RISK_APPROVED), OrderStatus.RISK_APPROVED)
     repo.add_execution(make_execution())
@@ -283,6 +289,10 @@ REPLACE_CASES: dict[str, tuple[str, str]] = {
                         "VALUES ('101','int-1','d-1','999','x')"),
     "unmatched_executions": ("reason = 'x'", "(execution_id, reason, recorded_at, payload) "
                              "VALUES ('foreign-1','x','x','{}')"),
+    "order_amendments": ("new_price = '9'", "(seq, amendment_id, intent_id, decision_id, new_price, "
+                         "new_quantity, requested_at) VALUES (1,'am-x','int-1','d-2','1','1','x')"),
+    "order_amendment_results": ("result = 'REJECTED'", "(seq, amendment_id, result, recorded_at) "
+                                "VALUES (1,'am-1','REJECTED','x')"),
     "execution_supersessions": ("recorded_at = 'x'", "(superseded_execution_id, "
                                 "superseding_execution_id, recorded_at) VALUES ('exec-1','exec-2','x')"),
 }  # fmt: skip
@@ -639,3 +649,62 @@ def test_supersession_trigger_rejects_self_and_cycles(
             "superseding_execution_id, recorded_at) VALUES (?, ?, 'x')",
             pair,
         )
+
+
+# ---------- O-03：改单 ----------
+
+
+def test_amendments_consume_decisions_once_and_keep_results(repo: LedgerRepository) -> None:
+    repo.add_intent(make_intent())
+    repo.add_risk_decision(make_allow("d-a"))
+    kw = {"intent_id": "int-1", "decision_id": "d-a", "new_price": Decimal("1.5"),
+          "new_quantity": Decimal(5), "at": T0}  # fmt: skip
+    assert repo.add_amendment(amendment_id="am-1", **kw) is True  # type: ignore[arg-type]
+    assert repo.add_amendment(amendment_id="am-1", **kw) is False  # type: ignore[arg-type]
+    with pytest.raises(ConflictError):  # 同一决定给第二次改单
+        repo.add_amendment(amendment_id="am-2", **kw)  # type: ignore[arg-type]
+    assert repo.decision_is_used("d-a")
+    (pending,) = repo.amendments_for("int-1")
+    assert pending.result is None  # 券商调用之前的崩溃窗口可见
+    repo.record_amendment_result("am-1", "UNKNOWN", T0)
+    assert repo.record_amendment_result("am-1", "UNKNOWN", T0) is False  # 重放
+    repo.record_amendment_result("am-1", "ACCEPTED", T0)  # 查证转正
+    assert repo.amendments_for("int-1")[0].result == "ACCEPTED"
+    with pytest.raises(ConflictError):  # ACCEPTED 之后只能被异步拒绝
+        repo.record_amendment_result("am-1", "UNKNOWN", T0)
+    repo.record_amendment_result("am-1", "REJECTED", T0)
+    with pytest.raises(ConflictError):  # REJECTED 是终结
+        repo.record_amendment_result("am-1", "ACCEPTED", T0)
+    assert repo.amendment_result("am-1") == "REJECTED"
+
+
+def test_amendment_result_values_are_checked(db_path: Path, repo: LedgerRepository) -> None:
+    repo.add_intent(make_intent())
+    repo.add_risk_decision(make_allow("d-a"))
+    repo.add_amendment(
+        amendment_id="am-1", intent_id="int-1", decision_id="d-a", new_price=Decimal(1),
+        new_quantity=Decimal(1), at=T0,
+    )  # fmt: skip
+    with raw(db_path) as conn, pytest.raises(sqlite3.IntegrityError, match="amendment result"):
+        conn.execute(
+            "INSERT INTO order_amendment_results (amendment_id, result, recorded_at) "
+            "VALUES ('am-1', 'MAYBE', 'x')"
+        )
+
+
+def test_amendment_decision_must_be_fresh_and_of_same_intent(repo: LedgerRepository) -> None:
+    for intent_id in ("int-1", "int-2"):
+        repo.add_intent(make_intent(intent_id))
+    repo.add_risk_decision(make_allow("d-1"))
+    repo.add_risk_decision(make_allow("d-2", "int-2"))
+    repo.commit_submission(
+        make_broker_order(), "d-1", Decimal(10), make_event("ev-s", EventKind.SUBMIT_SENT),
+        OrderStatus.SUBMITTING,
+    )  # fmt: skip
+    for decision_id in ("d-1", "d-2"):  # 已用于签发；属于别的意图
+        with pytest.raises(StorageError):
+            repo.add_amendment(
+                amendment_id=f"am-{decision_id}", intent_id="int-1", decision_id=decision_id,
+                new_price=Decimal(1), new_quantity=Decimal(1), at=T0,
+            )  # fmt: skip
+    assert repo.amendments_for("int-1") == []

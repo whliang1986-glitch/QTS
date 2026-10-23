@@ -19,11 +19,17 @@
 
 成交更正（O-02）：更正另起一行并记录取代关系，有效成交量只看未被取代的成交。
 
-不做的事（后续任务）：改单与撤单竞态（O-03）、崩溃恢复与启动对账（O-05、R-07）、佣金后到的入账（B-03）。
+改单（O-03）：只改价格与数量，必须附带新的、已落账的风控决定；请求先落账再调用券商；
+同一时刻只允许一张结果未定的改单，结果未定期间按“未定改单与有效数量中较大者”判定全部成交
+（不提前判 FILLED）；
+结果 UNKNOWN 由 `resolve_amendments` 查单后转正；保护性止损暂不允许改单（R-04 定规则后再开放）。
+
+不做的事（后续任务）：崩溃恢复与启动对账（O-05、R-07）、佣金后到的入账（B-03）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Callable, Mapping
@@ -31,6 +37,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 
 from server.broker.base import (
+    TERMINAL_STATES,
+    AmendmentRejectedError,
     BrokerAdapter,
     BrokerError,
     BrokerEvent,
@@ -38,6 +46,7 @@ from server.broker.base import (
     BrokerOrderState,
     CommissionReport,
     ExecutionReport,
+    OrderAmendment,
     OrderRecord,
     OrderStatusUpdate,
     OrderTicket,
@@ -92,6 +101,10 @@ class SubmissionRefusedError(Exception):
     """拒绝签发：风控决定未落账或不匹配、已被使用、标的规格缺失等（失败即关闭，不下单）。"""
 
 
+class AmendRefusedError(Exception):
+    """拒绝改单：状态不允许、风控决定未落账或已被用过、数量不大于已成交等（失败即关闭，不调用券商）。"""
+
+
 class CancelRefusedError(Exception):
     """拒绝撤单：保护性止损不经本入口撤销（R-05 的二次确认路径）。"""
 
@@ -120,6 +133,8 @@ class OrderManager:
         self._deadlines: dict[str, datetime] = {}
         self._pending_cancel: set[str] = set()
         self._lookup_misses: dict[str, int] = {}
+        self._amending: set[str] = set()  # 正在调用券商的改单（查证时跳过）
+        self._amend_pending_rounds: dict[str, int] = {}  # 改单查证仍对不上的轮数
 
     # ---------- 查询 ----------
 
@@ -291,13 +306,13 @@ class OrderManager:
     def _record_matches(self, intent_id: str, record: OrderRecord) -> bool:
         """查到的券商订单与签发内容一致（标的、方向、账户、数量、permId）。"""
         intent = self._repo.get_intent(intent_id)
-        issued = self._issued(intent_id)
         known_perm = self._repo.perm_id_for(intent_id)
         return (
             intent is not None
             and (record.symbol, record.side, record.account_id)
             == (intent.symbol, intent.side, intent.account_id)
-            and record.total_quantity == issued.quantity
+            and record.total_quantity
+            in {self._ordered(intent_id), *self._pending_amendments(intent_id)}
             and (known_perm is None or record.perm_id in {None, known_perm})
         )
 
@@ -344,6 +359,224 @@ class OrderManager:
         except Exception as exc:  # 撤单请求未确认：保持 CANCEL_PENDING，等回报或对账
             self._discrepancy(intent_id, "cancel_raised", error=type(exc).__name__)
         return status
+
+    # ---------- 改单 ----------
+
+    async def request_amend(
+        self,
+        intent_id: str,
+        *,
+        amendment_id: str,
+        new_price: Decimal,
+        new_quantity: Decimal,
+        decision: RiskDecision,
+    ) -> OrderStatus:
+        """改价格或数量（只改这两项；类别、方向、标的、类型、有效期在类型层面不可表达）。
+
+        - 只允许 SUBMITTED / PARTIALLY_FILLED；撤单中、待撤、提交中、UNKNOWN、终态一律拒绝；
+        - 必须附带针对新价格与数量、已落账、从未用过的新风控决定
+          （B-01 移交：按 amendment_id 消费）；
+        - 改单请求在调用券商之前落账；amendment_id 是幂等键，重复请求不再调用券商；
+        - 券商拒绝 → REJECTED；抛其他异常 → UNKNOWN（有效数量保持原值，记差异交对账）。
+        """
+        new_price, new_quantity = canonical(new_price), canonical(new_quantity)
+        owner = self._repo.amendment_owner(amendment_id)
+        if owner is not None:
+            return self._replayed_amendment(
+                intent_id=intent_id,
+                owner=owner,
+                amendment_id=amendment_id,
+                new_price=new_price,
+                new_quantity=new_quantity,
+                decision=decision,
+            )
+        status = self.status(intent_id)
+        if status not in ACTIVE or intent_id in self._pending_cancel:
+            raise AmendRefusedError(f"订单处于 {status.value}，不能改单")
+        if self._pending_amendments(intent_id):
+            raise AmendRefusedError("上一次改单结果未定，先查证（resolve_amendments）再改单")
+        amendment = self._amendment(intent_id, amendment_id, new_price, new_quantity, decision)
+        if new_quantity <= self.filled_quantity(intent_id):
+            raise AmendRefusedError("新数量必须大于已成交数量")
+        try:
+            self._repo.add_amendment(
+                amendment_id=amendment_id,
+                intent_id=intent_id,
+                decision_id=decision.decision_id,
+                new_price=new_price,
+                new_quantity=new_quantity,
+                at=self._clock(),
+            )
+        except ConflictError as exc:
+            raise AmendRefusedError("风控决定已被别的改单用过") from exc
+        self._amending.add(amendment_id)
+        try:
+            await self._broker.modify_order(amendment)
+        except asyncio.CancelledError:  # 调用方被取消：结果未知，记下后照样向上传递取消
+            self._amending.discard(amendment_id)
+            self._record_amendment_result(intent_id, amendment_id, "UNKNOWN")
+            self._discrepancy(intent_id, "amend_cancelled", amendment_id=amendment_id)
+            self._on_unresolved(intent_id)
+            raise
+        except (AmendmentRejectedError, UnknownOrderError) as exc:
+            self._amending.discard(amendment_id)
+            self._record_amendment_result(intent_id, amendment_id, "REJECTED")
+            self._discrepancy(intent_id, "amend_rejected", error=type(exc).__name__)
+            return self._sync_fills(intent_id, self.status(intent_id))
+        except Exception as exc:  # 结果未知：不重发；判全部成交按较大数量，查证后转正
+            self._amending.discard(amendment_id)
+            self._record_amendment_result(intent_id, amendment_id, "UNKNOWN")
+            self._discrepancy(intent_id, "amend_unknown", error=type(exc).__name__)
+            self._on_unresolved(intent_id)
+            return self.status(intent_id)
+        self._amending.discard(amendment_id)
+        self._record_amendment_result(intent_id, amendment_id, "ACCEPTED")
+        log_event(log, logging.INFO, "改单已接受", intent_id=intent_id, amendment_id=amendment_id)
+        return self._sync_fills(intent_id, self.status(intent_id))
+
+    def _record_amendment_result(self, intent_id: str, amendment_id: str, result: str) -> None:
+        """记改单结果；先后关系不合法（例如已被查证记为别的结果）记差异并升级，不让异常冒出。"""
+        try:
+            self._repo.record_amendment_result(amendment_id, result, self._clock())
+        except ConflictError:
+            self._discrepancy(
+                intent_id, "amend_result_conflict", amendment_id=amendment_id, result=result
+            )
+            self._on_unresolved(intent_id)
+
+    def _replayed_amendment(  # noqa: PLR0913
+        self,
+        *,
+        intent_id: str,
+        owner: str,
+        amendment_id: str,
+        new_price: Decimal,
+        new_quantity: Decimal,
+        decision: RiskDecision,
+    ) -> OrderStatus:
+        """同一 amendment_id 重放：参数一致则不再调用券商；参数不同或属于别的意图则拒绝。"""
+        if owner != intent_id:
+            raise AmendRefusedError(f"amendment_id {amendment_id} 已被别的意图用过")
+        recorded = next(
+            a for a in self._repo.amendments_for(intent_id) if a.amendment_id == amendment_id
+        )
+        if (recorded.new_price, recorded.new_quantity, recorded.decision_id) != (
+            new_price,
+            new_quantity,
+            decision.decision_id,
+        ):
+            raise AmendRefusedError(f"amendment_id {amendment_id} 已用于不同的改单内容")
+        return self.status(intent_id)
+
+    def _pending_amendments(self, intent_id: str) -> list[Decimal]:
+        """结果未定（未记录或 UNKNOWN）的改单数量。"""
+        return [
+            a.new_quantity
+            for a in self._repo.amendments_for(intent_id)
+            if a.result in {None, "UNKNOWN"}
+        ]
+
+    async def resolve_amendments(self, intent_id: str) -> None:
+        """按查单结果给未定的改单补记结果（正在调用券商的改单跳过）。
+
+        - 券商订单的数量与价格等于改单值：ACCEPTED；
+        - 对不上且券商订单已是终态：REJECTED（改单再也不会生效）；
+        - 对不上但订单还活着：券商可能还没处理完（IBKR 改单是异步的），保持 UNKNOWN 等下一轮，
+          绝不提前记成终结的 REJECTED。
+        结果为空的改单只在本进程没有在途改单时出现（崩溃后启动恢复，O-05），按同样规则处理。
+        """
+        pending = [
+            a
+            for a in self._repo.amendments_for(intent_id)
+            if a.result in {None, "UNKNOWN"} and a.amendment_id not in self._amending
+        ]
+        if not pending:
+            return
+        mine = self._issued(intent_id).broker_order.broker_order_id
+        try:
+            lookup = await self._broker.lookup_order(intent_id)
+        except Exception as exc:  # 查询失败：仍不确定，保持未定
+            self._discrepancy(intent_id, "amend_lookup_failed", error=type(exc).__name__)
+            return
+        records = [o for o in lookup.orders if o.broker_order_id == mine]
+        if not records:
+            self._discrepancy(intent_id, "amend_unresolved")
+            return
+        record = records[0]
+        for a in pending:
+            if a.amendment_id in self._amending:
+                continue  # 查单期间又发出了这张改单
+            applied = (record.total_quantity, record.price) == (a.new_quantity, a.new_price)
+            if applied:
+                result = "ACCEPTED"
+            elif record.state in TERMINAL_STATES:
+                result = "REJECTED"
+            else:
+                if a.result is None:
+                    self._record_amendment_result(intent_id, a.amendment_id, "UNKNOWN")
+                rounds = self._amend_pending_rounds.get(a.amendment_id, 0) + 1
+                self._amend_pending_rounds[a.amendment_id] = rounds
+                self._discrepancy(
+                    intent_id, "amend_still_pending", amendment_id=a.amendment_id, round=str(rounds)
+                )
+                if rounds >= self._max_lookup_rounds:  # 长期对不上：再次升级
+                    self._on_unresolved(intent_id)
+                continue
+            self._amend_pending_rounds.pop(a.amendment_id, None)
+            self._record_amendment_result(intent_id, a.amendment_id, result)
+            self._discrepancy(
+                intent_id, "amend_resolved", amendment_id=a.amendment_id, result=result
+            )
+        self._sync_fills(intent_id, self.status(intent_id))
+
+    def _amendment(
+        self,
+        intent_id: str,
+        amendment_id: str,
+        new_price: Decimal,
+        new_quantity: Decimal,
+        decision: RiskDecision,
+    ) -> OrderAmendment:
+        """校验风控决定并构造改单（原票据按签发记录重建）。"""
+        intent = self._repo.get_intent(intent_id)
+        issued = self._issued(intent_id)
+        if intent is None:  # pragma: no cover - 签发记录保证
+            raise AmendRefusedError(f"没有意图 {intent_id}")
+        if intent.order_class is OrderClass.PROTECTIVE_STOP:
+            # 改止损价可能等于取消保护或立即触发；R-04 定好止损改单规则前一律拒绝（失败即关闭）
+            raise AmendRefusedError("保护性止损暂不允许改单")
+        persisted = self._repo.risk_decisions_for(intent_id)
+        if decision not in persisted:
+            raise AmendRefusedError("改单的风控决定未落账或与账本内容不一致")
+        if self._repo.decision_is_used(decision.decision_id):
+            raise AmendRefusedError("这个风控决定已经用过，改单必须附带新的决定")
+        used = {issued.decision_id} | {a.decision_id for a in self._repo.amendments_for(intent_id)}
+        latest_used = max(d.decided_at for d in persisted if d.decision_id in used)
+        if decision.decided_at <= latest_used:
+            raise AmendRefusedError("改单的风控决定必须晚于本订单已用过的全部决定")
+        original_decision = next(
+            (d for d in persisted if d.decision_id == issued.decision_id), None
+        )
+        instrument = self._instruments.get(intent.symbol)
+        if original_decision is None or instrument is None:
+            raise AmendRefusedError("缺少原签发的风控决定或标的规格")
+        try:
+            original = OrderTicket(
+                intent=intent,
+                decision=original_decision,
+                quantity=issued.quantity,
+                broker_order_id=issued.broker_order.broker_order_id,
+                instrument=instrument,
+            )
+            return OrderAmendment(
+                amendment_id=amendment_id,
+                original=original,
+                new_price=new_price,
+                new_quantity=new_quantity,
+                decision=decision,
+            )
+        except ValueError as exc:
+            raise AmendRefusedError(f"改单不合法：{exc}") from exc
 
     async def _after_active(self, intent_id: str) -> None:
         if intent_id in self._pending_cancel and self.status(intent_id) in ACTIVE:
@@ -613,9 +846,11 @@ class OrderManager:
                     )
             return status
         filled, ordered = self.filled_quantity(intent_id), self._ordered(intent_id)
-        if filled > ordered:
-            self._discrepancy(intent_id, "overfill", filled=str(filled), ordered=str(ordered))
-        if filled >= ordered:
+        # 改单结果未定时取较大者：加量改单可能已生效，不能按旧数量提前判全部成交
+        target = max([ordered, *self._pending_amendments(intent_id)])
+        if filled > target:
+            self._discrepancy(intent_id, "overfill", filled=str(filled), ordered=str(target))
+        if filled >= target:
             return self._apply(intent_id, E.FULL_FILL)
         if filled > 0 and (status is not S.PARTIALLY_FILLED and status is not S.CANCEL_PENDING):
             return self._apply(intent_id, E.PARTIAL_FILL)
@@ -630,7 +865,9 @@ class OrderManager:
         return issued
 
     def _ordered(self, intent_id: str) -> Decimal:
-        return self._issued(intent_id).quantity
+        """有效下单数量：最后一次被券商接受的改单数量，没有改单则为签发数量（O-03）。"""
+        accepted = [a for a in self._repo.amendments_for(intent_id) if a.result == "ACCEPTED"]
+        return accepted[-1].new_quantity if accepted else self._issued(intent_id).quantity
 
     def _record_perm_id(self, intent_id: str, perm_id: str) -> bool:
         """登记 permId；已属于别的意图（或本意图已有另一个）返回 False。"""

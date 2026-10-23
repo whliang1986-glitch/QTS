@@ -158,6 +158,41 @@ execution_supersessions = Table(
     Column("recorded_at", Text, nullable=False),
 )
 
+# O-03（迁移 0005）：改单请求先落账（决定唯一），券商调用后记录结果
+order_amendments = Table(
+    "order_amendments",
+    metadata,
+    Column("seq", Integer, primary_key=True, autoincrement=True),
+    Column("amendment_id", Text, nullable=False, unique=True),
+    Column("intent_id", Text, ForeignKey("orders.intent_id"), nullable=False),
+    Column(
+        "decision_id",
+        Text,
+        ForeignKey("risk_decisions.decision_id"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("new_price", Text, nullable=False),
+    Column("new_quantity", Text, nullable=False),
+    Column("requested_at", Text, nullable=False),
+)
+
+# 改单结果是事件：最后一条为当前结果（UNKNOWN 可查证转正，ACCEPTED 可被异步拒绝）
+order_amendment_results = Table(
+    "order_amendment_results",
+    metadata,
+    Column("seq", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "amendment_id",
+        Text,
+        ForeignKey("order_amendments.amendment_id"),
+        nullable=False,
+        index=True,
+    ),
+    Column("result", Text, nullable=False),
+    Column("recorded_at", Text, nullable=False),
+)
+
 LEDGER_TABLES = frozenset(metadata.tables)
 # 每张账本表必须存在的触发器；打开账本时缺一个即拒绝（防止迁移重建表时触发器丢失）
 LEDGER_TRIGGERS = frozenset(
@@ -168,4 +203,6 @@ LEDGER_TRIGGERS = frozenset(
     | {"executions_no_foreign_order"}
     # 迁移 0004：更正只能在同一张订单内
     | {"execution_supersessions_no_cross_intent"}
+    # 迁移 0005：改单决定必须新且属于同一意图；改单结果的取值与先后关系
+    | {"order_amendments_no_cross_intent", "order_amendment_results_no_bad_result"}
 )
