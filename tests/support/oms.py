@@ -74,6 +74,11 @@ class Env:
             on_unresolved=self.unresolved.append,
         )
 
+    def restart(self) -> None:
+        """进程崩溃重启：旧连接断开；同一账本上新建客户端与 OrderManager（内存状态全部丢失）。"""
+        self.server.drop_client(self.broker.client_id)
+        self.use(FakeBroker(self.server, client_id=self.broker.client_id))
+
     def use(self, broker: FakeBroker) -> None:
         self.broker = broker
         self.om = OrderManager(

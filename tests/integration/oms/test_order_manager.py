@@ -1347,17 +1347,23 @@ async def test_cancelled_amendment_is_recorded_unknown_and_not_stuck(tmp_path: P
 
 
 class FailingLookupBroker(DelayedApplyBroker):
+    failing = False  # 下单之后才让查单失败（签发前的查重照常，O-05）
+
     async def lookup_order(self, order_ref: str) -> OrderLookup:
-        raise RuntimeError("lookup timed out")
+        if self.failing:
+            raise RuntimeError("lookup timed out")
+        return await super().lookup_order(order_ref)
 
 
 @pytest.mark.asyncio
 async def test_amendment_lookup_failure_keeps_it_pending(tmp_path: Path) -> None:
     env = Env(tmp_path)
-    env.use(FailingLookupBroker(env.server))
+    broker = FailingLookupBroker(env.server)
+    env.use(broker)
     await env.broker.connect()
     await env.submit()
     await env.pump()
+    broker.failing = True
     await amend(env, "am-1", "99.50", 10)
     await env.om.resolve_amendments("i-1")
     assert env.repo.amendments_for("i-1")[-1].result == "UNKNOWN"
