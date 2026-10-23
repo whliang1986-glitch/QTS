@@ -88,20 +88,26 @@ async def test_s01_lost_request_stays_unknown_and_escalates(env: Env) -> None:
 
 
 class LookupDownBroker(FakeBroker):
-    """查单接口不可用（回报通道仍在）。"""
+    """下单之后查单接口不可用（回报通道仍在）；签发前的查重照常。"""
+
+    down = False
 
     async def lookup_order(self, order_ref: str) -> OrderLookup:
-        raise BrokerUnavailableError("lookup down")
+        if self.down:
+            raise BrokerUnavailableError("lookup down")
+        return await super().lookup_order(order_ref)
 
 
 @pytest.mark.asyncio
 async def test_s01_status_report_alone_does_not_resolve_unknown(tmp_path: Path) -> None:
     """UNKNOWN 时收到状态回报：回报只是线索，必须查单核实；查不了就继续 UNKNOWN，不照抄回报。"""
     env = Env(tmp_path)
-    env.use(LookupDownBroker(env.server))
+    broker = LookupDownBroker(env.server)
+    env.use(broker)
     await env.broker.connect()
     env.server.lose_next_ack()
     await env.submit()
+    broker.down = True
     env.clock.advance(11)
     assert env.om.check_timeouts() == ["i-1"]
     await env.om.on_broker_event(status_update(env, BrokerOrderState.ACKNOWLEDGED))
@@ -195,16 +201,11 @@ async def test_s05_rejections(env: Env, category: ErrorCategory) -> None:
     assert len(broker_orders(env, "i-1")) == 1  # 没有重下
 
 
-# ---------- 场景 7（移交 O-05）：重启窗口吞掉在途回报 ----------
+# ---------- 场景 7：重启窗口吞掉在途回报（O-05 重连对账补回） ----------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="O-05：重连后需对账补回丢失的回报；O-05 完成后去掉 xfail",
-)
 @pytest.mark.asyncio
-async def test_s07_inflight_reports_lost_across_restart_need_reconciliation(env: Env) -> None:
+async def test_s07_inflight_reports_lost_across_restart_are_reconciled(env: Env) -> None:
     await env.submit()
     await env.pump()
     env.server.hold_events()
@@ -213,7 +214,7 @@ async def test_s07_inflight_reports_lost_across_restart_need_reconciliation(env:
     env.server.release_events()  # 客户端已断开：在途回报丢失
     env.server.exit_restart_window()
     await env.broker.connect()
-    await env.pump()  # 没有重连对账
+    await env.pump()  # CONNECTED → 重连对账：按查单结果补记成交与状态
     assert env.om.filled_quantity("i-1") == Decimal(10)
     assert env.om.status("i-1") is S.FILLED
 
@@ -256,13 +257,10 @@ FAULT_NAMES = [
     "submit", "retry", "retry_new_decision", "lose_ack", "lose_request", "reject_next",
     "fill1", "fill4", "dup", "hold", "release", "release_rev", "cancel", "confirm",
     "reject_cancel", "manual_cancel", "timeout", "resolve", "foreign", "restart", "expire",
+    "drop", "crash",
 ]  # fmt: skip
-# 断线（券商重启窗口）期间不执行会改变券商侧事实、或要求 OMS 与券商通信的故障：
-# 断线期间的事实漂移需要重连对账（场景 7，O-05），这里只验证断线本身不破坏不变量
-BROKER_SIDE = {
-    "fill1", "fill4", "dup", "release", "release_rev", "confirm", "reject_cancel",
-    "foreign", "expire", "cancel", "resolve",
-}  # fmt: skip
+# 断线（drop：连接中断；restart：券商重启窗口；crash：进程崩溃，新 OrderManager 接管同一账本）期间
+# 所有故障照常注入：券商侧事实继续变化而回报丢失，重连后由对账（O-05）补回
 FAULTS = st.lists(
     st.tuples(st.sampled_from(FAULT_NAMES), st.integers(min_value=0, max_value=7)),
     min_size=1,
@@ -282,6 +280,12 @@ EXAMPLES: list[list[tuple[str, int]]] = [
     [("submit", 0), ("hold", 0), ("fill4", 0), ("fill4", 0), ("fill4", 0), ("cancel", 0)],
     [("lose_ack", 0), ("submit", 0), ("restart", 0), ("timeout", 0), ("retry", 0)],
     [("submit", 0), ("fill1", 0), ("dup", 0), ("dup", 0)],
+    # O-05：断线期间成交 / 到期 / 撤单；崩溃前挂起的撤单；提交途中崩溃
+    [("submit", 0), ("drop", 0), ("fill4", 0), ("expire", 0), ("restart", 0)],
+    [("submit", 0), ("drop", 0), ("cancel", 0), ("restart", 0)],
+    [("lose_ack", 0), ("submit", 0), ("timeout", 0), ("cancel", 0), ("crash", 0)],
+    [("lose_request", 0), ("submit", 0), ("crash", 0), ("submit", 0), ("restart", 0)],
+    [("submit", 0), ("crash", 0), ("fill4", 0), ("fill4", 0), ("fill4", 0), ("restart", 0)],
 ]
 # 随机故障下允许出现的差异种类，每一种都对应注入的故障；其余（非法转移、超额成交、成交冲突、
 # permId 冲突、同一 orderRef 下多张单、查单事实不符等）出现即失败
@@ -291,6 +295,9 @@ ALLOWED_DISCREPANCIES = {
     "unmatched_execution",  # 外来成交
     "fill_after_terminal",  # 逆序放出：终态回报先于成交到达
     "status_after_terminal",  # 逆序放出：终态之后又到一条不同的终态回报
+    "cancel_raised",  # 断线时撤单
+    "recovered_submitting",  # 提交途中断线或崩溃：先转 UNKNOWN 再查证
+    "cancel_resent",  # 断线期间发出的撤单没到券商：重连后补发
 }
 # 只在暂存过回报时允许：OMS 还没看到终态就撤单，券商报“订单不存在”（真实的撤单竞态）
 ALLOWED_WHEN_HELD = {"cancel_unknown_order"}
@@ -305,19 +312,19 @@ class Run:
         self.cancel: dict[str, str] = {}  # intent_id → "requested" / "rejected"
         self.foreign = 0
         self.held = False  # 是否暂存过回报
+        self.lost = False  # 是否断过线（断线期间的外来成交会丢，归 R-07 对账）
+        self.foreign_delivered = 0  # 连着线且没有暂存回报时注入的外来成交：必定送达
 
 
 async def settle(env: Env, run: Run) -> None:
     """收尾，让 OMS 看到全部券商事实。
 
-    1. 退出重启窗口并重连（先连上再放出暂存回报：暂存时已连接的客户端重连后才收得到）；
-    2. 放出暂存的回报并处理；
+    1. 退出重启窗口并重连（CONNECTED → 重连对账）；
+    2. 放出暂存的回报并处理（暂存时的客户端若已断开或已被崩溃替换，这些回报丢失，靠对账补回）；
     3. 时钟前进 60 秒，超时转 UNKNOWN；每个意图查证到升级所需轮数（查到即转出，挂起的撤单补发）；
     4. 再处理一次回报。
-    乐观假设：重启窗口前已发出、尚未送达的回报，在重连后送达（FakeBroker 按客户端对象投递）。
-    真实 TWS 重启时这些在途回报会丢，只能靠重连对账补回，归 O-05（见
-    test_s07_inflight_reports_lost_across_restart_need_reconciliation）。
-    不做：重连对账、补发断线期间丢失的事件（O-05）；resolve_amendments（本测试不改单）。
+    断线期间的成交、到期、撤单确认等回报全部丢失，OMS 只能靠重连后的查单对账得知（O-05）。
+    不做：外来成交与持仓对账（R-07）；resolve_amendments（本测试不改单）。
     """
     if not env.broker.connected:
         env.server.exit_restart_window()
@@ -367,8 +374,6 @@ async def cancel(env: Env, run: Run, target: str) -> None:
 
 async def apply_fault(env: Env, fault: str, pick: int, run: Run, n: int) -> None:  # noqa: PLR0912, PLR0915
     connected = env.broker.connected
-    if not connected and fault in BROKER_SIDE:
-        return
     target = run.intents[pick % len(run.intents)] if run.intents else None
     found = broker_orders(env, target) if target else []
     order = found[0] if found else None
@@ -412,12 +417,20 @@ async def apply_fault(env: Env, fault: str, pick: int, run: Run, n: int) -> None
     elif fault == "foreign":
         env.server.inject_foreign_execution("SPY", Side.SELL, Decimal("0.5"), Decimal(100))
         run.foreign += 1
+        run.foreign_delivered += connected and env.server._held is None
     elif fault == "restart":
         if connected:
             env.server.enter_restart_window()
+            run.lost = True
         else:
             env.server.exit_restart_window()
             await env.broker.connect()
+    elif fault == "drop" and connected:
+        env.server.drop_client(env.broker.client_id)
+        run.lost = True
+    elif fault == "crash":  # 进程崩溃：内存状态全部丢失，新实例接管同一账本，等重连
+        env.restart()
+        run.lost = True
     elif fault == "expire":
         env.server.expire_day_orders()
     await env.pump()  # 断线时队列里只有连接事件
@@ -460,7 +473,10 @@ def check_invariants(env: Env, run: Run, faults: Any) -> None:
         assert env.repo.issuance_for(intent_id) is None and not broker_orders(env, intent_id)
     unmatched = env.repo.unmatched_executions()
     assert {r for _, r, _ in unmatched} <= {"no_order"}, faults
-    assert len(unmatched) == run.foreign, ("外来成交全部且只进未匹配表", faults)
+    # 外来成交只进未匹配表；断线期间或暂存后丢失的外来成交回报由 R-07 持仓对账发现
+    assert run.foreign_delivered <= len(unmatched) <= run.foreign, ("外来成交只进未匹配表", faults)
+    if not run.lost:
+        assert len(unmatched) == run.foreign, ("没断过线时外来成交全部入表", faults)
     allowed = ALLOWED_DISCREPANCIES | (ALLOWED_WHEN_HELD if run.held else set())
     unexpected = set(env.discrepancies()) - allowed
     assert not unexpected, (unexpected, faults)
@@ -489,6 +505,7 @@ def test_random_fault_sequences_keep_oms_invariants(
         for n, (fault, pick) in enumerate(faults):
             await apply_fault(env, fault, pick, run, n)
         await settle(env, run)
+        assert env.om.recovered, ("收尾重连后对账必须完成", faults)
         check_invariants(env, run, faults)
 
     asyncio.run(run_faults())

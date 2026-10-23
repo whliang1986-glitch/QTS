@@ -24,17 +24,26 @@
 （不提前判 FILLED）；
 结果 UNKNOWN 由 `resolve_amendments` 查单后转正；保护性止损暂不允许改单（R-04 定规则后再开放）。
 
-不做的事（后续任务）：崩溃恢复与启动对账（O-05、R-07）、佣金后到的入账（B-03）。
+崩溃恢复与重连对账（O-05）：`recover` 在启动与每次重连后（ConnectionEvent CONNECTED）按账本里每个
+未结束的订单向券商查单核实——SUBMITTING（提交途中崩溃）先转 UNKNOWN 再查证，
+UNKNOWN 走 `resolve_unknown`，活动 / 撤单中的订单按查到的事实补记成交与状态；
+断线期间发出、没到券商的撤单补发；未定的改单查证转正；
+挂起的撤单（已落审计）在确认后补发。对账完成之前拒绝新单与改单（失败即关闭），查单失败保持未完成。
+外来成交与持仓、现金的对账不在这里（R-07）。
+
+不做的事（后续任务）：持仓与现金对账（R-07）、佣金后到的入账（B-03）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
+from typing import NoReturn
 
 from server.broker.base import (
     TERMINAL_STATES,
@@ -44,7 +53,10 @@ from server.broker.base import (
     BrokerEvent,
     BrokerExecution,
     BrokerOrderState,
+    BrokerUnavailableError,
     CommissionReport,
+    ConnectionEvent,
+    ConnectionState,
     ExecutionReport,
     OrderAmendment,
     OrderRecord,
@@ -71,6 +83,7 @@ log = logging.getLogger(__name__)
 
 S, E = OrderStatus, EventKind
 DISCREPANCY = "order_discrepancy"
+CANCEL_PARKED = "cancel_parked"  # 挂起的撤单（重启后据此补发）
 ACTIVE = frozenset({S.SUBMITTED, S.PARTIALLY_FILLED})
 FILLABLE = frozenset({S.SUBMITTING, S.SUBMITTED, S.PARTIALLY_FILLED, S.CANCEL_PENDING})
 # 券商侧状态 → 从 UNKNOWN 查证后观察到的状态（撤单中 / 撤单被拒按是否已有成交归为活动状态）
@@ -105,6 +118,10 @@ class AmendRefusedError(Exception):
     """拒绝改单：状态不允许、风控决定未落账或已被用过、数量不大于已成交等（失败即关闭，不调用券商）。"""
 
 
+class ReconcileError(Exception):
+    """对账发现无法自动处理的不一致（已记差异并升级）：对账不算完成，继续拒绝新单。"""
+
+
 class CancelRefusedError(Exception):
     """拒绝撤单：保护性止损不经本入口撤销（R-05 的二次确认路径）。"""
 
@@ -135,6 +152,9 @@ class OrderManager:
         self._lookup_misses: dict[str, int] = {}
         self._amending: set[str] = set()  # 正在调用券商的改单（查证时跳过）
         self._amend_pending_rounds: dict[str, int] = {}  # 改单查证仍对不上的轮数
+        self._recovered = False  # 启动 / 重连对账是否已完成（未完成拒绝新单）
+        self._recover_lock = asyncio.Lock()
+        self._epoch = 0  # 每次断线 / 重启窗口加 1：对账期间断过线，对账结果作废
 
     # ---------- 查询 ----------
 
@@ -156,6 +176,10 @@ class OrderManager:
         issued = self._check_submission(intent, decision)
         if issued is not None:
             return self.status(intent_id)  # 幂等：已签发过，不再下单
+        if not self._recovered and not await self.recover():
+            raise SubmissionRefusedError("启动 / 重连对账未完成，拒绝新增订单")
+        epoch = self._epoch
+        await self._ensure_not_at_broker(intent_id)
         ticket = await self._issue_ticket(intent, decision)
         # 全部校验通过后才记 RISK_APPROVED：校验失败的意图不会显得“已批准”
         current = self.status(intent_id)
@@ -169,6 +193,8 @@ class OrderManager:
             submitted_at=now,
         )
         submitting = transition(current, E.SUBMIT_SENT)
+        if not self._recovered or self._epoch != epoch:  # 等待券商期间断过线：重新对账前不落账
+            raise SubmissionRefusedError("提交途中连接中断，重连对账前拒绝新增订单")
         # 订单号、签发记录与 SUBMITTING 在下单之前落账：之后任何崩溃都只会查单，不会重下
         committed = self._repo.commit_submission(
             order,
@@ -189,6 +215,21 @@ class OrderManager:
             self._discrepancy(intent_id, "submit_raised", error=type(exc).__name__)
             return status
         return submitting
+
+    async def _ensure_not_at_broker(self, intent_id: str) -> None:
+        """首次签发前按 orderRef 查一次券商。
+
+        账本没有签发记录、券商却已有这张单（例如从较早的备份恢复），说明账本缺了事实，
+        再签发就是重复下单（IBKR 不拒绝重复 orderRef）。查询失败同样拒绝。
+        """
+        try:
+            lookup = await self._broker.lookup_order(intent_id)
+        except Exception as exc:
+            raise SubmissionRefusedError(f"签发前查重失败：{type(exc).__name__}") from exc
+        if not lookup.empty:
+            self._discrepancy(intent_id, "order_at_broker_without_issuance")
+            self._on_unresolved(intent_id)
+            raise SubmissionRefusedError("券商已有这个意图的订单而账本没有签发记录，拒绝签发")
 
     def _check_submission(self, intent: OrderIntent, decision: RiskDecision) -> Issuance | None:
         """核对意图与风控决定（必须已落账且一致）；已签发过则返回签发记录。"""
@@ -259,20 +300,26 @@ class OrderManager:
 
     # ---------- UNKNOWN 查证 ----------
 
-    async def resolve_unknown(self, intent_id: str) -> OrderStatus:
-        """按 orderRef 查券商。查到即以 BROKER_STATUS_OBSERVED 转出；查不到保持 UNKNOWN。"""
+    async def resolve_unknown(self, intent_id: str, *, strict: bool = False) -> OrderStatus:
+        """按 orderRef 查券商。查到即以 BROKER_STATUS_OBSERVED 转出；查不到保持 UNKNOWN。
+
+        strict（对账内部用）：查询失败向上抛，让对账不算完成；查无此单仍按多轮查证处理。
+        """
         if self.status(intent_id) is not S.UNKNOWN:
             return self.status(intent_id)
         try:
             lookup = await self._broker.lookup_order(intent_id)
         except Exception as exc:  # 查询失败：仍不确定，保持 UNKNOWN
-            return self._miss(intent_id, f"lookup_failed:{type(exc).__name__}")
+            self._miss(intent_id, f"lookup_failed:{type(exc).__name__}")
+            if strict:
+                raise
+            return S.UNKNOWN
         if self.status(intent_id) is not S.UNKNOWN:  # 等待查询期间已被并发查证转出
             return self.status(intent_id)
         # 先入账普通成交、再入账更正：同一批查单结果里的更正不会因顺序落到“更正先到”
         for execution in sorted(lookup.executions, key=lambda e: e.corrects is not None):
             self._book_execution(execution)
-        record = self._verified_record(intent_id, lookup.orders)
+        record = self._verified_record(intent_id, lookup.orders, strict=strict)
         if record is None:
             return S.UNKNOWN
         self._lookup_misses.pop(intent_id, None)
@@ -281,16 +328,23 @@ class OrderManager:
         status = self._apply(intent_id, E.BROKER_STATUS_OBSERVED, observed=self._observed(record))
         self._sync_fills(intent_id, status)
         await self._after_active(intent_id)  # 挂起的撤单在查证转出后补发
+        if strict:
+            self._check_fills(intent_id, record)
         return self.status(intent_id)
 
     def _verified_record(
-        self, intent_id: str, orders: tuple[OrderRecord, ...]
+        self, intent_id: str, orders: tuple[OrderRecord, ...], *, strict: bool = False
     ) -> OrderRecord | None:
-        """从查单结果里取出本系统那张订单；有疑点（别的订单号、事实不符、查无此单）返回 None。"""
+        """从查单结果里取出本系统那张订单；有疑点（别的订单号、事实不符、查无此单）返回 None。
+
+        strict（对账内部用）：别的订单号与事实不符时升级并让对账失败；查无此单仍只记一轮。
+        """
         mine = self._issued(intent_id).broker_order.broker_order_id
         records = [o for o in orders if o.broker_order_id == mine]
         strays = [o.broker_order_id for o in orders if o.broker_order_id != mine]
         if strays:  # 同一 orderRef 下有别的订单：可能重复下单或被冒用，不转出，升级处理
+            if strict:
+                self._escalate(intent_id, "lookup_foreign_order_ids", ids=",".join(strays))
             self._discrepancy(intent_id, "lookup_foreign_order_ids", ids=",".join(strays))
             self._on_unresolved(intent_id)
             return None
@@ -298,6 +352,8 @@ class OrderManager:
             self._miss(intent_id, "not_found")
             return None
         if not self._record_matches(intent_id, records[0]):
+            if strict:
+                self._escalate(intent_id, "lookup_fact_mismatch", broker_order_id=mine)
             self._discrepancy(intent_id, "lookup_fact_mismatch", broker_order_id=mine)
             self._on_unresolved(intent_id)
             return None
@@ -331,6 +387,134 @@ class OrderManager:
             self._on_unresolved(intent_id)  # 由调用方进入 SAFE HALT；仍不重发
         return S.UNKNOWN
 
+    # ---------- 崩溃恢复与重连对账（O-05） ----------
+
+    @property
+    def recovered(self) -> bool:
+        return self._recovered
+
+    async def recover(self) -> bool:
+        """按账本里每个未结束的订单向券商查单核实；全部查完才返回 True 并放行新单。
+
+        未连接抛 BrokerUnavailableError；查单失败记 reconcile_failed，返回 False（保持拒绝新单）。
+        查无此单的 UNKNOWN 仍按多轮查证升级，不影响其余订单放行（由 SAFE HALT 处理）。
+        """
+        if not self._broker.connected:
+            raise BrokerUnavailableError("未连接券商，无法对账")
+        async with self._recover_lock:
+            self._recovered = False
+            epoch = self._epoch
+            parked = self._parked_cancels()
+            failed = False
+            for intent_id in self._repo.submitted_intents():
+                if self.status(intent_id) in TERMINAL:
+                    continue
+                try:
+                    await self._reconcile(intent_id, parked)
+                except Exception as exc:  # 这一张没对完：记下，继续对其余订单（补发撤单不被卡住）
+                    failed = True
+                    self._discrepancy(intent_id, "reconcile_failed", error=type(exc).__name__)
+            if failed:  # 有订单没对完：保持拒绝新单，等下次重连或调用方重试
+                return False
+            if self._epoch != epoch or not self._broker.connected:  # 对账期间断过线：结果作废
+                self._discrepancy(None, "reconcile_interrupted")
+                return False
+            self._recovered = True
+            log_event(log, logging.INFO, "对账完成")
+            return True
+
+    def _parked_cancels(self) -> set[str]:
+        """落过审计、之后还没真正发出（没有 CANCEL_REQUESTED）的挂起撤单。"""
+        intents = {
+            json.loads(dict(a.detail)["intent_id"]) for a in self._repo.audits(CANCEL_PARKED)
+        }
+        return {
+            i
+            for i in intents
+            if not any(e.kind is E.CANCEL_REQUESTED for e, _ in self._repo.order_history(i))
+        }
+
+    async def _reconcile(self, intent_id: str, parked: set[str]) -> None:
+        if intent_id in parked:
+            self._pending_cancel.add(intent_id)
+        status = self.status(intent_id)
+        if status is S.SUBMITTING:  # 提交途中崩溃或断线：结果未知，先查证，绝不重发
+            self._deadlines.pop(intent_id, None)
+            status = self._apply(intent_id, E.SUBMIT_TIMEOUT)
+            self._discrepancy(intent_id, "recovered_submitting")
+        if status is S.UNKNOWN:
+            await self.resolve_unknown(intent_id, strict=True)
+        else:
+            await self._reconcile_live(intent_id)
+        if self.status(intent_id) not in TERMINAL:
+            await self.resolve_amendments(intent_id, strict=True)
+        await self._after_active(intent_id)
+
+    async def _reconcile_live(self, intent_id: str) -> None:
+        """活动 / 撤单中的订单：按查到的事实补记成交与状态（查单失败向上抛，对账不算完成）。"""
+        lookup = await self._broker.lookup_order(intent_id)
+        for execution in sorted(lookup.executions, key=lambda e: e.corrects is not None):
+            self._book_execution(execution)
+        mine = self._issued(intent_id).broker_order.broker_order_id
+        strays = [o.broker_order_id for o in lookup.orders if o.broker_order_id != mine]
+        records = [o for o in lookup.orders if o.broker_order_id == mine]
+        if strays or not records:  # 同一 orderRef 下有别的单，或券商查不到活动订单：不擅自改状态
+            kind = "lookup_foreign_order_ids" if strays else "reconcile_order_missing"
+            self._escalate(intent_id, kind, ids=",".join(strays))
+        record = records[0]
+        if not self._record_matches(intent_id, record):  # 标的、方向、账户、数量或 permId 对不上
+            self._escalate(intent_id, "lookup_fact_mismatch", broker_order_id=mine)
+        if record.perm_id is not None and self._repo.perm_id_for(intent_id) is None:
+            self._record_perm_id(intent_id, record.perm_id)
+        if self.status(intent_id) is S.CANCEL_PENDING and record.state in {
+            BrokerOrderState.ACKNOWLEDGED,
+            BrokerOrderState.PARTIALLY_FILLED,
+        }:  # 撤单请求没到券商（断线期间发出）或撤单被拒的回报丢了：补发撤单
+            await self._resend_cancel(intent_id, mine)
+            self._check_fills(intent_id, record)
+            return
+        await self._on_status(
+            OrderStatusUpdate(
+                broker_order_id=mine,
+                order_ref=intent_id,
+                perm_id=record.perm_id,
+                state=record.state,
+                filled_quantity=record.filled_quantity,
+                remaining_quantity=record.remaining_quantity,
+                at=self._clock(),
+            )
+        )
+        self._sync_fills(intent_id, self.status(intent_id))
+        self._check_fills(intent_id, record)
+
+    def _check_fills(self, intent_id: str, record: OrderRecord) -> None:
+        """券商的累计成交与账本有效成交量对不上（例如查到的成交不全）：不能自动补，升级。"""
+        if self.filled_quantity(intent_id) != record.filled_quantity:
+            self._escalate(
+                intent_id,
+                "reconcile_fill_mismatch",
+                local=str(self.filled_quantity(intent_id)),
+                broker=str(record.filled_quantity),
+            )
+
+    async def _resend_cancel(self, intent_id: str, broker_order_id: str) -> None:
+        intent = self._repo.get_intent(intent_id)
+        if intent is None or intent.order_class is OrderClass.PROTECTIVE_STOP:
+            # 保护性止损不经此路径撤销（R-05）：记差异并升级，不调用券商
+            self._escalate(intent_id, "cancel_resend_refused")
+        self._sync_fills(intent_id, self.status(intent_id))
+        self._discrepancy(intent_id, "cancel_resent")
+        try:
+            await self._broker.cancel_order(broker_order_id)
+        except UnknownOrderError:  # 查单说还活着、撤单却说不存在：事实矛盾，升级
+            self._escalate(intent_id, "cancel_unknown_order")
+
+    def _escalate(self, intent_id: str, kind: str, **detail: str | None) -> NoReturn:
+        """记差异、通知调用方（SAFE HALT），并让本次对账失败。"""
+        self._discrepancy(intent_id, kind, **detail)
+        self._on_unresolved(intent_id)
+        raise ReconcileError(kind)
+
     # ---------- 撤单 ----------
 
     async def request_cancel(self, intent_id: str) -> OrderStatus:
@@ -342,6 +526,15 @@ class OrderManager:
             raise CancelRefusedError("保护性止损不经此入口撤销（需二次确认，R-05）")
         status = self.status(intent_id)
         if status in {S.SUBMITTING, S.UNKNOWN}:
+            if intent_id not in self._pending_cancel:
+                record_audit(
+                    self._repo,
+                    action=CANCEL_PARKED,
+                    actor=self._actor,
+                    at=self._clock(),
+                    detail={"intent_id": intent_id},
+                    correlation_id=intent_id,
+                )
             self._pending_cancel.add(intent_id)
             log_event(log, logging.INFO, "撤单挂起，等待确认后再撤", intent_id=intent_id)
             return status
@@ -390,6 +583,8 @@ class OrderManager:
                 new_quantity=new_quantity,
                 decision=decision,
             )
+        if not self._recovered:
+            raise AmendRefusedError("启动 / 重连对账未完成，不能改单")
         status = self.status(intent_id)
         if status not in ACTIVE or intent_id in self._pending_cancel:
             raise AmendRefusedError(f"订单处于 {status.value}，不能改单")
@@ -476,7 +671,7 @@ class OrderManager:
             if a.result in {None, "UNKNOWN"}
         ]
 
-    async def resolve_amendments(self, intent_id: str) -> None:
+    async def resolve_amendments(self, intent_id: str, *, strict: bool = False) -> None:
         """按查单结果给未定的改单补记结果（正在调用券商的改单跳过）。
 
         - 券商订单的数量与价格等于改单值：ACCEPTED；
@@ -495,8 +690,10 @@ class OrderManager:
         mine = self._issued(intent_id).broker_order.broker_order_id
         try:
             lookup = await self._broker.lookup_order(intent_id)
-        except Exception as exc:  # 查询失败：仍不确定，保持未定
+        except Exception as exc:  # 查询失败：仍不确定，保持未定（对账内部向上抛）
             self._discrepancy(intent_id, "amend_lookup_failed", error=type(exc).__name__)
+            if strict:
+                raise
             return
         records = [o for o in lookup.orders if o.broker_order_id == mine]
         if not records:
@@ -595,6 +792,13 @@ class OrderManager:
                 else:
                     self._sync_fills(intent_id, self.status(intent_id))
                 await self._after_active(intent_id)
+        elif isinstance(event, ConnectionEvent):
+            if event.state is ConnectionState.CONNECTED:
+                if not self._recovered and self._broker.connected:  # 过时的连接事件：等下一次
+                    await self.recover()
+            else:  # 断线或券商重启窗口：期间的回报可能丢失，重连后必须重新对账
+                self._recovered = False
+                self._epoch += 1
         elif isinstance(event, CommissionReport):
             log_event(log, logging.INFO, "佣金回报", execution_id=event.execution_id)
         elif isinstance(event, BrokerError):
