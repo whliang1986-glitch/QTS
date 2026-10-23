@@ -270,25 +270,99 @@ class LedgerRepository:
 
     # ---------- 成交 ----------
 
+    @staticmethod
+    def _execution_row(execution: Execution) -> dict[str, object]:
+        return {
+            "execution_id": execution.execution_id,
+            "intent_id": execution.intent_id,
+            "broker_order_id": execution.broker_order_id,
+            "symbol": execution.symbol,
+            "side": execution.side.value,
+            "quantity": str(execution.quantity),
+            "price": str(execution.price),
+            "commission": str(execution.commission),
+            "executed_at": _iso(execution.executed_at),
+            "payload": execution.model_dump_json(),
+        }
+
     def add_execution(self, execution: Execution) -> bool:
-        payload = execution.model_dump_json()
+        row = self._execution_row(execution)
+        payload = row["payload"]
         return self._insert_once(
             schema.executions,
-            {
-                "execution_id": execution.execution_id,
-                "intent_id": execution.intent_id,
-                "broker_order_id": execution.broker_order_id,
-                "symbol": execution.symbol,
-                "side": execution.side.value,
-                "quantity": str(execution.quantity),
-                "price": str(execution.price),
-                "commission": str(execution.commission),
-                "executed_at": _iso(execution.executed_at),
-                "payload": payload,
-            },
+            row,
             [{"execution_id": execution.execution_id}],
             lambda r: r.payload == payload,
         )
+
+    def add_correction(self, correction: Execution, superseded_id: str, at: datetime) -> bool:
+        """成交更正：更正后的成交另起一行，并记录它取代了哪一笔（同一事务）。
+
+        完全相同的更正再写一次返回 False；
+        被取代的成交已被别的更正取代、或更正行内容不同抛 ConflictError。
+        """
+        payload = correction.model_dump_json()
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(schema.executions.insert().values(**self._execution_row(correction)))
+                conn.execute(
+                    schema.execution_supersessions.insert().values(
+                        superseded_execution_id=superseded_id,
+                        superseding_execution_id=correction.execution_id,
+                        recorded_at=_iso(at),
+                    )
+                )
+        except IntegrityError as exc:
+            row = self._fetch(schema.executions, {"execution_id": correction.execution_id})
+            link = self._fetch(
+                schema.execution_supersessions, {"superseded_execution_id": superseded_id}
+            )
+            if (
+                row is not None
+                and row.payload == payload
+                and link is not None
+                and link.superseding_execution_id == correction.execution_id
+            ):
+                return False
+            raise ConflictError(
+                f"成交更正冲突：{superseded_id} 已被取代，或更正 {correction.execution_id} 内容不同"
+            ) from exc
+        except DBAPIError as exc:
+            raise StorageError(f"写入成交更正失败：{exc.orig}") from exc
+        return True
+
+    def superseding_of(self, execution_id: str) -> str | None:
+        """取代某笔成交的更正（没有则 None）。"""
+        row = self._fetch(schema.execution_supersessions, {"superseded_execution_id": execution_id})
+        return None if row is None else str(row.superseding_execution_id)
+
+    def has_execution(self, execution_id: str) -> bool:
+        return self._fetch(schema.executions, {"execution_id": execution_id}) is not None
+
+    def superseded_executions(self, intent_id: str) -> set[str]:
+        """某意图下已被更正取代的成交。"""
+        t, e = schema.execution_supersessions, schema.executions
+        stmt = (
+            select(t.c.superseded_execution_id)
+            .join(e, e.c.execution_id == t.c.superseded_execution_id)
+            .where(e.c.intent_id == intent_id)
+        )
+        with self._reading("execution_supersessions") as conn:
+            return {str(i) for (i,) in conn.execute(stmt)}
+
+    def effective_executions_for(self, intent_id: str) -> list[Execution]:
+        """有效成交：全部成交去掉被更正取代的（单条查询，只读进程不会读到半套更正）。"""
+        e, t = schema.executions, schema.execution_supersessions
+        superseded = select(t.c.superseded_execution_id).where(
+            t.c.superseded_execution_id == e.c.execution_id
+        )
+        stmt = (
+            select(e.c.payload)
+            .where(e.c.intent_id == intent_id, ~superseded.exists())
+            .order_by(e.c.executed_at, e.c.execution_id)
+        )
+        with self._reading("executions") as conn:
+            return [Execution.model_validate_json(p) for (p,) in conn.execute(stmt)]
 
     def executions_for(self, intent_id: str) -> list[Execution]:
         t = schema.executions

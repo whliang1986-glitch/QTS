@@ -141,6 +141,23 @@ unmatched_executions = Table(
     Column("payload", Text, nullable=False),
 )
 
+# O-02（迁移 0004）：成交更正——更正后的成交另起一行，这里记“谁被谁取代”
+execution_supersessions = Table(
+    "execution_supersessions",
+    metadata,
+    Column(
+        "superseded_execution_id", Text, ForeignKey("executions.execution_id"), primary_key=True
+    ),
+    Column(
+        "superseding_execution_id",
+        Text,
+        ForeignKey("executions.execution_id"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("recorded_at", Text, nullable=False),
+)
+
 LEDGER_TABLES = frozenset(metadata.tables)
 # 每张账本表必须存在的触发器；打开账本时缺一个即拒绝（防止迁移重建表时触发器丢失）
 LEDGER_TRIGGERS = frozenset(
@@ -149,4 +166,6 @@ LEDGER_TRIGGERS = frozenset(
     | {"mode_changes_no_live"}
     # 迁移 0003：成交必须挂在同一意图的券商订单上
     | {"executions_no_foreign_order"}
+    # 迁移 0004：更正只能在同一张订单内
+    | {"execution_supersessions_no_cross_intent"}
 )
