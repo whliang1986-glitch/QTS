@@ -1,0 +1,584 @@
+"""订单管理（O-01，V4.1 6.3–6.5）：唯一的票据签发者与订单状态的唯一写入者。
+
+主路径：
+1. `submit_approved_intent`（只由 server/risk 调用，arch_scan 规则 risk-bypass）：
+   读回账本里已落账的风控决定并核对；一个决定只能用一次、一个意图只有一条订单链；
+   订单号取 max(券商 nextValidId, 账本最大值 + 1)；券商订单、签发记录与 SUBMIT_SENT 事件
+   **在下单之前**同一事务落账，然后才调用券商。下单抛任何异常都视为结果未知（UNKNOWN），不重发。
+2. `on_broker_event`：券商回报 → C-02 的订单事件，一律先 transition() 再写账本。
+   - 同一状态的重复回报记录后忽略，不升级为 HALT；非法转移拒绝并写差异审计。
+   - 成交按 execution_id 去重入账（重复返回 False），累计数量决定 PARTIAL_FILL / FULL_FILL；
+     终态之后到达的成交照样入账并写差异审计；无法关联的成交进未匹配成交表，不丢弃。
+   - permId 从任一路回报先到的取得即落账（写字段，终态下也允许）。
+3. UNKNOWN（提交超时或下单异常）：只能经 `resolve_unknown` 按 orderRef 查券商后以
+   BROKER_STATUS_OBSERVED 转出；查无此单保持 UNKNOWN 并多轮查证，**绝不映射为 REJECTED 后重下**；
+   多轮仍查不到就通知调用方（SAFE HALT 由 ModeManager 执行）。
+   UNKNOWN 期间到达的成交先入账再触发查单。
+4. 撤单：SUBMITTING / UNKNOWN 的订单不能直接撤，挂起到确认后再撤；保护性止损不走这里（R-05）。
+5. 提交超时：离开 SUBMITTING 即取消定时；迟到的超时记录后忽略。
+
+不做的事（后续任务）：改单与撤单竞态（O-03）、崩溃恢复与启动对账（O-05、R-07）、成交更正冲正（O-02）、
+佣金后到的入账（B-03）。
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+from server.broker.base import (
+    BrokerAdapter,
+    BrokerError,
+    BrokerEvent,
+    BrokerExecution,
+    BrokerOrderState,
+    CommissionReport,
+    ExecutionReport,
+    OrderRecord,
+    OrderStatusUpdate,
+    OrderTicket,
+    UnknownOrderError,
+)
+from server.domain.enums import OrderClass, RiskVerdict
+from server.domain.instrument import Instrument
+from server.domain.order_state import (
+    TERMINAL,
+    EventKind,
+    IllegalTransitionError,
+    OrderEvent,
+    OrderStatus,
+    transition,
+)
+from server.domain.orders import BrokerOrder, Execution, OrderIntent, RiskDecision
+from server.storage.errors import ConflictError
+from server.storage.ledger import Issuance, LedgerRepository
+from server.storage.logs import log_event, record_audit
+
+log = logging.getLogger(__name__)
+
+S, E = OrderStatus, EventKind
+DISCREPANCY = "order_discrepancy"
+ACTIVE = frozenset({S.SUBMITTED, S.PARTIALLY_FILLED})
+FILLABLE = frozenset({S.SUBMITTING, S.SUBMITTED, S.PARTIALLY_FILLED, S.CANCEL_PENDING})
+# 券商侧状态 → 从 UNKNOWN 查证后观察到的状态（撤单中 / 撤单被拒按是否已有成交归为活动状态）
+OBSERVED: Mapping[BrokerOrderState, OrderStatus] = {
+    BrokerOrderState.ACKNOWLEDGED: S.SUBMITTED,
+    BrokerOrderState.PARTIALLY_FILLED: S.PARTIALLY_FILLED,
+    BrokerOrderState.FILLED: S.FILLED,
+    BrokerOrderState.CANCELLED: S.CANCELLED,
+    BrokerOrderState.REJECTED: S.REJECTED,
+    BrokerOrderState.EXPIRED: S.EXPIRED,
+}
+
+
+class SubmissionRefusedError(Exception):
+    """拒绝签发：风控决定未落账或不匹配、已被使用、标的规格缺失等（失败即关闭，不下单）。"""
+
+
+class CancelRefusedError(Exception):
+    """拒绝撤单：保护性止损不经本入口撤销（R-05 的二次确认路径）。"""
+
+
+class OrderManager:
+    def __init__(  # noqa: PLR0913 - 依赖全部显式注入
+        self,
+        repo: LedgerRepository,
+        broker: BrokerAdapter,
+        *,
+        instruments: Mapping[str, Instrument],
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        submit_timeout: timedelta = timedelta(seconds=10),
+        on_unresolved: Callable[[str], None],
+        max_lookup_rounds: int = 3,
+        actor: str = "tradingd",
+    ) -> None:
+        self._repo = repo
+        self._broker = broker
+        self._instruments = instruments
+        self._clock = clock
+        self._submit_timeout = submit_timeout
+        self._max_lookup_rounds = max_lookup_rounds
+        self._on_unresolved = on_unresolved
+        self._actor = actor
+        self._deadlines: dict[str, datetime] = {}
+        self._pending_cancel: set[str] = set()
+        self._lookup_misses: dict[str, int] = {}
+
+    # ---------- 查询 ----------
+
+    def status(self, intent_id: str) -> OrderStatus:
+        return self._repo.latest_status(intent_id) or S.CREATED
+
+    def filled_quantity(self, intent_id: str) -> Decimal:
+        return sum((e.quantity for e in self._repo.executions_for(intent_id)), Decimal(0))
+
+    # ---------- 提交 ----------
+
+    async def submit_approved_intent(
+        self, intent: OrderIntent, decision: RiskDecision
+    ) -> OrderStatus:
+        """签发票据并提交（只由 server/risk 调用）。重复调用不会第二次下单。"""
+        intent_id = intent.intent_id
+        issued = self._check_submission(intent, decision)
+        if issued is not None:
+            return self.status(intent_id)  # 幂等：已签发过，不再下单
+        ticket = await self._issue_ticket(intent, decision)
+        # 全部校验通过后才记 RISK_APPROVED：校验失败的意图不会显得“已批准”
+        current = self.status(intent_id)
+        if current is S.CREATED:
+            current = self._apply(intent_id, E.RISK_APPROVED)
+        now = self._clock()
+        order = BrokerOrder(
+            intent_id=intent_id,
+            broker_order_id=ticket.broker_order_id,
+            order_class=intent.order_class,
+            submitted_at=now,
+        )
+        submitting = transition(current, E.SUBMIT_SENT)
+        # 订单号、签发记录与 SUBMITTING 在下单之前落账：之后任何崩溃都只会查单，不会重下
+        committed = self._repo.commit_submission(
+            order,
+            decision.decision_id,
+            ticket.quantity,
+            self._event(intent_id, E.SUBMIT_SENT),
+            submitting,
+        )
+        if not committed:  # 同一签发已落账过：不论之前是否发出，都不再下单
+            return self.status(intent_id)
+        self._deadlines[intent_id] = now + self._submit_timeout
+        try:
+            await self._broker.place_order(ticket)
+        except Exception as exc:  # 结果未知：不重发，转 UNKNOWN 查证
+            status = self.status(intent_id)
+            if status is S.SUBMITTING:  # 等待期间可能已被超时检查转为 UNKNOWN
+                status = self._apply(intent_id, E.SUBMIT_TIMEOUT)
+            self._discrepancy(intent_id, "submit_raised", error=type(exc).__name__)
+            return status
+        return submitting
+
+    def _check_submission(self, intent: OrderIntent, decision: RiskDecision) -> Issuance | None:
+        """核对意图与风控决定（必须已落账且一致）；已签发过则返回签发记录。"""
+        intent_id = intent.intent_id
+        if decision.intent_id != intent_id:
+            raise SubmissionRefusedError("风控决定不属于这个意图")
+        if decision.verdict not in {RiskVerdict.ALLOW, RiskVerdict.REDUCE}:
+            raise SubmissionRefusedError(f"风控结论 {decision.verdict.value} 不允许下单")
+        stored = self._repo.get_intent(intent_id)
+        if stored is None or stored != intent:
+            raise SubmissionRefusedError("意图未落账或与账本内容不一致")
+        if decision not in self._repo.risk_decisions_for(intent_id):
+            raise SubmissionRefusedError("风控决定未落账或与账本内容不一致，拒绝签发")
+        issued = self._repo.issuance_for(intent_id)
+        if issued is not None:
+            if issued.decision_id != decision.decision_id:
+                raise SubmissionRefusedError("这个意图已用别的风控决定签发过，不能再签发")
+            return issued
+        current = self.status(intent_id)
+        if current not in {S.CREATED, S.RISK_APPROVED}:
+            raise SubmissionRefusedError(f"意图处于 {current.value}，不能提交")
+        return None
+
+    async def _issue_ticket(self, intent: OrderIntent, decision: RiskDecision) -> OrderTicket:
+        """唯一的票据签发点：规格、数量、订单号齐全才签发。"""
+        instrument = self._instruments.get(intent.symbol)
+        if instrument is None:
+            raise SubmissionRefusedError(f"缺少 {intent.symbol} 的标的规格，禁止下单")
+        quantity = (
+            intent.quantity
+            if decision.verdict is RiskVerdict.ALLOW
+            else decision.approved_quantity or Decimal(0)
+        )
+        broker_order_id = await self._next_order_id()
+        try:
+            return OrderTicket(
+                intent=intent,
+                decision=decision,
+                quantity=quantity,
+                broker_order_id=broker_order_id,
+                instrument=instrument,
+            )
+        except ValueError as exc:
+            raise SubmissionRefusedError(f"票据不合法：{exc}") from exc
+
+    async def _next_order_id(self) -> str:
+        reported = await self._broker.next_order_id()
+        if not (reported.isascii() and reported.isdecimal()):
+            raise SubmissionRefusedError(f"券商返回的订单号不是数字：{reported!r}")
+        return str(max(int(reported), self._repo.max_numeric_broker_order_id() + 1))
+
+    # ---------- 超时 ----------
+
+    def check_timeouts(self) -> list[str]:
+        """到期仍在 SUBMITTING 的订单转 UNKNOWN。
+
+        已离开 SUBMITTING 的定时直接丢弃（迟到的超时忽略）。
+        """
+        now = self._clock()
+        expired: list[str] = []
+        for intent_id, deadline in list(self._deadlines.items()):
+            if self.status(intent_id) is not S.SUBMITTING:
+                self._deadlines.pop(intent_id, None)
+            elif now >= deadline:
+                self._apply(intent_id, E.SUBMIT_TIMEOUT)
+                expired.append(intent_id)
+        return expired
+
+    # ---------- UNKNOWN 查证 ----------
+
+    async def resolve_unknown(self, intent_id: str) -> OrderStatus:
+        """按 orderRef 查券商。查到即以 BROKER_STATUS_OBSERVED 转出；查不到保持 UNKNOWN。"""
+        if self.status(intent_id) is not S.UNKNOWN:
+            return self.status(intent_id)
+        try:
+            lookup = await self._broker.lookup_order(intent_id)
+        except Exception as exc:  # 查询失败：仍不确定，保持 UNKNOWN
+            return self._miss(intent_id, f"lookup_failed:{type(exc).__name__}")
+        if self.status(intent_id) is not S.UNKNOWN:  # 等待查询期间已被并发查证转出
+            return self.status(intent_id)
+        for execution in lookup.executions:
+            self._book_execution(execution)
+        record = self._verified_record(intent_id, lookup.orders)
+        if record is None:
+            return S.UNKNOWN
+        self._lookup_misses.pop(intent_id, None)
+        if record.perm_id is not None and self._repo.perm_id_for(intent_id) is None:
+            self._record_perm_id(intent_id, record.perm_id)  # 查证时补登 permId，便于之后认领与对账
+        status = self._apply(intent_id, E.BROKER_STATUS_OBSERVED, observed=self._observed(record))
+        self._sync_fills(intent_id, status)
+        await self._after_active(intent_id)  # 挂起的撤单在查证转出后补发
+        return self.status(intent_id)
+
+    def _verified_record(
+        self, intent_id: str, orders: tuple[OrderRecord, ...]
+    ) -> OrderRecord | None:
+        """从查单结果里取出本系统那张订单；有疑点（别的订单号、事实不符、查无此单）返回 None。"""
+        mine = self._issued(intent_id).broker_order.broker_order_id
+        records = [o for o in orders if o.broker_order_id == mine]
+        strays = [o.broker_order_id for o in orders if o.broker_order_id != mine]
+        if strays:  # 同一 orderRef 下有别的订单：可能重复下单或被冒用，不转出，升级处理
+            self._discrepancy(intent_id, "lookup_foreign_order_ids", ids=",".join(strays))
+            self._on_unresolved(intent_id)
+            return None
+        if not records:
+            self._miss(intent_id, "not_found")
+            return None
+        if not self._record_matches(intent_id, records[0]):
+            self._discrepancy(intent_id, "lookup_fact_mismatch", broker_order_id=mine)
+            self._on_unresolved(intent_id)
+            return None
+        return records[0]
+
+    def _record_matches(self, intent_id: str, record: OrderRecord) -> bool:
+        """查到的券商订单与签发内容一致（标的、方向、账户、数量、permId）。"""
+        intent = self._repo.get_intent(intent_id)
+        issued = self._issued(intent_id)
+        known_perm = self._repo.perm_id_for(intent_id)
+        return (
+            intent is not None
+            and (record.symbol, record.side, record.account_id)
+            == (intent.symbol, intent.side, intent.account_id)
+            and record.total_quantity == issued.quantity
+            and (known_perm is None or record.perm_id in {None, known_perm})
+        )
+
+    def _observed(self, record: OrderRecord) -> OrderStatus:
+        mapped = OBSERVED.get(record.state)
+        if mapped is not None:
+            return mapped
+        # CANCEL_PENDING / CANCEL_REJECTED：订单仍活着
+        return S.PARTIALLY_FILLED if record.filled_quantity > 0 else S.SUBMITTED
+
+    def _miss(self, intent_id: str, reason: str) -> OrderStatus:
+        rounds = self._lookup_misses.get(intent_id, 0) + 1
+        self._lookup_misses[intent_id] = rounds
+        self._discrepancy(intent_id, "unknown_unresolved", reason=reason, round=str(rounds))
+        if rounds >= self._max_lookup_rounds:
+            self._on_unresolved(intent_id)  # 由调用方进入 SAFE HALT；仍不重发
+        return S.UNKNOWN
+
+    # ---------- 撤单 ----------
+
+    async def request_cancel(self, intent_id: str) -> OrderStatus:
+        """撤开仓或减仓单。SUBMITTING / UNKNOWN 先挂起，确认后再撤；终态与撤单中不重复发。"""
+        intent = self._repo.get_intent(intent_id)
+        if intent is None:
+            raise CancelRefusedError(f"没有意图 {intent_id}")
+        if intent.order_class is OrderClass.PROTECTIVE_STOP:
+            raise CancelRefusedError("保护性止损不经此入口撤销（需二次确认，R-05）")
+        status = self.status(intent_id)
+        if status in {S.SUBMITTING, S.UNKNOWN}:
+            self._pending_cancel.add(intent_id)
+            log_event(log, logging.INFO, "撤单挂起，等待确认后再撤", intent_id=intent_id)
+            return status
+        if status in {S.CREATED, S.RISK_APPROVED}:
+            self._discrepancy(intent_id, "cancel_before_submit")
+            return status
+        if status not in ACTIVE:
+            return status
+        self._pending_cancel.discard(intent_id)
+        status = self._apply(intent_id, E.CANCEL_REQUESTED)
+        try:
+            await self._broker.cancel_order(self._issued(intent_id).broker_order.broker_order_id)
+        except UnknownOrderError:
+            self._discrepancy(intent_id, "cancel_unknown_order")
+        except Exception as exc:  # 撤单请求未确认：保持 CANCEL_PENDING，等回报或对账
+            self._discrepancy(intent_id, "cancel_raised", error=type(exc).__name__)
+        return status
+
+    async def _after_active(self, intent_id: str) -> None:
+        if intent_id in self._pending_cancel and self.status(intent_id) in ACTIVE:
+            await self.request_cancel(intent_id)
+
+    # ---------- 回报 ----------
+
+    async def on_broker_event(self, event: BrokerEvent) -> None:
+        if isinstance(event, OrderStatusUpdate):
+            await self._on_status(event)
+        elif isinstance(event, ExecutionReport):
+            intent_id = self._book_execution(event.execution)
+            if intent_id is not None:
+                if self.status(intent_id) is S.UNKNOWN:
+                    await self.resolve_unknown(intent_id)  # 成交只是证据，状态仍须查证后转出
+                else:
+                    self._sync_fills(intent_id, self.status(intent_id))
+                await self._after_active(intent_id)
+        elif isinstance(event, CommissionReport):
+            log_event(log, logging.INFO, "佣金回报", execution_id=event.execution_id)
+        elif isinstance(event, BrokerError):
+            log_event(
+                log,
+                logging.WARNING,
+                "券商错误",
+                category=event.category.value,
+                code=event.code,
+                broker_order_id=event.broker_order_id,
+            )
+
+    def _intent_for(
+        self, broker_order_id: str | None, order_ref: str | None, perm_id: str | None
+    ) -> str | None:
+        """回报 → 本系统意图。
+
+        orderRef 必须存在，且与订单号指向同一张已签发的订单；
+        回报带的 permId 与已登记的不同也不认领。外来单的订单号可能为 0 或与别的 clientId 重复，
+        只凭订单号认领会把别人的状态与成交记到本系统头上。
+        """
+        if order_ref is None or broker_order_id is None:
+            return None
+        if self._repo.intent_for_broker_order(broker_order_id) != order_ref:
+            return None
+        known_perm = self._repo.perm_id_for(order_ref)
+        if perm_id is not None and known_perm is not None and perm_id != known_perm:
+            return None
+        return order_ref
+
+    async def _on_status(self, update: OrderStatusUpdate) -> None:
+        intent_id = self._intent_for(update.broker_order_id, update.order_ref, update.perm_id)
+        if intent_id is None:
+            self._discrepancy(
+                None,
+                "unmatched_status",
+                broker_order_id=update.broker_order_id,
+                state=update.state.value,
+            )
+            return
+        if update.perm_id is not None and not self._record_perm_id(intent_id, update.perm_id):
+            return  # permId 已属于别的意图：不认领这条回报（失败即关闭）
+        status = self.status(intent_id)
+        if status is S.UNKNOWN:
+            await self.resolve_unknown(intent_id)
+            await self._after_active(intent_id)
+            return
+        if status in TERMINAL:
+            reported = OBSERVED.get(update.state)
+            if reported in TERMINAL and reported is not status:  # 券商事实与本地终态不一致
+                self._discrepancy(
+                    intent_id,
+                    "status_after_terminal",
+                    local=status.value,
+                    broker=update.state.value,
+                )
+            return  # 状态不变；差异交对账（R-07）处理
+        for kind, has_fills in self._kinds_for(intent_id, status, update):
+            try:
+                status = self._apply(intent_id, kind, has_fills=has_fills)
+            except IllegalTransitionError:
+                self._discrepancy(intent_id, "illegal_transition", state=update.state.value)
+                return
+        self._sync_fills(intent_id, status)
+        await self._after_active(intent_id)
+
+    def _kinds_for(
+        self, intent_id: str, status: OrderStatus, update: OrderStatusUpdate
+    ) -> list[tuple[EventKind, bool | None]]:
+        """券商状态 → 订单事件。成交数量由成交回报驱动，这里只处理接单、撤单、拒单、到期。
+
+        SUBMITTING 时收到任何“订单存在”的状态，先补一个 BROKER_ACK（回报乱序时也正确）。
+        """
+        state = update.state
+        needs_ack = status is S.SUBMITTING and state is not BrokerOrderState.REJECTED
+        ack: list[tuple[EventKind, bool | None]] = [(E.BROKER_ACK, None)] if needs_ack else []
+        if state is BrokerOrderState.CANCELLED:
+            kind = E.CANCEL_CONFIRMED if status is S.CANCEL_PENDING else E.BROKER_CANCELLED
+            return [*ack, (kind, None)]
+        if state is BrokerOrderState.CANCEL_REJECTED:
+            if status is not S.CANCEL_PENDING:
+                return ack
+            # has_fills 由已入账的累计成交得出，不由回报直接给出目标状态（C-02 移交）
+            return [(E.CANCEL_REJECTED, self.filled_quantity(intent_id) > 0)]
+        final = {BrokerOrderState.REJECTED: E.BROKER_REJECTED, BrokerOrderState.EXPIRED: E.EXPIRED}
+        kind_for_state = final.get(state)
+        # 接单、成交、撤单中：只可能需要补 ACK；成交数量另由成交回报推进
+        return ack if kind_for_state is None else [*ack, (kind_for_state, None)]
+
+    def _book_execution(self, execution: BrokerExecution) -> str | None:
+        """成交入账：能关联到已签发订单的进成交表（按 execution_id 去重），其余进未匹配成交表。"""
+        intent_id = self._intent_for(
+            execution.broker_order_id, execution.order_ref, execution.perm_id
+        )
+        reason = self._unmatched_reason(execution, intent_id)
+        now = self._clock()
+        if reason is not None or intent_id is None:
+            try:
+                self._repo.add_unmatched_execution(
+                    execution.execution_id, reason or "unmatched", execution.model_dump_json(), now
+                )
+            except ConflictError:  # 同一成交重放时内容变了：记差异，不中断事件流
+                self._discrepancy(
+                    intent_id, "unmatched_execution_conflict", execution_id=execution.execution_id
+                )
+                return None
+            self._discrepancy(
+                intent_id, "unmatched_execution", execution_id=execution.execution_id,
+                reason=reason or "unmatched",
+            )  # fmt: skip
+            return None
+        if execution.perm_id is not None and not self._record_perm_id(intent_id, execution.perm_id):
+            self._repo.add_unmatched_execution(
+                execution.execution_id, "perm_conflict", execution.model_dump_json(), now
+            )
+            return None  # permId 已属于别的意图：不计入本意图（失败即关闭）
+        booked = Execution(
+            execution_id=execution.execution_id,
+            intent_id=intent_id,
+            broker_order_id=execution.broker_order_id or "",
+            symbol=execution.symbol,
+            side=execution.side,
+            quantity=execution.quantity,
+            price=execution.price,
+            # 佣金后到时先记 0，最终值由 CommissionReport 入账（B-03 定口径）
+            commission=execution.commission if execution.commission is not None else Decimal(0),
+            executed_at=execution.executed_at,
+        )
+        try:
+            inserted = self._repo.add_execution(booked)
+        except ConflictError:
+            self._discrepancy(intent_id, "execution_conflict", execution_id=execution.execution_id)
+            return None
+        if inserted and self.status(intent_id) in TERMINAL:
+            self._discrepancy(intent_id, "fill_after_terminal", execution_id=execution.execution_id)
+        return intent_id if inserted else None
+
+    def _unmatched_reason(self, execution: BrokerExecution, intent_id: str | None) -> str | None:
+        if execution.corrects is not None:
+            return "correction"  # 冲正由 O-02 处理：先照实保存，不计入成交量
+        if intent_id is None:
+            return "no_order"
+        intent = self._repo.get_intent(intent_id)
+        if intent is None:  # pragma: no cover - 外键保证
+            return "no_intent"
+        if (intent.symbol, intent.side, intent.account_id) != (
+            execution.symbol,
+            execution.side,
+            execution.account_id,
+        ):
+            return "fact_mismatch"
+        if execution.quantity != execution.quantity.to_integral_value():
+            return "fractional"
+        return None
+
+    def _sync_fills(self, intent_id: str, status: OrderStatus) -> OrderStatus:
+        """按累计成交推进 PARTIAL_FILL / FULL_FILL（成交数量只由已入账的成交决定）。"""
+        if status not in FILLABLE:
+            if status is S.FILLED and self.filled_quantity(intent_id) < self._ordered(intent_id):
+                self._discrepancy(intent_id, "fills_missing")
+            return status
+        filled, ordered = self.filled_quantity(intent_id), self._ordered(intent_id)
+        if filled > ordered:
+            self._discrepancy(intent_id, "overfill", filled=str(filled), ordered=str(ordered))
+        if filled >= ordered:
+            return self._apply(intent_id, E.FULL_FILL)
+        if filled > 0 and (status is not S.PARTIALLY_FILLED and status is not S.CANCEL_PENDING):
+            return self._apply(intent_id, E.PARTIAL_FILL)
+        return status
+
+    # ---------- 内部 ----------
+
+    def _issued(self, intent_id: str) -> Issuance:
+        issued = self._repo.issuance_for(intent_id)
+        if issued is None:
+            raise SubmissionRefusedError(f"意图 {intent_id} 没有签发记录")
+        return issued
+
+    def _ordered(self, intent_id: str) -> Decimal:
+        return self._issued(intent_id).quantity
+
+    def _record_perm_id(self, intent_id: str, perm_id: str) -> bool:
+        """登记 permId；已属于别的意图（或本意图已有另一个）返回 False。"""
+        try:
+            self._repo.record_perm_id(intent_id, perm_id, self._clock())
+        except ConflictError:
+            self._discrepancy(intent_id, "perm_id_conflict", perm_id=perm_id)
+            return False
+        return True
+
+    def _event(
+        self,
+        intent_id: str,
+        kind: EventKind,
+        *,
+        observed: OrderStatus | None = None,
+        has_fills: bool | None = None,
+    ) -> OrderEvent:
+        return OrderEvent(
+            event_id=f"oe-{uuid.uuid4().hex}",
+            intent_id=intent_id,
+            kind=kind,
+            occurred_at=self._clock(),
+            correlation_id=intent_id,  # 一条订单链共用一个关联 ID
+            observed=observed,
+            has_fills=has_fills,
+        )
+
+    def _apply(
+        self,
+        intent_id: str,
+        kind: EventKind,
+        *,
+        observed: OrderStatus | None = None,
+        has_fills: bool | None = None,
+    ) -> OrderStatus:
+        """先 transition() 再写账本（C-02 移交：订单事件落库的唯一路径）。"""
+        current = self.status(intent_id)
+        new = transition(current, kind, observed=observed, has_fills=has_fills)
+        event = self._event(intent_id, kind, observed=observed, has_fills=has_fills)
+        self._repo.append_order_event(event, new)
+        if new is not S.SUBMITTING:
+            self._deadlines.pop(intent_id, None)  # 离开 SUBMITTING 即取消提交超时
+        if new in TERMINAL:
+            self._pending_cancel.discard(intent_id)
+        return new
+
+    def _discrepancy(self, intent_id: str | None, kind: str, **detail: str | None) -> None:
+        record_audit(
+            self._repo,
+            action=DISCREPANCY,
+            actor=self._actor,
+            at=self._clock(),
+            detail={"kind": kind, "intent_id": intent_id, **detail},
+            correlation_id=intent_id,
+        )
+        log_event(log, logging.WARNING, "订单差异", kind=kind, intent_id=intent_id, **detail)

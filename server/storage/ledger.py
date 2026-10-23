@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -84,6 +85,16 @@ class CommandRecord:
     command: str
     result: str
     recorded_at: str
+
+
+@dataclass(frozen=True)
+class Issuance:
+    """一次票据签发：券商订单、用掉的风控决定与实际下单数量（O-01）。"""
+
+    broker_order: BrokerOrder
+    decision_id: str
+    quantity: Decimal
+    issued_at: str
 
 
 @dataclass(frozen=True)
@@ -288,6 +299,140 @@ class LedgerRepository:
         )
         with self._reading("executions") as conn:
             return [Execution.model_validate_json(p) for (p,) in conn.execute(stmt)]
+
+    # ---------- 票据签发（O-01） ----------
+
+    def commit_submission(
+        self,
+        order: BrokerOrder,
+        decision_id: str,
+        quantity: Decimal,
+        event: OrderEvent,
+        status: OrderStatus,
+    ) -> bool:
+        """在下单之前，把券商订单、签发记录与 SUBMIT_SENT 事件放在同一事务写入。
+
+        完全相同的签发再写一次返回 False（重试安全）；意图、订单号或风控决定已被别的签发占用抛
+        ConflictError——一个决定只能用一次，一个意图只有一条订单链。
+        """
+        if order.perm_id is not None:
+            raise StorageError("permId 通过 record_perm_id 单独登记")
+        if event.intent_id != order.intent_id:
+            raise StorageError("签发事件与券商订单不属于同一意图")
+        order_payload = order.model_dump_json()
+        event_payload = event.model_dump_json()
+        status_value = OrderStatus(status).value
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(
+                    schema.broker_orders.insert().values(
+                        broker_order_id=order.broker_order_id,
+                        intent_id=order.intent_id,
+                        order_class=order.order_class.value,
+                        submitted_at=_iso(order.submitted_at),
+                        payload=order_payload,
+                    )
+                )
+                conn.execute(
+                    schema.ticket_issuance.insert().values(
+                        broker_order_id=order.broker_order_id,
+                        intent_id=order.intent_id,
+                        decision_id=decision_id,
+                        quantity=str(quantity),
+                        issued_at=_iso(order.submitted_at),
+                    )
+                )
+                conn.execute(
+                    schema.order_events.insert().values(
+                        event_id=event.event_id,
+                        intent_id=event.intent_id,
+                        kind=event.kind.value,
+                        status=status_value,
+                        occurred_at=_iso(event.occurred_at),
+                        correlation_id=event.correlation_id,
+                        payload=event_payload,
+                    )
+                )
+        except IntegrityError as exc:
+            existing = self.issuance_for(order.intent_id)
+            same = (
+                existing is not None
+                and existing.broker_order.model_dump_json() == order_payload
+                and existing.decision_id == decision_id
+                and existing.quantity == quantity
+            )
+            row = self._fetch(schema.order_events, {"event_id": event.event_id})
+            if same and row is not None and row.payload == event_payload:
+                return False
+            raise ConflictError(
+                f"签发冲突：意图 {order.intent_id}、订单号 {order.broker_order_id} 或风控决定 "
+                f"{decision_id} 已被占用"
+            ) from exc
+        except DBAPIError as exc:
+            raise StorageError(f"写入签发失败：{exc.orig}") from exc
+        return True
+
+    def issuance_for(self, intent_id: str) -> Issuance | None:
+        row = self._fetch(schema.ticket_issuance, {"intent_id": intent_id})
+        if row is None:
+            return None
+        order_row = self._fetch(schema.broker_orders, {"broker_order_id": row.broker_order_id})
+        if order_row is None:  # pragma: no cover - 外键保证
+            raise StorageError(f"签发记录 {row.broker_order_id} 缺少券商订单")
+        with self._reading("ticket_issuance"):
+            return Issuance(
+                broker_order=BrokerOrder.model_validate_json(order_row.payload),
+                decision_id=row.decision_id,
+                quantity=Decimal(row.quantity),
+                issued_at=row.issued_at,
+            )
+
+    def intent_for_broker_order(self, broker_order_id: str) -> str | None:
+        row = self._fetch(schema.broker_orders, {"broker_order_id": broker_order_id})
+        return None if row is None else str(row.intent_id)
+
+    def submitted_intents(self) -> list[str]:
+        """全部已签发（交给过券商）的意图，按签发顺序。"""
+        t = schema.ticket_issuance
+        stmt = select(t.c.intent_id).order_by(t.c.issued_at, t.c.intent_id)
+        with self._reading("ticket_issuance") as conn:
+            return [str(i) for (i,) in conn.execute(stmt)]
+
+    def max_numeric_broker_order_id(self) -> int:
+        """账本里最大的数字订单号（没有则 0）；下一个订单号取 max(券商, 账本 + 1)。"""
+        stmt = select(schema.broker_orders.c.broker_order_id)
+        with self._reading("broker_orders") as conn:
+            ids = [str(i) for (i,) in conn.execute(stmt)]
+        return max((int(i) for i in ids if i.isdigit()), default=0)
+
+    def perm_id_for(self, intent_id: str) -> str | None:
+        row = self._fetch(schema.perm_ids, {"intent_id": intent_id})
+        return None if row is None else str(row.perm_id)
+
+    def add_unmatched_execution(
+        self, execution_id: str, reason: str, payload: str, at: datetime
+    ) -> bool:
+        """无法关联到本系统订单的成交照实入账（payload 是券商侧成交事实的 JSON）。"""
+        return self._insert_once(
+            schema.unmatched_executions,
+            {
+                "execution_id": execution_id,
+                "reason": reason,
+                "recorded_at": _iso(at),
+                "payload": payload,
+            },
+            [{"execution_id": execution_id}],
+            lambda r: r.payload == payload,
+        )
+
+    def unmatched_executions(self) -> list[tuple[str, str, str]]:
+        """(execution_id, reason, payload)，按入账顺序。"""
+        t = schema.unmatched_executions
+        stmt = select(t.c.execution_id, t.c.reason, t.c.payload).order_by(
+            t.c.recorded_at, t.c.execution_id
+        )
+        with self._reading("unmatched_executions") as conn:
+            return [(str(e), str(r), str(p)) for e, r, p in conn.execute(stmt)]
 
     # ---------- 风控决定 ----------
 

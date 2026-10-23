@@ -43,11 +43,13 @@ def make_intent(intent_id: str = "int-1", qty: str = "10") -> OrderIntent:
     )
 
 
-def make_execution(eid: str = "exec-1", qty: str = "4", intent_id: str = "int-1") -> Execution:
+def make_execution(
+    eid: str = "exec-1", qty: str = "4", intent_id: str = "int-1", boid: str = "101"
+) -> Execution:
     return Execution(
         execution_id=eid,
         intent_id=intent_id,
-        broker_order_id="101",
+        broker_order_id=boid,
         symbol="SPY",
         side=Side.BUY,
         quantity=Decimal(qty),
@@ -104,13 +106,20 @@ def repo(db_path: Path) -> LedgerRepository:
 
 @pytest.fixture
 def full_repo(repo: LedgerRepository) -> LedgerRepository:
-    """9 张账本表各有至少一条真实行。"""
+    """全部账本表各有至少一条真实行。"""
     repo.add_intent(make_intent())
-    repo.add_broker_order(make_broker_order())
+    repo.add_risk_decision(make_decision())
+    repo.commit_submission(
+        make_broker_order(),
+        "d-1",
+        Decimal(10),
+        make_event("ev-0", EventKind.SUBMIT_SENT),
+        OrderStatus.SUBMITTING,
+    )
+    repo.add_unmatched_execution("foreign-1", "no_order_ref", "{}", T0)
     repo.record_perm_id("int-1", "9001", T0)
     repo.append_order_event(make_event("ev-1", EventKind.RISK_APPROVED), OrderStatus.RISK_APPROVED)
     repo.add_execution(make_execution())
-    repo.add_risk_decision(make_decision())
     repo.record_command("req-1", "halt_new_orders", "{}", T0)
     repo.append_audit(make_audit())
     halt = HaltState(halted=True, reason="急停", since=T0, set_by="dylan")
@@ -269,6 +278,10 @@ REPLACE_CASES: dict[str, tuple[str, str]] = {
                      "VALUES (1,'a-x','x','x','x','x','{}')"),
     "mode_changes": ("mode = 'PAPER'", "(seq, change_id, mode, halt, changed_at, actor) "
                      "VALUES (1,'mc-x','PAPER','{}','x','x')"),
+    "ticket_issuance": ("quantity = '999'", "(broker_order_id, intent_id, decision_id, quantity, issued_at) "
+                        "VALUES ('101','int-1','d-1','999','x')"),
+    "unmatched_executions": ("reason = 'x'", "(execution_id, reason, recorded_at, payload) "
+                             "VALUES ('foreign-1','x','x','{}')"),
 }  # fmt: skip
 
 
@@ -328,6 +341,7 @@ def test_intent_insert_is_idempotent_and_conflict_detected(repo: LedgerRepositor
 
 def test_duplicate_execution_is_booked_once(repo: LedgerRepository) -> None:
     repo.add_intent(make_intent())
+    repo.add_broker_order(make_broker_order())
     assert repo.add_execution(make_execution()) is True
     assert repo.add_execution(make_execution()) is False
     assert [e.execution_id for e in repo.executions_for("int-1")] == ["exec-1"]
@@ -429,6 +443,7 @@ def test_audit_events_dedupe_and_latest(repo: LedgerRepository) -> None:
 
 def test_money_is_stored_as_exact_text(db_path: Path, repo: LedgerRepository) -> None:
     repo.add_intent(make_intent())
+    repo.add_broker_order(make_broker_order())
     repo.add_execution(make_execution())
     with raw(db_path) as conn:
         row = conn.execute("SELECT quantity, price, commission FROM executions").fetchone()
@@ -452,6 +467,7 @@ def test_write_failure_propagates(db_path: Path, repo: LedgerRepository) -> None
 
 def test_corrupt_rows_raise_storage_error(db_path: Path, repo: LedgerRepository) -> None:
     repo.add_intent(make_intent())
+    repo.add_broker_order(make_broker_order(boid="1"))
     with raw(db_path) as conn:
         conn.execute(
             "INSERT INTO mode_changes (change_id, mode, halt, changed_at, actor) "
@@ -507,3 +523,69 @@ def test_commit_mode_and_audits_is_atomic(repo: LedgerRepository) -> None:
     latest = repo.latest_mode()
     assert latest is not None and latest.mode is Mode.HALT
     assert [a.event_id for a in repo.audits("halt")] == ["a2"]
+
+
+# ---------- O-01：签发、成交归属与未匹配成交 ----------
+
+
+def make_allow(did: str = "d-ok", intent_id: str = "int-1") -> RiskDecision:
+    return RiskDecision(
+        decision_id=did, intent_id=intent_id, verdict=RiskVerdict.ALLOW, rule_set_version="1",
+        decided_at=T0,
+    )  # fmt: skip
+
+
+def test_submission_is_atomic_and_idempotent(repo: LedgerRepository) -> None:
+    repo.add_intent(make_intent())
+    repo.add_risk_decision(make_allow())
+    order, event = make_broker_order(), make_event("ev-s", EventKind.SUBMIT_SENT)
+    assert repo.commit_submission(order, "d-ok", Decimal(10), event, OrderStatus.SUBMITTING)
+    assert not repo.commit_submission(order, "d-ok", Decimal(10), event, OrderStatus.SUBMITTING)
+    issued = repo.issuance_for("int-1")
+    assert issued is not None and issued.decision_id == "d-ok" and issued.quantity == 10
+    assert repo.latest_status("int-1") is OrderStatus.SUBMITTING
+    assert repo.intent_for_broker_order("101") == "int-1"
+    assert repo.submitted_intents() == ["int-1"]
+    assert repo.max_numeric_broker_order_id() == 101
+
+
+def test_decision_and_intent_can_be_used_only_once(repo: LedgerRepository) -> None:
+    for intent_id in ("int-1", "int-2"):
+        repo.add_intent(make_intent(intent_id))
+    repo.add_risk_decision(make_allow())
+    repo.commit_submission(
+        make_broker_order(), "d-ok", Decimal(10), make_event("ev-1", EventKind.SUBMIT_SENT),
+        OrderStatus.SUBMITTING,
+    )  # fmt: skip
+    with pytest.raises(ConflictError):  # 同一决定给另一个意图
+        repo.commit_submission(
+            make_broker_order("int-2", "102"), "d-ok", Decimal(10),
+            make_event("ev-2", EventKind.SUBMIT_SENT, "int-2"), OrderStatus.SUBMITTING,
+        )  # fmt: skip
+    with pytest.raises(ConflictError):  # 同一意图换订单号重签
+        repo.commit_submission(
+            make_broker_order("int-1", "103"), "d-ok", Decimal(10),
+            make_event("ev-3", EventKind.SUBMIT_SENT), OrderStatus.SUBMITTING,
+        )  # fmt: skip
+    # 冲突的事务整体回滚：没有留下半条签发
+    assert repo.intent_for_broker_order("102") is None
+    assert repo.intent_for_broker_order("103") is None
+    assert [e.event_id for e, _ in repo.order_history("int-2")] == []
+
+
+def test_execution_must_belong_to_order_of_same_intent(repo: LedgerRepository) -> None:
+    for intent_id in ("int-1", "int-2"):
+        repo.add_intent(make_intent(intent_id))
+    repo.add_broker_order(make_broker_order("int-2", "102"))
+    with pytest.raises(StorageError):  # 101 不存在
+        repo.add_execution(make_execution())
+    with pytest.raises(StorageError):  # 102 属于另一个意图
+        repo.add_execution(make_execution(boid="102"))
+
+
+def test_unmatched_executions_are_kept(repo: LedgerRepository) -> None:
+    assert repo.add_unmatched_execution("x-1", "no_order_ref", '{"q": "0.5"}', T0)
+    assert not repo.add_unmatched_execution("x-1", "no_order_ref", '{"q": "0.5"}', T0)
+    with pytest.raises(ConflictError):
+        repo.add_unmatched_execution("x-1", "no_order_ref", '{"q": "1"}', T0)
+    assert repo.unmatched_executions() == [("x-1", "no_order_ref", '{"q": "0.5"}')]

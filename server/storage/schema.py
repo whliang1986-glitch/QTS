@@ -114,10 +114,39 @@ mode_changes = Table(
     Column("actor", Text, nullable=False),
 )
 
+# O-01（迁移 0003）：一次签发用掉一个风控决定；下单数量随签发记录
+ticket_issuance = Table(
+    "ticket_issuance",
+    metadata,
+    Column("broker_order_id", Text, ForeignKey("broker_orders.broker_order_id"), primary_key=True),
+    Column("intent_id", Text, ForeignKey("orders.intent_id"), nullable=False, unique=True),
+    Column(
+        "decision_id",
+        Text,
+        ForeignKey("risk_decisions.decision_id"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("quantity", Text, nullable=False),
+    Column("issued_at", Text, nullable=False),
+)
+
+# O-01（迁移 0003）：无法关联到本系统订单的成交照实入账，不丢弃
+unmatched_executions = Table(
+    "unmatched_executions",
+    metadata,
+    Column("execution_id", Text, primary_key=True),
+    Column("reason", Text, nullable=False),
+    Column("recorded_at", Text, nullable=False),
+    Column("payload", Text, nullable=False),
+)
+
 LEDGER_TABLES = frozenset(metadata.tables)
 # 每张账本表必须存在的触发器；打开账本时缺一个即拒绝（防止迁移重建表时触发器丢失）
 LEDGER_TRIGGERS = frozenset(
     {f"{table}_no_{op}" for table in LEDGER_TABLES for op in ("update", "delete", "replace")}
     # 迁移 0002：G7 之前账本里不得出现实盘模式（解除需要 Dylan 批准的新迁移）
     | {"mode_changes_no_live"}
+    # 迁移 0003：成交必须挂在同一意图的券商订单上
+    | {"executions_no_foreign_order"}
 )
