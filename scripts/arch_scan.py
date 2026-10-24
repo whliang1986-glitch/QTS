@@ -11,6 +11,9 @@
 - risk-bypass：oms 的订单提交入口只能在 server/risk（及 oms 自身）使用。
 - order-ticket：OrderTicket 只能在 server/oms 构造（broker 只用于类型标注与处理）。
 - mode-write：账本的模式变更写入只能在 server/risk/mode_manager.py（及 storage 自身）使用。
+- risk-decision：RiskDecision 只能在 domain、storage、oms、risk、broker、backtest 中出现（R-01）；
+  策略、AI、API、数据等包不得构造或引用风控决定。拿到实例后用 type(d) 构造的手法静态扫描拦不住，
+  由于这些包本就不能调用 oms 提交入口，危害有限；运行时由 OMS 的摘要核对兜底。
 - broker-forwarder：broker 包内的受保护名称只能出现在受保护名函数中，且该函数的允许调用方
   必须是被使用名称允许调用方的子集；broker 包内不得定义模块级 __getattr__；
   受保护名函数只能使用白名单装饰器。
@@ -59,6 +62,9 @@ CATEGORIES: dict[str, frozenset[str]] = {
     "order-ticket": frozenset({"OrderTicket", "OrderAmendment"}),
     # 撤销保护性止损的显式确认参数：只能出现在 oms 的二次确认路径与 broker 实现中（B-01）
     "protective-cancel": frozenset({"allow_protective_stop"}),
+    # 风控决定只能由 server/risk 产生、由 oms 消费（R-01）：策略、AI、API 不得构造或引用，
+    # 从类型上挡住“自己写一个 ALLOW 交给 OMS”
+    "risk-decision": frozenset({"RiskDecision"}),
     # 以及账户类型基线所用的审计动作名（防止其他模块写同名审计伪造基线）
     "mode-write": frozenset({"append_mode_change", "commit_mode_and_audits", "account_observed"}),
 }
@@ -78,6 +84,7 @@ CATEGORY_RULE = {
     "mode-write": "mode-write",
     "order-ticket": "order-ticket",
     "protective-cancel": "protective-cancel",
+    "risk-decision": "risk-decision",
 }
 CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "order": ("oms", "broker"),
@@ -87,6 +94,8 @@ CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "mode-write": ("storage", "risk/mode_manager.py"),
     "order-ticket": ("oms", "broker"),
     "protective-cancel": ("oms", "broker"),
+    # domain 定义、storage 落账、broker 的票据内嵌、backtest 复用风控（T-04）
+    "risk-decision": ("domain", "storage", "oms", "risk", "broker", "backtest"),
 }
 CATEGORY_HINT = {
     "order": "只能在 server/oms 中使用",
@@ -96,6 +105,7 @@ CATEGORY_HINT = {
     "mode-write": "只能由 server/risk/mode_manager.py 调用",
     "order-ticket": "只能由 server/oms 签发",
     "protective-cancel": "只能在 server/oms 的二次确认路径中使用",
+    "risk-decision": "只能由 server/risk 产生（domain、storage、oms、broker、backtest 可引用）",
 }
 # broker 包内受保护名函数允许使用的装饰器
 BROKER_DECORATOR_ALLOWLIST = frozenset(

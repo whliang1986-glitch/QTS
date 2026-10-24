@@ -75,6 +75,7 @@ from server.domain.order_state import (
     transition,
 )
 from server.domain.orders import BrokerOrder, Execution, OrderIntent, RiskDecision
+from server.oms.binding import amendment_digest, intent_digest
 from server.storage.errors import ConflictError
 from server.storage.ledger import Issuance, LedgerRepository
 from server.storage.logs import log_event, record_audit
@@ -243,6 +244,8 @@ class OrderManager:
             raise SubmissionRefusedError("意图未落账或与账本内容不一致")
         if decision not in self._repo.risk_decisions_for(intent_id):
             raise SubmissionRefusedError("风控决定未落账或与账本内容不一致，拒绝签发")
+        if decision.subject_digest != intent_digest(stored):  # R-01：决定必须绑定这份意图内容
+            raise SubmissionRefusedError("风控决定没有绑定这个意图的内容（评估对象不一致）")
         issued = self._repo.issuance_for(intent_id)
         if issued is not None:
             if issued.decision_id != decision.decision_id:
@@ -751,6 +754,11 @@ class OrderManager:
         latest_used = max(d.decided_at for d in persisted if d.decision_id in used)
         if decision.decided_at <= latest_used:
             raise AmendRefusedError("改单的风控决定必须晚于本订单已用过的全部决定")
+        bound = amendment_digest(
+            intent, amendment_id=amendment_id, new_price=new_price, new_quantity=new_quantity
+        )
+        if decision.subject_digest != bound:  # R-01：决定必须绑定这次改单的价格与数量
+            raise AmendRefusedError("改单的风控决定没有绑定这次改单的价格与数量")
         original_decision = next(
             (d for d in persisted if d.decision_id == issued.decision_id), None
         )

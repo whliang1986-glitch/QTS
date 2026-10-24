@@ -29,6 +29,7 @@ from server.domain.enums import (
 from server.domain.instrument import Instrument
 from server.domain.order_state import OrderStatus
 from server.domain.orders import OrderIntent, RiskDecision
+from server.oms.binding import amendment_digest, intent_digest
 from server.oms.manager import DISCREPANCY, OrderManager
 from server.storage.ledger import LedgerRepository, open_ledger
 from server.storage.migrate import upgrade
@@ -89,7 +90,8 @@ class Env:
             on_unresolved=self.unresolved.append,
         )
 
-    def intent(self, intent_id: str = "i-1", **kw: Any) -> OrderIntent:
+    def make_intent(self, intent_id: str = "i-1", **kw: Any) -> OrderIntent:
+        """构造意图但不落账（风控入口自己落账）。"""
         data: dict[str, Any] = {
             "intent_id": intent_id, "created_at": T0, "strategy_id": "s", "strategy_version": "1",
             "account_id": ACCOUNT.account_id, "symbol": "SPY", "side": Side.BUY,
@@ -98,14 +100,25 @@ class Env:
             "time_in_force": TimeInForce.DAY,
         }  # fmt: skip
         data.update(kw)
-        intent = OrderIntent.model_validate(data)
+        return OrderIntent.model_validate(data)
+
+    def intent(self, intent_id: str = "i-1", **kw: Any) -> OrderIntent:
+        intent = self.make_intent(intent_id, **kw)
         self.repo.add_intent(intent)
         return intent
 
     def allow(self, intent: OrderIntent, decision_id: str | None = None, **kw: Any) -> RiskDecision:
+        """落账一个风控决定；默认绑定这份意图（R-01），改单用 amendment 参数绑定改单内容。"""
+        amendment: tuple[str, Decimal, Decimal] | None = kw.pop("amendment", None)
+        if amendment is None:
+            digest = intent_digest(intent)
+        else:
+            aid, price, qty = amendment
+            digest = amendment_digest(intent, amendment_id=aid, new_price=price, new_quantity=qty)
         data: dict[str, Any] = {
             "decision_id": decision_id or f"d-{intent.intent_id}", "intent_id": intent.intent_id,
             "verdict": RiskVerdict.ALLOW, "rule_set_version": "1", "decided_at": T0,
+            "subject_digest": digest,
         }  # fmt: skip
         data.update(kw)
         decision = RiskDecision.model_validate(data)

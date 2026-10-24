@@ -815,15 +815,16 @@ async def amend(
     existing = [d for d in env.repo.risk_decisions_for("i-1") if d.decision_id == did]
     # 改单的决定必须晚于本订单已用过的全部决定：每个新决定往后推一秒
     later = T0 + timedelta(seconds=len(env.repo.risk_decisions_for("i-1")))
+    bound = (amendment_id, Decimal(price), Decimal(qty))  # R-01：决定绑定这次改单的价格与数量
     if existing:
         decision = existing[0]
     elif qty == intent.quantity:
-        decision = env.allow(intent, did, decided_at=later)
+        decision = env.allow(intent, did, decided_at=later, amendment=bound)
     else:
         hit = (RuleHit(rule_id="r", rule_version="1", message="缩量"),)
         decision = env.allow(
             intent, did, verdict=RiskVerdict.REDUCE, approved_quantity=Decimal(qty),
-            rule_hits=hit, decided_at=later,
+            rule_hits=hit, decided_at=later, amendment=bound,
         )  # fmt: skip
     return await env.om.request_amend(
         "i-1", amendment_id=amendment_id, new_price=Decimal(price), new_quantity=Decimal(qty),

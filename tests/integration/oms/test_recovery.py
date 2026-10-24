@@ -74,7 +74,12 @@ async def amend(env: Env, amendment_id: str, price: str, qty: int) -> OrderStatu
     intent = env.repo.get_intent("i-1")
     assert intent is not None
     later = T0 + timedelta(seconds=len(env.repo.risk_decisions_for("i-1")))  # 晚于已用过的决定
-    decision = env.allow(intent, f"d-{amendment_id}", decided_at=later)
+    decision = env.allow(
+        intent,
+        f"d-{amendment_id}",
+        decided_at=later,
+        amendment=(amendment_id, Decimal(price), Decimal(qty)),
+    )
     return await env.om.request_amend(
         "i-1",
         amendment_id=amendment_id,

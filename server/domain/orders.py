@@ -92,6 +92,9 @@ class RiskDecision(ValueModel):
     rule_hits: tuple[RuleHit, ...] = ()
     rule_set_version: Identifier
     decided_at: UtcDatetime
+    # 评估对象的规范化摘要（R-01，server/oms/binding.py）：OMS 只消费与所签发 / 改单内容一致的决定；
+    # 没有摘要的决定（R-01 之前写入的）一律不能用于下单
+    subject_digest: Identifier | None = None
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
