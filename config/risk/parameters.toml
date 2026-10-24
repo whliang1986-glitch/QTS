@@ -1,0 +1,80 @@
+# F-04 风控参数 v1：数值由 Claude 拟定，Dylan 2026-10-24 授权；理由见 docs/runbooks/risk-parameters.template.toml
+[parameters.max_order_notional_nav]
+start = 0.05
+hard_min = 0.005
+hard_max = 0.10
+
+[parameters.max_position_etf_nav]
+start = 0.25
+hard_min = 0.05
+hard_max = 0.40
+
+[parameters.max_position_stk_nav]
+start = 0.10
+hard_min = 0.02
+hard_max = 0.20
+
+[parameters.max_total_exposure_nav]
+start = 1.0
+hard_min = 0.10
+hard_max = 1.0
+
+[parameters.min_cash_buffer_nav]
+start = 0.02
+hard_min = 0.01
+hard_max = 0.50
+
+[parameters.max_daily_loss_nav]
+start = 0.02
+hard_min = 0.005
+hard_max = 0.05
+
+[parameters.max_strategy_drawdown]
+start = 0.10
+hard_min = 0.02
+hard_max = 0.20
+
+[parameters.max_open_orders]
+start = 20
+hard_min = 1
+hard_max = 50
+
+[parameters.max_orders_per_minute]
+start = 10
+hard_min = 1
+hard_max = 30
+
+[parameters.max_limit_deviation]
+start = 0.01
+hard_min = 0.001
+hard_max = 0.03
+
+[parameters.max_quote_age_ms]
+start = 5000
+hard_min = 1000
+hard_max = 15000
+
+[parameters.max_spread_bps]
+start = 30
+hard_min = 5
+hard_max = 100
+
+[parameters.max_clock_skew_ms]
+start = 1000
+hard_min = 100
+hard_max = 2000
+
+[parameters.protective_stop_distance]
+start = 0.10
+hard_min = 0.03
+hard_max = 0.20
+
+[parameters.stop_cooldown_trading_days]
+start = 5
+hard_min = 5
+hard_max = 20
+
+[parameters.smoke_order_nav]
+start = 0.005
+hard_min = 0.001
+hard_max = 0.01
