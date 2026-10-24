@@ -160,7 +160,7 @@ class RiskEngine:
         oms: OrderManager,
         modes: ModeManager,
         *,
-        rule_set: RuleSet | None,
+        rule_set: RuleSet | Callable[[], RuleSet | None] | None,
         context: ContextProvider,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         new_id: Callable[[], str] = lambda: uuid.uuid4().hex,
@@ -170,7 +170,10 @@ class RiskEngine:
         self._repo = repo
         self._oms = oms
         self._modes = modes
-        self._rule_set = rule_set
+        # 规则集可以是固定的，也可以每次评估时现取（R-02：面板调严立即生效）
+        self._rules: Callable[[], RuleSet | None] = (
+            rule_set if callable(rule_set) else (lambda: rule_set)
+        )
         self._context = context
         self._clock = clock
         self._new_id = new_id
@@ -236,7 +239,7 @@ class RiskEngine:
         """评估并落账，返回决定（不调用 OMS）。"""
         return self._persist(await self._evaluate(subject))
 
-    def _precheck(self, subject: Subject) -> RiskDecision | None:
+    def _precheck(self, subject: Subject, rule_set: RuleSet | None) -> RiskDecision | None:
         """模式门禁、改单数量、规则集就绪；不通过返回拒绝决定。"""
         try:
             self._modes.require_trading_allowed()
@@ -254,17 +257,21 @@ class RiskEngine:
             return self._engine_reject(
                 subject, "amend_quantity", "改单数量必须是整股且不超过意图数量"
             )
-        if self._rule_set is None or not self._rule_set.rules:
+        if rule_set is None or not rule_set.rules:
             return self._engine_reject(
                 subject, "rule_set_missing", "风控规则集缺失（受保护参数未提交或不合法）"
             )
         return None
 
     async def _evaluate(self, subject: Subject) -> RiskDecision:
-        refused = self._precheck(subject)
+        try:
+            rule_set = self._rules()
+        except Exception as exc:  # 取不到规则集（参数加载失败等）：按缺失处理
+            log_event(log, logging.ERROR, "风控规则集不可用", error=type(exc).__name__)
+            rule_set = None
+        refused = self._precheck(subject, rule_set)
         if refused is not None:
             return refused
-        rule_set = self._rule_set
         assert rule_set is not None  # noqa: S101 - _precheck 已确认规则集就绪
         try:
             context = await asyncio.wait_for(
@@ -352,7 +359,7 @@ class RiskEngine:
 
     def _engine_reject(self, subject: Subject, rule_id: str, message: str) -> RiskDecision:
         hit = RuleHit(rule_id=rule_id, rule_version=ENGINE_RULE_VERSION, message=message)
-        version = self._rule_set.version if self._rule_set is not None else "none"
+        version = "engine"  # 引擎内置检查不属于任何规则集版本
         log_event(
             log, logging.WARNING, "风控拒绝", rule_id=rule_id, intent_id=subject.intent.intent_id
         )

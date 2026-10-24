@@ -414,6 +414,28 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "ok = k is OrderClass.PROTECTIVE_STOP" + NL,
         "protective-class",
     ),
+    "strategy 伪造参数变更记录": (
+        "server/strategy/s.py",
+        "e = AuditEvent(action='risk_param_change')" + NL,
+        "dynamic-name",
+    ),
+    "risk 其他模块写变更": (
+        "server/risk/rulesets.py",
+        "store._append_change(k)" + NL,
+        "risk-param-write",
+    ),
+    "api 写确认记录类别": ("server/api/a.py", "kind = 'loosen_confirmed'" + NL, "dynamic-name"),
+    "ai 调松风控参数": ("server/ai/a.py", "store.request_loosen(n, v)" + NL, "risk-param-loosen"),
+    "strategy 确认调松": (
+        "server/strategy/s.py",
+        "store.confirm_loosen(rid, actor=a, confirmation=c)" + NL,
+        "risk-param-loosen",
+    ),
+    "risk 其他模块调松": (
+        "server/risk/rulesets.py",
+        "store.confirm_loosen(rid)" + NL,
+        "risk-param-loosen",
+    ),
     "ai 反序列化风控决定": (
         "server/ai/m.py",
         "d = RiskDecision.model_validate(payload)" + NL,
@@ -523,6 +545,7 @@ ALLOWED: dict[str, tuple[str, str]] = {
     "risk 产生风控决定": ("server/risk/e.py", "d = RiskDecision(decision_id='x')\n"),
     "guard 识别保护性止损": ("server/guard/g.py", "skip = c is OrderClass.PROTECTIVE_STOP\n"),
     "oms 使用止损来源": ("server/oms/p.py", "sid = PROTECTIVE_STOP_SOURCE\n"),
+    "api 面板确认调松": ("server/api/panel.py", "store.confirm_loosen(rid)\n"),
     "storage 反序列化风控决定": ("server/storage/l.py", "RiskDecision.model_validate_json(p)\n"),
     "broker 同名委托": (
         "server/broker/fake/f.py",

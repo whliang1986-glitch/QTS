@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -86,7 +87,7 @@ def engine(
     *rules: FixedRule,
     manager: ModeManager | None = None,
     context: Context | None = None,
-    rule_set: RuleSet | str | None = "default",
+    rule_set: RuleSet | Callable[[], RuleSet | None] | str | None = "default",
     timeout: float = 1,
 ) -> RiskEngine:
     if isinstance(rule_set, str):
@@ -468,3 +469,24 @@ async def test_protective_stop_is_never_reduced(env: Env) -> None:
     assert outcome.decision.verdict is V.REJECT  # 只保护一部分仓位等于静默放弃保护
     assert outcome.decision.rule_hits[-1].rule_id == "protective_stop_not_reducible"
     assert env.repo.issuance_for("stop-1") is None
+
+
+@pytest.mark.asyncio
+async def test_rule_source_failure_rejects(env: Env) -> None:
+    def broken() -> RuleSet | None:
+        raise ValueError("parameters unreadable")
+
+    outcome = await engine(env, rule_set=broken).submit(env.make_intent())
+    assert outcome.decision.rule_hits[0].rule_id == "rule_set_missing"
+    assert env.repo.issuance_for("i-1") is None
+
+
+@pytest.mark.asyncio
+async def test_rule_source_is_read_on_every_evaluation(env: Env) -> None:
+    current: list[RuleSet | None] = [RuleSet(version="v1", rules=(FixedRule(),))]
+    risk = engine(env, rule_set=lambda: current[0])
+    first = await risk.submit(env.make_intent())
+    current[0] = RuleSet(version="v2", rules=(FixedRule(reject("调严后超限")),))
+    second = await risk.submit(env.make_intent("i-2"))
+    assert first.decision.verdict is V.ALLOW and first.decision.rule_set_version == "v1"
+    assert second.decision.verdict is V.REJECT and second.decision.rule_set_version == "v2"

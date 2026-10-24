@@ -49,6 +49,8 @@ def test_real_repository_passes() -> None:
 DOMAIN = "domain 不得依赖任何其他层"
 DECISION = "strategy、ai、api 不得依赖 broker（直接或间接）"
 ALLOWLIST = "只有 oms、guard、backtest、data 可以直接 import broker"
+NO_LEDGER = "ai、strategy 不得依赖 storage 与 risk（R-02a：不能伪造参数变更或风控决定）"
+NO_API = "ai、strategy 不得依赖 api（R-02a：不能经 api 的包装函数间接调松风控参数或确认）"
 
 # 植入的文件 → 预期被打破的契约名（断言具体契约，防止被另一条契约顶替着通过）
 VIOLATIONS: dict[str, tuple[dict[str, str], str]] = {
@@ -70,6 +72,9 @@ VIOLATIONS: dict[str, tuple[dict[str, str], str]] = {
     "risk 直接依赖 broker": ({"server/risk/rules.py": "import server.broker\n"}, ALLOWLIST),
     "storage 直接依赖 broker": ({"server/storage/r.py": "import server.broker\n"}, ALLOWLIST),
     "ipc 直接依赖 broker": ({"server/ipc/outbox.py": "import server.broker.fake\n"}, ALLOWLIST),
+    "ai 依赖账本": ({"server/ai/a.py": "import server.storage\n"}, NO_LEDGER),
+    "strategy 依赖风控参数": ({"server/strategy/s.py": "from server import risk\n"}, NO_LEDGER),
+    "ai 依赖 api": ({"server/ai/a.py": "import server.api\n"}, NO_API),
 }
 
 

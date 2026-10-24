@@ -119,6 +119,22 @@ forbidden_modules = ["server.broker"]
 allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
+id = "no-api-from-ai-strategy"
+name = "ai、strategy 不得依赖 api（R-02a：不能经 api 的包装函数间接调松风控参数或确认）"
+type = "forbidden"
+source_modules = ["server.ai", "server.strategy"]
+forbidden_modules = ["server.api"]
+
+[[tool.importlinter.contracts]]
+id = "no-ledger-from-ai-strategy"
+name = "ai、strategy 不得依赖 storage 与 risk（R-02a：不能伪造参数变更或风控决定）"
+type = "forbidden"
+source_modules = ["server.ai", "server.strategy"]
+forbidden_modules = ["server.storage", "server.risk"]
+# 包含间接依赖（安全优先）。将来 strategy 需要经 data 间接依赖 storage.config 时，不得整体放宽或加
+# allow_indirect_imports：把禁止范围收窄到 server.storage.ledger 与 server.risk，并重新评审。
+
+[[tool.importlinter.contracts]]
 id = "fake-broker-test-only"
 name = "FakeBroker 只给 backtest 与测试用（B-02）：其他包不能借它的控制面绕过 clientId 隔离与撤单保护"
 type = "forbidden"
