@@ -246,12 +246,15 @@ def test_rule_source_follows_current_parameters(tmp_path: Path, repo: LedgerRepo
     assert build_rule_set(s.current()).version == after.version
 
 
-def test_template_lists_every_parameter_and_fails_closed_until_filled() -> None:
+def test_proposed_template_loads_and_covers_every_parameter() -> None:
+    """建议值文件必须能原样加载（Dylan 复制即可用），且参数与定义一一对应。"""
     path = Path(__file__).parents[3] / "docs" / "runbooks" / "risk-parameters.template.toml"
     names = set(tomllib.loads(path.read_text(encoding="utf-8"))["parameters"])
     assert names == {s.name for s in SPECS}
-    with pytest.raises(ConfigError, match="hard_min"):  # 上下限故意留空：不填完不能加载
-        parse_parameters(load_toml(path, name="risk-parameters"))
+    config = parse_parameters(load_toml(path, name="risk-parameters"))
+    # 附录 A 的硬性要求：不加杠杆、止损后冷却不少于 5 个交易日
+    assert config.bounds["max_total_exposure_nav"].hard_max <= 1
+    assert config.bounds["stop_cooldown_trading_days"].hard_min >= 5
 
 
 # ---------- R-02a 评审补充 ----------

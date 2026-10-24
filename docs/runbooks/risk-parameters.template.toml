@@ -1,91 +1,127 @@
-# 风控参数模板（R-02a / ADR-16）——由 Dylan 审阅、填写后，复制为 config/risk/parameters.toml 并本人提交。
+# 风控参数建议值（F-04 / R-02a / ADR-16）——由开发方提出，Dylan 审阅后复制为 config/risk/parameters.toml 并本人提交。
 #
-# - start 列出的是 V4.1 附录 A 的**草案值**，没有按你的资金规模与风险承受能力校准，必须逐项确认或修改。
-# - hard_min / hard_max 是面板可调的硬性上下限，**故意留空**：不填完，文件无法加载，风控拒绝一切新增订单（默认最严）。
-#   面板（API）只能在这个范围内调整；调严立即生效，调松须你本人二次确认。
-# - 比例类参数取值 (0, 1]（例如 0.05 = 5% NAV）；笔数、毫秒、基点、交易日为正整数。
+# 性质：这是“建议值”，不是批准值。按 CLAUDE.md，AI 只能提议、不能批准：Dylan 本人把本文件复制到受保护配置并提交，
+#       即为批准动作；提交前请至少看一遍每项的 start 与可调范围。
+# 选值原则：
+# - start 以 V4.1 附录 A 草案为基准，拿不准的取更严一端（附录 A 草案本身已按“开发与模拟盘”偏保守）。
+# - hard_min / hard_max 是风控面板能调的硬边界：范围留出实盘中合理调整的余地，但“松”的一端不放到失去保护意义的位置。
+#   面板只能在这个范围内调；调严立即生效，调松须 Dylan 二次确认；想强制某个值，收窄这两个边界即可。
+# - 比例类参数取值 (0, 1]（0.05 = 5% NAV）；笔数、毫秒、基点、交易日为正整数。最多 12 位小数，不接受 inf / nan。
 # - 杠杆（固定 1.0）、做空、衍生品（含期权）、市价单、风控口径是开关，不在这里，也不进面板。
-# - 每个参数必须恰好有 start、hard_min、hard_max 三项；缺参数、多参数、多余键都会加载失败。
-# - 重启后面板上保存的调严值仍然有效（比新 start 更严时）；想强制某个值，收窄 hard_min / hard_max。
-#   修改本文件后，之前确认过的调松全部作废，需要重新确认。
-# - protective_stop_distance 必须小于 1（等于 1 相当于不设止损）；数值最多 12 位小数，不接受 inf / nan。
+# - 每个参数必须恰好有 start、hard_min、hard_max 三项；缺参数、多参数、多余键都会加载失败（风控随即拒绝一切新订单）。
+# - 重启后面板上保存的调严值仍有效；修改本文件后，之前确认过的调松全部作废，需要重新确认。
+# - protective_stop_distance 必须小于 1。
 
-[parameters.max_order_notional_nav]   # 单笔订单最大名义金额（NAV 比例）
+# 单笔订单最大名义金额（NAV 比例，越大越松）。
+# start 5%：附录 A 草案；单笔亏损即使全损也只占净值一小部分。
+# 范围 0.5%–10%：下限便于极保守试运行；上限 10% 防止一笔单子就押上大块净值。
+[parameters.max_order_notional_nav]
 start = 0.05
-# hard_min =
-# hard_max =
+hard_min = 0.005
+hard_max = 0.10
 
-[parameters.max_position_etf_nav]     # ETF 单标的市值上限
+# ETF 单标的市值上限（NAV 比例，越大越松）。
+# start 25%：附录 A 草案（宽基 ETF 本身分散）。范围 5%–40%：上限 40% 防止过度集中于单只 ETF。
+[parameters.max_position_etf_nav]
 start = 0.25
-# hard_min =
-# hard_max =
+hard_min = 0.05
+hard_max = 0.40
 
-[parameters.max_position_stk_nav]     # 个股单标的市值上限
+# 个股单标的市值上限（NAV 比例，越大越松）。
+# start 10%：附录 A 草案。范围 2%–20%：个股波动远大于宽基，上限 20% 已属激进。
+[parameters.max_position_stk_nav]
 start = 0.10
-# hard_min =
-# hard_max =
+hard_min = 0.02
+hard_max = 0.20
 
-[parameters.max_total_exposure_nav]   # 总敞口上限（不含杠杆）
+# 总敞口上限（NAV 比例，越大越松；不含杠杆）。
+# start 100%：附录 A 草案，现金账户满仓即 100%。范围 10%–100%：上限 100% 意味着永不加杠杆（杠杆是开关，不在面板）。
+[parameters.max_total_exposure_nav]
 start = 1.0
-# hard_min =
-# hard_max =
+hard_min = 0.10
+hard_max = 1.0
 
-[parameters.min_cash_buffer_nav]      # 最低现金缓冲（数值越大越严）
+# 最低现金缓冲（NAV 比例，越大越严）。
+# start 2%：附录 A 草案（与总敞口取更严者，实际可用约 98%）。
+# 范围 1%–50%：下限 1% 保证始终留有现金应付费用与结算差；上限 50% 便于降低仓位运行。
+[parameters.min_cash_buffer_nav]
 start = 0.02
-# hard_min =
-# hard_max =
+hard_min = 0.01
+hard_max = 0.50
 
-[parameters.max_daily_loss_nav]       # 日内亏损上限，触发 HALT
+# 日内亏损上限（相对当日开盘净值的比例，越大越松；触发后持久化 HALT）。
+# start 2%：附录 A 草案。范围 0.5%–5%：上限 5% 防止单日回撤失控（日线低频策略的正常日波动远小于此）。
+[parameters.max_daily_loss_nav]
 start = 0.02
-# hard_min =
-# hard_max =
+hard_min = 0.005
+hard_max = 0.05
 
-[parameters.max_strategy_drawdown]    # 策略最大回撤
+# 策略最大回撤（比例，越大越松；达到即暂停该策略开仓）。
+# start 10%：附录 A 草案，需与保护性止损距离匹配。范围 2%–20%：上限 20% 仍能在严重失效前停下策略。
+[parameters.max_strategy_drawdown]
 start = 0.10
-# hard_min =
-# hard_max =
+hard_min = 0.02
+hard_max = 0.20
 
-[parameters.max_open_orders]          # 最大未成交订单数（不含保护性止损），笔
+# 最大未成交订单数（笔，越大越松；不含保护性止损）。
+# start 20：附录 A 草案，日线低频策略远用不到。范围 1–50：上限 50 防止程序异常时堆积大量挂单。
+[parameters.max_open_orders]
 start = 20
-# hard_min =
-# hard_max =
+hard_min = 1
+hard_max = 50
 
-[parameters.max_orders_per_minute]    # 下单频率上限，笔/分钟
+# 下单频率上限（笔/分钟，越大越松）。
+# start 10：附录 A 草案。范围 1–30：上限 30 远低于券商限速，主要防失控循环下单。
+[parameters.max_orders_per_minute]
 start = 10
-# hard_min =
-# hard_max =
+hard_min = 1
+hard_max = 30
 
-[parameters.max_limit_deviation]      # 限价偏离（相对最新价）
+# 限价偏离上限（限价相对最新价的比例，越大越松）。
+# start 1%：附录 A 草案。范围 0.1%–3%：上限 3% 防止误价单（例如小数点错位）以离谱价格成交。
+[parameters.max_limit_deviation]
 start = 0.01
-# hard_min =
-# hard_max =
+hard_min = 0.001
+hard_max = 0.03
 
-[parameters.max_quote_age_ms]         # 报价最大陈旧时间，毫秒
+# 报价最大陈旧时间（毫秒，越大越松；超过即拒绝依赖该行情的新增订单）。
+# start 5000：附录 A 草案（要求模拟账户也有实时行情）。范围 1000–15000：上限 15 秒，再长就不算“当前价格”。
+[parameters.max_quote_age_ms]
 start = 5000
-# hard_min =
-# hard_max =
+hard_min = 1000
+hard_max = 15000
 
-[parameters.max_spread_bps]           # 最大买卖价差，基点
+# 最大买卖价差（基点，越大越松）。
+# start 30：附录 A 草案（宽基 ETF 通常远小于此）。范围 5–100：上限 100 bp（1%）防止在流动性枯竭时成交。
+[parameters.max_spread_bps]
 start = 30
-# hard_min =
-# hard_max =
+hard_min = 5
+hard_max = 100
 
-[parameters.max_clock_skew_ms]        # 时钟偏差上限，毫秒
+# 时钟偏差上限（毫秒，越大越松；超过即拒绝新增风险）。
+# start 1000：附录 A 草案。范围 100–2000：上限 2 秒，再大会影响时间戳与对账判断。
+[parameters.max_clock_skew_ms]
 start = 1000
-# hard_min =
-# hard_max =
+hard_min = 100
+hard_max = 2000
 
-[parameters.protective_stop_distance] # 保护性止损距离（成本价下方的比例）
+# 保护性止损距离（成本价下方的比例，越大越松；必须小于 1）。
+# start 10%：附录 A 草案，与策略回撤 10% 匹配。范围 3%–20%：下限 3% 防止被日内正常波动扫掉；上限 20% 仍是有意义的保护。
+[parameters.protective_stop_distance]
 start = 0.10
-# hard_min =
-# hard_max =
+hard_min = 0.03
+hard_max = 0.20
 
-[parameters.stop_cooldown_trading_days] # 止损后最短冷却期，交易日（数值越大越严；另需“至下一个再平衡日”）
+# 止损后最短冷却期（交易日，越大越严；另需“至下一个再平衡日”）。
+# start 5：附录 A 草案的下限。范围 5–20：附录 A 要求“不少于 5 个交易日”，所以下限就是 5，面板不能调短。
+[parameters.stop_cooldown_trading_days]
 start = 5
-# hard_min =
-# hard_max =
+hard_min = 5
+hard_max = 20
 
-[parameters.smoke_order_nav]          # 冒烟策略单笔金额（仅模拟盘）
+# 冒烟策略单笔金额（NAV 比例，越大越松；仅模拟盘，实盘模式下该策略不可启用）。
+# start 0.5%：附录 A 草案。范围 0.1%–1%：冒烟策略只为验证链路，不需要更大金额。
+[parameters.smoke_order_nav]
 start = 0.005
-# hard_min =
-# hard_max =
+hard_min = 0.001
+hard_max = 0.01
