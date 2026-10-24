@@ -21,16 +21,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from typing import ClassVar, Protocol
 
-from server.domain.enums import RiskVerdict
+from server.domain.account import CashBalance, Position
+from server.domain.enums import OrderClass, RiskVerdict, Side
+from server.domain.instrument import Instrument
 from server.domain.order_state import OrderStatus
 from server.domain.orders import OrderIntent, RiskDecision, RuleHit
-from server.domain.values import Identifier, PositiveQuantity, Price, UtcDatetime, ValueModel
+from server.domain.values import (
+    Identifier,
+    PositiveQuantity,
+    Price,
+    Quantity,
+    UtcDatetime,
+    ValueModel,
+)
 from server.oms.binding import amendment_digest, intent_digest
 from server.oms.manager import OrderManager
 from server.risk.mode_manager import ModeManager, TradingHaltedError
@@ -73,10 +82,38 @@ class Subject(ValueModel):
         )
 
 
+class OpenOrder(ValueModel):
+    """评估时仍在券商侧未结束的本系统订单（R-04 起用于防做空、防加杠杆与止损计数）。"""
+
+    intent_id: Identifier
+    symbol: Identifier
+    side: Side
+    order_class: OrderClass
+    remaining_quantity: Quantity
+    limit_price: Price | None = None
+
+
 class RiskContext(ValueModel):
-    """规则评估所需的快照（R-02 / R-03 扩展账户、持仓、行情等字段）。"""
+    """规则评估所需的快照。缺项为 None：用到它的规则必须拒绝（失败即关闭），不得当成 0。
+
+    - positions：券商持仓（负持仓不当作可卖数量，见 domain.account.Position）；
+    - open_orders：本系统已签发、尚未确认终态的全部订单（含 SUBMITTING / UNKNOWN 与撤单中）；
+    - cash：已结算 / 未结算现金（未结算为负表示买入应付款）；instruments：标的规格；
+    - last_prices：最新价（R-03 加新鲜度门禁）。
+    R-02 / R-03 继续扩展（NAV、行情、当日盈亏等）。
+    """
 
     now: UtcDatetime
+    positions: tuple[Position, ...] | None = None
+    open_orders: tuple[OpenOrder, ...] | None = None
+    cash: CashBalance | None = None
+    instruments: Mapping[str, Instrument] | None = None
+    last_prices: Mapping[str, Price] | None = None  # 最新价（R-03 接入行情与新鲜度）
+
+    def position(self, symbol: str) -> Decimal | None:
+        if self.positions is None:
+            return None
+        return sum((p.quantity for p in self.positions if p.symbol == symbol), Decimal(0))
 
 
 class RuleResult(ValueModel):
@@ -282,6 +319,16 @@ class RiskEngine:
             return self._decision(subject, V.REJECT, version, rule_hits)
         approved = self._reduced_quantity(subject, [r for _, r in hits])
         if approved is None:
+            if subject.intent.order_class is OrderClass.PROTECTIVE_STOP:
+                # 保护性止损被要求缩量：拒绝并告警（持仓可能因此没有保护，P0）
+                rule_hits = (*rule_hits, RuleHit(
+                    rule_id="protective_stop_not_reducible",
+                    rule_version=ENGINE_RULE_VERSION,
+                    message="保护性止损不缩量：只保护一部分仓位等于放弃保护",
+                ))  # fmt: skip
+                log_event(
+                    log, logging.ERROR, "保护性止损被拒（缩量）", intent_id=subject.intent.intent_id
+                )
             return self._decision(subject, V.REJECT, version, rule_hits)
         return self._decision(subject, V.REDUCE, version, rule_hits, approved=approved)
 
@@ -294,6 +341,8 @@ class RiskEngine:
         allowed = [r.max_quantity for r in results if r.max_quantity is not None]
         if len(allowed) != len(results) or subject.amendment_id is not None:
             return None
+        if subject.intent.order_class is OrderClass.PROTECTIVE_STOP:
+            return None  # 不缩保护性止损（R-04）：由调用方拒绝并告警
         approved = min(allowed).to_integral_value(rounding=ROUND_FLOOR)  # 首期只交易整股
         if approved >= subject.quantity or approved <= 0:
             return None

@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from server.domain.enums import Mode, RiskVerdict
+from server.domain.enums import Mode, OrderClass, OrderType, RiskVerdict, Side, TimeInForce
 from server.domain.order_state import OrderStatus
-from server.domain.orders import RiskDecision
+from server.domain.orders import PROTECTIVE_STOP_SOURCE, RiskDecision
 from server.oms.binding import amendment_digest, intent_digest
 from server.oms.manager import AmendRefusedError, SubmissionRefusedError
 from server.risk.engine import (
@@ -450,3 +450,21 @@ async def test_fractional_amend_quantity_is_rejected_before_rules(env: Env) -> N
     )
     assert outcome.decision.rule_hits[0].rule_id == "amend_quantity"
     assert env.repo.amendments_for("i-1") == []
+
+
+@pytest.mark.asyncio
+async def test_protective_stop_is_never_reduced(env: Env) -> None:
+    protective = env.make_intent(
+        "stop-1",
+        side=Side.SELL,
+        order_class=OrderClass.PROTECTIVE_STOP,
+        order_type=OrderType.STOP,
+        limit_price=None,
+        stop_price=Decimal(90),
+        time_in_force=TimeInForce.GTC,
+        strategy_id=PROTECTIVE_STOP_SOURCE,
+    )
+    outcome = await engine(env, FixedRule(reduce("5"))).submit(protective)
+    assert outcome.decision.verdict is V.REJECT  # 只保护一部分仓位等于静默放弃保护
+    assert outcome.decision.rule_hits[-1].rule_id == "protective_stop_not_reducible"
+    assert env.repo.issuance_for("stop-1") is None

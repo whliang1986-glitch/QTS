@@ -11,6 +11,8 @@
 - risk-bypass：oms 的订单提交入口只能在 server/risk（及 oms 自身）使用。
 - order-ticket：OrderTicket 只能在 server/oms 构造（broker 只用于类型标注与处理）。
 - mode-write：账本的模式变更写入只能在 server/risk/mode_manager.py（及 storage 自身）使用。
+- protective-source / protective-class：保护性止损的来源标识（含字面量）与类别名只能出现在
+  domain、oms、risk（类别名另允许 guard、backtest），策略、AI、API 不得构造保护性止损（R-04）。
 - risk-decision：RiskDecision 只能在 domain、storage、oms、risk、broker、backtest 中出现（R-01）；
   策略、AI、API、数据等包不得构造或引用风控决定。拿到实例后用 type(d) 构造的手法静态扫描拦不住，
   由于这些包本就不能调用 oms 提交入口，危害有限；运行时由 OMS 的摘要核对兜底。
@@ -65,6 +67,10 @@ CATEGORIES: dict[str, frozenset[str]] = {
     # 风控决定只能由 server/risk 产生、由 oms 消费（R-01）：策略、AI、API 不得构造或引用，
     # 从类型上挡住“自己写一个 ALLOW 交给 OMS”
     "risk-decision": frozenset({"RiskDecision"}),
+    # 保护性止损只能由 OMS 随持仓创建（R-04）：来源标识（含它的字面量取值）与止损类别名
+    # 只能出现在 domain、oms、risk（类别名另允许 guard 与 backtest 识别止损单）
+    "protective-source": frozenset({"PROTECTIVE_STOP_SOURCE", "oms.protective"}),
+    "protective-class": frozenset({"PROTECTIVE_STOP"}),
     # 以及账户类型基线所用的审计动作名（防止其他模块写同名审计伪造基线）
     "mode-write": frozenset({"append_mode_change", "commit_mode_and_audits", "account_observed"}),
 }
@@ -85,6 +91,8 @@ CATEGORY_RULE = {
     "order-ticket": "order-ticket",
     "protective-cancel": "protective-cancel",
     "risk-decision": "risk-decision",
+    "protective-source": "protective-source",
+    "protective-class": "protective-class",
 }
 CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "order": ("oms", "broker"),
@@ -96,6 +104,8 @@ CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "protective-cancel": ("oms", "broker"),
     # domain 定义、storage 落账、broker 的票据内嵌、backtest 复用风控（T-04）
     "risk-decision": ("domain", "storage", "oms", "risk", "broker", "backtest"),
+    "protective-source": ("domain", "oms", "risk"),
+    "protective-class": ("domain", "oms", "risk", "guard", "backtest"),
 }
 CATEGORY_HINT = {
     "order": "只能在 server/oms 中使用",
@@ -106,6 +116,8 @@ CATEGORY_HINT = {
     "order-ticket": "只能由 server/oms 签发",
     "protective-cancel": "只能在 server/oms 的二次确认路径中使用",
     "risk-decision": "只能由 server/risk 产生（domain、storage、oms、broker、backtest 可引用）",
+    "protective-source": "只能由 server/oms 随持仓使用（domain 定义、risk 核对）",
+    "protective-class": "只能在 domain、oms、risk、guard、backtest 中使用（策略等不得构造止损）",
 }
 # broker 包内受保护名函数允许使用的装饰器
 BROKER_DECORATOR_ALLOWLIST = frozenset(
