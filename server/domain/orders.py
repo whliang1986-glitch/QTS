@@ -17,6 +17,10 @@ from server.domain.values import (
     ValueModel,
 )
 
+# 保护性止损只能由 OMS 随持仓创建（R-04 / R-06）：这类意图的 strategy_id 固定为此值；
+# 进程间通信入口（S-01）必须拒绝策略提交带此 strategy_id 的意图
+PROTECTIVE_STOP_SOURCE = "oms.protective"
+
 
 class OrderIntent(ValueModel):
     """策略或用户提出的交易意图，intent_id 是贯穿重试的幂等键。

@@ -394,6 +394,26 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "dynamic-name",
     ),
     "ipc 分派表里的风控决定": ("server/ipc/i.py", "TYPES = ['RiskDecision']" + NL, "dynamic-name"),
+    "strategy 冒充保护性止损来源": (
+        "server/strategy/s.py",
+        "from server.domain.orders import PROTECTIVE_STOP_SOURCE" + NL,
+        "protective-source",
+    ),
+    "strategy 写来源字面量": (
+        "server/strategy/s.py",
+        "sid = 'oms.protective'" + NL,
+        "dynamic-name",
+    ),
+    "ai 构造保护性止损": (
+        "server/ai/a.py",
+        "c = OrderClass.PROTECTIVE_STOP" + NL,
+        "protective-class",
+    ),
+    "api 比较止损类别": (
+        "server/api/a.py",
+        "ok = k is OrderClass.PROTECTIVE_STOP" + NL,
+        "protective-class",
+    ),
     "ai 反序列化风控决定": (
         "server/ai/m.py",
         "d = RiskDecision.model_validate(payload)" + NL,
@@ -501,6 +521,8 @@ ALLOWED: dict[str, tuple[str, str]] = {
     "oms 动态反射": ("server/oms/o.py", "getattr(self, name)\n"),
     "guard 撤单": ("server/guard/g.py", "broker.cancel_order(order_id)\n"),
     "risk 产生风控决定": ("server/risk/e.py", "d = RiskDecision(decision_id='x')\n"),
+    "guard 识别保护性止损": ("server/guard/g.py", "skip = c is OrderClass.PROTECTIVE_STOP\n"),
+    "oms 使用止损来源": ("server/oms/p.py", "sid = PROTECTIVE_STOP_SOURCE\n"),
     "storage 反序列化风控决定": ("server/storage/l.py", "RiskDecision.model_validate_json(p)\n"),
     "broker 同名委托": (
         "server/broker/fake/f.py",
