@@ -34,6 +34,7 @@ from server.domain.order_state import OrderStatus
 from server.domain.orders import OrderIntent, RiskDecision, RuleHit
 from server.domain.values import (
     Identifier,
+    Money,
     PositiveQuantity,
     Price,
     Quantity,
@@ -93,14 +94,24 @@ class OpenOrder(ValueModel):
     limit_price: Price | None = None
 
 
+class StopCooldown(ValueModel):
+    """某标的保护性止损成交后的冷却信息（由上下文提供者按交易日历计算）。"""
+
+    trading_days_since_stop: int
+    rebalanced_since_stop: bool  # 止损之后是否已经过了一个再平衡日
+
+
 class RiskContext(ValueModel):
     """规则评估所需的快照。缺项为 None：用到它的规则必须拒绝（失败即关闭），不得当成 0。
 
     - positions：券商持仓（负持仓不当作可卖数量，见 domain.account.Position）；
     - open_orders：本系统已签发、尚未确认终态的全部订单（含 SUBMITTING / UNKNOWN 与撤单中）；
     - cash：已结算 / 未结算现金（未结算为负表示买入应付款）；instruments：标的规格；
-    - last_prices：最新价（R-03 加新鲜度门禁）。
-    R-02 / R-03 继续扩展（NAV、行情、当日盈亏等）。
+    - last_prices：最新价（R-03 加新鲜度门禁）；
+    - nav / start_of_day_nav：账户净值与当日开盘净值（美元，R-02b 限额与日内亏损）；
+    - strategy_drawdown：各策略当前回撤（比例）；
+    - recent_submissions：近期本系统签发时间（下单频率）；
+    - stop_cooldown：发生过保护性止损成交的标的 → 冷却信息（止损后冷却期）。
     """
 
     now: UtcDatetime
@@ -109,6 +120,11 @@ class RiskContext(ValueModel):
     cash: CashBalance | None = None
     instruments: Mapping[str, Instrument] | None = None
     last_prices: Mapping[str, Price] | None = None  # 最新价（R-03 接入行情与新鲜度）
+    nav: Money | None = None
+    start_of_day_nav: Money | None = None
+    strategy_drawdown: Mapping[str, Decimal] | None = None
+    recent_submissions: tuple[UtcDatetime, ...] | None = None
+    stop_cooldown: Mapping[str, StopCooldown] | None = None
 
     def position(self, symbol: str) -> Decimal | None:
         if self.positions is None:
