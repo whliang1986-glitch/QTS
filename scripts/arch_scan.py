@@ -13,6 +13,8 @@
 - mode-write：账本的模式变更写入只能在 server/risk/mode_manager.py（及 storage 自身）使用。
 - protective-source / protective-class：保护性止损的来源标识（含字面量）与类别名只能出现在
   domain、oms、risk（类别名另允许 guard、backtest），策略、AI、API 不得构造保护性止损（R-04）。
+- risk-param-write：风控参数变更记录的动作名、类别与写入方法只能在 risk/parameters.py（R-02a）。
+- risk-param-loosen：调松风控参数的发起与确认入口只能在 risk/parameters.py 与 server/api（ADR-16）。
 - risk-decision：RiskDecision 只能在 domain、storage、oms、risk、broker、backtest 中出现（R-01）；
   策略、AI、API、数据等包不得构造或引用风控决定。拿到实例后用 type(d) 构造的手法静态扫描拦不住，
   由于这些包本就不能调用 oms 提交入口，危害有限；运行时由 OMS 的摘要核对兜底。
@@ -71,6 +73,14 @@ CATEGORIES: dict[str, frozenset[str]] = {
     # 只能出现在 domain、oms、risk（类别名另允许 guard 与 backtest 识别止损单）
     "protective-source": frozenset({"PROTECTIVE_STOP_SOURCE", "oms.protective"}),
     "protective-class": frozenset({"PROTECTIVE_STOP"}),
+    # 调松风控参数只能经面板后端（ADR-16）：发起与确认入口只在 risk/parameters.py 与 server/api，
+    # AI、策略等没有调松入口（调严不受限）
+    "risk-param-loosen": frozenset({"request_loosen", "confirm_loosen"}),
+    # 风控参数变更记录只能由 ParameterStore 写（R-02a）：动作名、类别与写入方法不得出现在别处，
+    # 防止绕过二次确认直接伪造“已确认调松”的记录（重放另做逐条核验）
+    "risk-param-write": frozenset(
+        {"risk_param_change", "CHANGE_ACTION", "loosen_confirmed", "_append_change"}
+    ),
     # 以及账户类型基线所用的审计动作名（防止其他模块写同名审计伪造基线）
     "mode-write": frozenset({"append_mode_change", "commit_mode_and_audits", "account_observed"}),
 }
@@ -93,6 +103,8 @@ CATEGORY_RULE = {
     "risk-decision": "risk-decision",
     "protective-source": "protective-source",
     "protective-class": "protective-class",
+    "risk-param-loosen": "risk-param-loosen",
+    "risk-param-write": "risk-param-write",
 }
 CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "order": ("oms", "broker"),
@@ -106,6 +118,8 @@ CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "risk-decision": ("domain", "storage", "oms", "risk", "broker", "backtest"),
     "protective-source": ("domain", "oms", "risk"),
     "protective-class": ("domain", "oms", "risk", "guard", "backtest"),
+    "risk-param-loosen": ("risk/parameters.py", "api"),
+    "risk-param-write": ("risk/parameters.py",),
 }
 CATEGORY_HINT = {
     "order": "只能在 server/oms 中使用",
@@ -118,6 +132,8 @@ CATEGORY_HINT = {
     "risk-decision": "只能由 server/risk 产生（domain、storage、oms、broker、backtest 可引用）",
     "protective-source": "只能由 server/oms 随持仓使用（domain 定义、risk 核对）",
     "protective-class": "只能在 domain、oms、risk、guard、backtest 中使用（策略等不得构造止损）",
+    "risk-param-loosen": "只能经 server/api 的面板入口调用（Dylan 二次确认，AI 无入口）",
+    "risk-param-write": "风控参数变更记录只能由 server/risk/parameters.py 写入",
 }
 # broker 包内受保护名函数允许使用的装饰器
 BROKER_DECORATOR_ALLOWLIST = frozenset(

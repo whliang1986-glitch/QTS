@@ -1,0 +1,91 @@
+# 风控参数模板（R-02a / ADR-16）——由 Dylan 审阅、填写后，复制为 config/risk/parameters.toml 并本人提交。
+#
+# - start 列出的是 V4.1 附录 A 的**草案值**，没有按你的资金规模与风险承受能力校准，必须逐项确认或修改。
+# - hard_min / hard_max 是面板可调的硬性上下限，**故意留空**：不填完，文件无法加载，风控拒绝一切新增订单（默认最严）。
+#   面板（API）只能在这个范围内调整；调严立即生效，调松须你本人二次确认。
+# - 比例类参数取值 (0, 1]（例如 0.05 = 5% NAV）；笔数、毫秒、基点、交易日为正整数。
+# - 杠杆（固定 1.0）、做空、衍生品（含期权）、市价单、风控口径是开关，不在这里，也不进面板。
+# - 每个参数必须恰好有 start、hard_min、hard_max 三项；缺参数、多参数、多余键都会加载失败。
+# - 重启后面板上保存的调严值仍然有效（比新 start 更严时）；想强制某个值，收窄 hard_min / hard_max。
+#   修改本文件后，之前确认过的调松全部作废，需要重新确认。
+# - protective_stop_distance 必须小于 1（等于 1 相当于不设止损）；数值最多 12 位小数，不接受 inf / nan。
+
+[parameters.max_order_notional_nav]   # 单笔订单最大名义金额（NAV 比例）
+start = 0.05
+# hard_min =
+# hard_max =
+
+[parameters.max_position_etf_nav]     # ETF 单标的市值上限
+start = 0.25
+# hard_min =
+# hard_max =
+
+[parameters.max_position_stk_nav]     # 个股单标的市值上限
+start = 0.10
+# hard_min =
+# hard_max =
+
+[parameters.max_total_exposure_nav]   # 总敞口上限（不含杠杆）
+start = 1.0
+# hard_min =
+# hard_max =
+
+[parameters.min_cash_buffer_nav]      # 最低现金缓冲（数值越大越严）
+start = 0.02
+# hard_min =
+# hard_max =
+
+[parameters.max_daily_loss_nav]       # 日内亏损上限，触发 HALT
+start = 0.02
+# hard_min =
+# hard_max =
+
+[parameters.max_strategy_drawdown]    # 策略最大回撤
+start = 0.10
+# hard_min =
+# hard_max =
+
+[parameters.max_open_orders]          # 最大未成交订单数（不含保护性止损），笔
+start = 20
+# hard_min =
+# hard_max =
+
+[parameters.max_orders_per_minute]    # 下单频率上限，笔/分钟
+start = 10
+# hard_min =
+# hard_max =
+
+[parameters.max_limit_deviation]      # 限价偏离（相对最新价）
+start = 0.01
+# hard_min =
+# hard_max =
+
+[parameters.max_quote_age_ms]         # 报价最大陈旧时间，毫秒
+start = 5000
+# hard_min =
+# hard_max =
+
+[parameters.max_spread_bps]           # 最大买卖价差，基点
+start = 30
+# hard_min =
+# hard_max =
+
+[parameters.max_clock_skew_ms]        # 时钟偏差上限，毫秒
+start = 1000
+# hard_min =
+# hard_max =
+
+[parameters.protective_stop_distance] # 保护性止损距离（成本价下方的比例）
+start = 0.10
+# hard_min =
+# hard_max =
+
+[parameters.stop_cooldown_trading_days] # 止损后最短冷却期，交易日（数值越大越严；另需“至下一个再平衡日”）
+start = 5
+# hard_min =
+# hard_max =
+
+[parameters.smoke_order_nav]          # 冒烟策略单笔金额（仅模拟盘）
+start = 0.005
+# hard_min =
+# hard_max =
