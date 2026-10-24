@@ -372,6 +372,33 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "t = OrderAmendment.model_validate(d)" + NL,
         "order-ticket",
     ),
+    # ---- R-01：风控决定只能由 risk 产生 ----
+    "strategy 构造风控决定": (
+        "server/strategy/s.py",
+        "d = RiskDecision(decision_id='x', verdict='ALLOW')" + NL,
+        "risk-decision",
+    ),
+    "api 导入风控决定": (
+        "server/api/a.py",
+        "from server.domain.orders import RiskDecision" + NL,
+        "risk-decision",
+    ),
+    "data 属性访问风控决定": (
+        "server/data/d.py",
+        "import server.domain.orders as o" + NL + "d = o.RiskDecision" + NL,
+        "risk-decision",
+    ),
+    "guard 字符串取风控决定": (
+        "server/guard/g.py",
+        "cls = getattr(m, 'RiskDecision')" + NL,
+        "dynamic-name",
+    ),
+    "ipc 分派表里的风控决定": ("server/ipc/i.py", "TYPES = ['RiskDecision']" + NL, "dynamic-name"),
+    "ai 反序列化风控决定": (
+        "server/ai/m.py",
+        "d = RiskDecision.model_validate(payload)" + NL,
+        "risk-decision",
+    ),
     "guard 撤保护性止损": (
         "server/guard/g.py",
         "await b.cancel_order(oid, allow_protective_stop=True)" + NL,
@@ -473,6 +500,8 @@ ALLOWED: dict[str, tuple[str, str]] = {
     "oms 撤单与改单": ("server/oms/o.py", "b.cancel_order(i)\nb.modify_order(i, p)\n"),
     "oms 动态反射": ("server/oms/o.py", "getattr(self, name)\n"),
     "guard 撤单": ("server/guard/g.py", "broker.cancel_order(order_id)\n"),
+    "risk 产生风控决定": ("server/risk/e.py", "d = RiskDecision(decision_id='x')\n"),
+    "storage 反序列化风控决定": ("server/storage/l.py", "RiskDecision.model_validate_json(p)\n"),
     "broker 同名委托": (
         "server/broker/fake/f.py",
         "def place_order(self, o):\n    self._k.place_order(o)\n",

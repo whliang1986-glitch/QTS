@@ -20,6 +20,7 @@
 | ADR-13 | Claude Code + CLAUDE.md + CI + 架构测试；P0 双重审阅 | 待确认 |
 | ADR-14 | 本机套接字 / 命名管道 IPC + outbox + tradingd 侧去重 | 待确认 |
 | ADR-15 | 以 IBKR 返回的账户类型为准；界面只能一键从严，放宽走受保护配置；类型变化进入 SAFE HALT | 已定（修订，见 [ADR-15-account-type.md](ADR-15-account-type.md)） |
+| ADR-16 | 风控参数运行时调整：受保护配置定上下限，面板在范围内调；调严即生效，调松须 Dylan 二次确认；开关不进面板 | 已定（2026-10-24，见 [ADR-16-risk-parameter-runtime-adjustment.md](ADR-16-risk-parameter-runtime-adjustment.md)） |
 
 注：ADR-04、ADR-06、ADR-15 已按 Dylan 2026-10-22 的决定修订，原 V4.1 条文以修订文件为准。
 
