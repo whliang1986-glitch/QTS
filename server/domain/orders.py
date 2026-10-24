@@ -20,6 +20,10 @@ from server.domain.values import (
 # 保护性止损只能由 OMS 随持仓创建（R-04 / R-06）：这类意图的 strategy_id 固定为此值；
 # 进程间通信入口（S-01）必须拒绝策略提交带此 strategy_id 的意图
 PROTECTIVE_STOP_SOURCE = "oms.protective"
+# 紧急平仓（R-05 急停第四级）生成的减仓意图的 strategy_id；
+# 只能由 server/risk 的急停入口在二次确认后使用；HALT 下风控按它放行降风险单，
+# 进程间通信入口（S-01）必须拒绝外部提交带此 strategy_id 的意图
+EMERGENCY_FLATTEN_SOURCE = "risk.emergency_flatten"
 
 
 class OrderIntent(ValueModel):

@@ -524,6 +524,42 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "dynamic-name",
     ),
     "api 直接写模式": ("server/api/r.py", "repo.commit_mode_and_audits(a)\n", "mode-write"),
+    # ---- R-05：急停入口 ----
+    "api 直接撤保护性止损": (
+        "server/api/r.py",
+        "await oms.request_cancel_protective(i)" + NL,
+        "protective-cancel-entry",
+    ),
+    "risk 其他模块撤保护性止损": (
+        "server/risk/engine.py",
+        "await oms.request_cancel_protective(i)" + NL,
+        "protective-cancel-entry",
+    ),
+    "ai 发起紧急平仓": (
+        "server/ai/a.py",
+        "await c.emergency_flatten(p, actor=a, confirmation=x)" + NL,
+        "emergency-confirm",
+    ),
+    "strategy 撤止损确认": (
+        "server/strategy/s.py",
+        "await c.cancel_protective_stops(actor=a, confirmation=PROTECTIVE_CANCEL_PHRASE)" + NL,
+        "emergency-confirm",
+    ),
+    "strategy 冒用紧急平仓来源": (
+        "server/strategy/s.py",
+        "from server.domain.orders import EMERGENCY_FLATTEN_SOURCE" + NL,
+        "emergency-source",
+    ),
+    "api 写紧急平仓来源字面量": (
+        "server/api/r.py",
+        "sid = 'risk.emergency_flatten'" + NL,
+        "dynamic-name",
+    ),
+    "oms 冒用紧急平仓来源": (
+        "server/oms/o.py",
+        "sid = EMERGENCY_FLATTEN_SOURCE" + NL,
+        "emergency-source",
+    ),
     # ---- 失败即关闭 ----
     "语法错误": ("server/strategy/s.py", "def broken(:\n", "parse-error"),
 }
@@ -546,6 +582,14 @@ ALLOWED: dict[str, tuple[str, str]] = {
     "guard 识别保护性止损": ("server/guard/g.py", "skip = c is OrderClass.PROTECTIVE_STOP\n"),
     "oms 使用止损来源": ("server/oms/p.py", "sid = PROTECTIVE_STOP_SOURCE\n"),
     "api 面板确认调松": ("server/api/panel.py", "store.confirm_loosen(rid)\n"),
+    "api 急停确认入口": (
+        "server/api/panel.py",
+        "await c.emergency_flatten(p, actor=a, confirmation=x)" + NL,
+    ),
+    "急停模块撤保护性止损": (
+        "server/risk/emergency.py",
+        "await self._oms.request_cancel_protective(i)" + NL,
+    ),
     "storage 反序列化风控决定": ("server/storage/l.py", "RiskDecision.model_validate_json(p)\n"),
     "broker 同名委托": (
         "server/broker/fake/f.py",

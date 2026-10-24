@@ -556,6 +556,31 @@ class OrderManager:
             self._discrepancy(intent_id, "cancel_raised", error=type(exc).__name__)
         return status
 
+    async def request_cancel_protective(self, intent_id: str) -> OrderStatus:
+        """撤保护性止损（R-05 二次确认路径，只由 server/risk 的急停入口在确认后调用）。
+
+        只接受保护性止损；状态未确认（提交中 / UNKNOWN）时拒绝，不挂起（先查证再决定）；
+        终态与撤单中不重复发。这是全系统唯一把 allow_protective_stop 设为 True 的地方。
+        """
+        intent = self._repo.get_intent(intent_id)
+        if intent is None or intent.order_class is not OrderClass.PROTECTIVE_STOP:
+            raise CancelRefusedError("这个入口只撤保护性止损")
+        status = self.status(intent_id)
+        if status in {S.SUBMITTING, S.UNKNOWN}:
+            raise CancelRefusedError("保护性止损状态未确认，先查证再撤")
+        if status not in ACTIVE:
+            return status
+        status = self._apply(intent_id, E.CANCEL_REQUESTED)
+        broker_order_id = self._issued(intent_id).broker_order.broker_order_id
+        try:
+            await self._broker.cancel_order(broker_order_id, allow_protective_stop=True)
+        except UnknownOrderError:
+            self._discrepancy(intent_id, "cancel_unknown_order")
+        except Exception as exc:  # 撤单请求未确认：保持 CANCEL_PENDING，等回报或对账
+            self._discrepancy(intent_id, "cancel_raised", error=type(exc).__name__)
+        log_event(log, logging.WARNING, "保护性止损撤单已发出", intent_id=intent_id)
+        return status
+
     # ---------- 改单 ----------
 
     async def request_amend(

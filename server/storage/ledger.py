@@ -711,6 +711,13 @@ class LedgerRepository:
         with self._reading("audit_events") as conn:
             return [AuditEvent.model_validate_json(p) for (p,) in conn.execute(stmt)]
 
+    def audits_among(self, actions: Sequence[str]) -> list[AuditEvent]:
+        """几类审计事件合在一起，按写入顺序从新到旧（不依赖时间戳先后）。"""
+        t = schema.audit_events
+        stmt = select(t.c.payload).where(t.c.action.in_(actions)).order_by(t.c.seq.desc())
+        with self._reading("audit_events") as conn:
+            return [AuditEvent.model_validate_json(p) for (p,) in conn.execute(stmt)]
+
     # ---------- 模式与急停 ----------
 
     def commit_mode_and_audits(
