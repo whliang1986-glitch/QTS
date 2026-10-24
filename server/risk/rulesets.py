@@ -15,12 +15,16 @@ from collections.abc import Callable
 
 from server.risk.default_deny import DefaultDenyRule, ProtectiveStopParams
 from server.risk.engine import RuleSet
+from server.risk.limits import limit_rules
 from server.risk.parameters import ParameterStore, RiskParameters
 
 
 def build_rule_set(params: RiskParameters) -> RuleSet:
     protective = ProtectiveStopParams(stop_distance=params["protective_stop_distance"])
-    return RuleSet(version=f"params:{params.version}", rules=(DefaultDenyRule(protective),))
+    return RuleSet(
+        version=f"params:{params.version}",
+        rules=(DefaultDenyRule(protective), *limit_rules(params)),
+    )
 
 
 def rule_source(store: ParameterStore | None) -> Callable[[], RuleSet | None]:
