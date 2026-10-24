@@ -31,7 +31,13 @@ from server.domain.account import CashBalance, Position
 from server.domain.enums import OrderClass, RiskVerdict, Side
 from server.domain.instrument import Instrument
 from server.domain.order_state import OrderStatus
-from server.domain.orders import OrderIntent, RiskDecision, RuleHit
+from server.domain.orders import (
+    EMERGENCY_FLATTEN_SOURCE,
+    PROTECTIVE_STOP_SOURCE,
+    OrderIntent,
+    RiskDecision,
+    RuleHit,
+)
 from server.domain.values import (
     Identifier,
     Money,
@@ -169,6 +175,19 @@ class Outcome:
     status: OrderStatus | None  # 只有 ALLOW / REDUCE 且交给了 OMS 才有
 
 
+def _reduces_risk(subject: Subject) -> bool:
+    """HALT 下可以放行的订单：OMS 随持仓创建的保护性止损、急停入口生成的紧急平仓（都不是改单）。"""
+    intent = subject.intent
+    if subject.amendment_id is not None:
+        return False
+    return (
+        intent.order_class is OrderClass.PROTECTIVE_STOP
+        and intent.strategy_id == PROTECTIVE_STOP_SOURCE
+    ) or (
+        intent.order_class is OrderClass.REDUCE and intent.strategy_id == EMERGENCY_FLATTEN_SOURCE
+    )
+
+
 class RiskEngine:
     def __init__(  # noqa: PLR0913 - 依赖全部显式注入
         self,
@@ -260,7 +279,9 @@ class RiskEngine:
         try:
             self._modes.require_trading_allowed()
         except TradingHaltedError as exc:
-            return self._engine_reject(subject, "mode_gate", str(exc))
+            # HALT 下只放行降低风险的订单（保护性止损、紧急平仓），规则照查；其余一律拒绝（R-05）
+            if not (_reduces_risk(subject) and self._modes.risk_reducing_allowed()):
+                return self._engine_reject(subject, "mode_gate", str(exc))
         except Exception as exc:  # 模式状态读不出来：同样不放行
             return self._engine_reject(
                 subject, "mode_gate", f"模式状态不可用：{type(exc).__name__}"

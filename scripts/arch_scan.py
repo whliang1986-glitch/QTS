@@ -15,6 +15,11 @@
   domain、oms、risk（类别名另允许 guard、backtest），策略、AI、API 不得构造保护性止损（R-04）。
 - risk-param-write：风控参数变更记录的动作名、类别与写入方法只能在 risk/parameters.py（R-02a）。
 - risk-param-loosen：调松风控参数的发起与确认入口只能在 risk/parameters.py 与 server/api（ADR-16）。
+- protective-cancel-entry：OMS 的保护性止损撤单入口只能在 oms 与 risk/emergency.py 使用（R-05）。
+- emergency-confirm：急停的二次确认入口（撤止损、紧急平仓）与确认短语只能在 risk/emergency.py
+  与 server/api 中出现（R-05，身份核验在 API 鉴权时接上）。
+- emergency-source：紧急平仓的来源标识（含字面量）只能出现在 domain 与 risk（R-05：HALT 下
+  风控按它放行降风险单，策略、AI、API 不得冒用）。
 - risk-decision：RiskDecision 只能在 domain、storage、oms、risk、broker、backtest 中出现（R-01）；
   策略、AI、API、数据等包不得构造或引用风控决定。拿到实例后用 type(d) 构造的手法静态扫描拦不住，
   由于这些包本就不能调用 oms 提交入口，危害有限；运行时由 OMS 的摘要核对兜底。
@@ -81,6 +86,12 @@ CATEGORIES: dict[str, frozenset[str]] = {
     "risk-param-write": frozenset(
         {"risk_param_change", "CHANGE_ACTION", "loosen_confirmed", "_append_change"}
     ),
+    # 急停（R-05）：撤保护性止损的 OMS 入口、二次确认入口与确认短语、紧急平仓来源标识
+    "protective-cancel-entry": frozenset({"request_cancel_protective"}),
+    "emergency-confirm": frozenset(
+        {"cancel_protective_stops", "emergency_flatten", "PROTECTIVE_CANCEL_PHRASE"}
+    ),
+    "emergency-source": frozenset({"EMERGENCY_FLATTEN_SOURCE", "risk.emergency_flatten"}),
     # 以及账户类型基线所用的审计动作名（防止其他模块写同名审计伪造基线）
     "mode-write": frozenset({"append_mode_change", "commit_mode_and_audits", "account_observed"}),
 }
@@ -105,6 +116,9 @@ CATEGORY_RULE = {
     "protective-class": "protective-class",
     "risk-param-loosen": "risk-param-loosen",
     "risk-param-write": "risk-param-write",
+    "protective-cancel-entry": "protective-cancel-entry",
+    "emergency-confirm": "emergency-confirm",
+    "emergency-source": "emergency-source",
 }
 CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "order": ("oms", "broker"),
@@ -120,6 +134,9 @@ CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "protective-class": ("domain", "oms", "risk", "guard", "backtest"),
     "risk-param-loosen": ("risk/parameters.py", "api"),
     "risk-param-write": ("risk/parameters.py",),
+    "protective-cancel-entry": ("oms", "risk/emergency.py"),
+    "emergency-confirm": ("risk/emergency.py", "api"),
+    "emergency-source": ("domain", "risk"),
 }
 CATEGORY_HINT = {
     "order": "只能在 server/oms 中使用",
@@ -134,6 +151,9 @@ CATEGORY_HINT = {
     "protective-class": "只能在 domain、oms、risk、guard、backtest 中使用（策略等不得构造止损）",
     "risk-param-loosen": "只能经 server/api 的面板入口调用（Dylan 二次确认，AI 无入口）",
     "risk-param-write": "风控参数变更记录只能由 server/risk/parameters.py 写入",
+    "protective-cancel-entry": "只能由 server/risk/emergency.py 在二次确认后调用",
+    "emergency-confirm": "只能经 server/api 的急停入口调用（人工二次确认，AI 无入口）",
+    "emergency-source": "只能由 server/risk 的急停入口使用（domain 定义）",
 }
 # broker 包内受保护名函数允许使用的装饰器
 BROKER_DECORATOR_ALLOWLIST = frozenset(

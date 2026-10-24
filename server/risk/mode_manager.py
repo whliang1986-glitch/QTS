@@ -131,6 +131,42 @@ class ModeManager:
         if state.mode not in TRADING_MODES:
             raise TradingHaltedError(f"{state.mode.value} 模式不允许新增风险")
 
+    def risk_reducing_allowed(self) -> bool:
+        """HALT 下是否还能放行降低风险的订单（R-05：保护性止损、紧急平仓）。
+
+        只有本实例完成过启动校验、没有闩锁、并且处于 HALT 或交易模式时才允许；
+        “HALT 写入失败”闩锁、未完成启动校验、非交易模式一律不允许（失败即关闭）。
+        """
+        try:
+            if self._refused is not None or self._verified is None:
+                return False
+            state = self.current()
+            if state is None:
+                return False
+            if not state.halt.halted:
+                return state.mode in TRADING_MODES
+            return not self._in_safe_halt()
+        except Exception:  # 账本读不出来：不放行
+            return False
+
+    def _in_safe_halt(self) -> bool:
+        """上次恢复之后是否进入过 SAFE HALT（状态不可信，连降风险单也不放行）。
+
+        从账本按写入顺序判断，重启后仍有效；只有人工恢复（resumed）才清除。
+        普通 HALT 显式记 safe=false；没有这个标记的 HALT（如 R-05 之前写入的）
+        一律按 SAFE HALT 处理。
+        """
+        for event in self._repo.audits_among(("halt", "resumed")):
+            if event.action == "resumed":
+                return False
+            if dict(event.detail).get("safe") != "false":
+                return True
+        return False
+
+    def verified_account(self) -> Account | None:
+        """本实例启动校验时券商报告的账户；未完成校验为 None。"""
+        return None if self._verified is None else self._verified[1]
+
     # ---------- 启动 ----------
 
     def start(self, config: ModeConfig, account: Account) -> ModeChange:
@@ -159,14 +195,14 @@ class ModeManager:
         refusal = self._refusal_reason(config, account)
         if refusal is not None:
             exc_type, reason = refusal
-            self._commit_halt(f"启动被拒：{reason}", SYSTEM_ACTOR, [observed])
+            self._commit_halt(f"启动被拒：{reason}", SYSTEM_ACTOR, [observed], safe=True)
             raise exc_type(reason)
 
         # 本次观察尚未写入，比较的是以前的记录
         safe_halt = self._safe_halt_reason(config, account)
         self._verified = (config, account)
         if safe_halt is not None:
-            return self._commit_halt(safe_halt, SYSTEM_ACTOR, [observed])
+            return self._commit_halt(safe_halt, SYSTEM_ACTOR, [observed], safe=True)
 
         latest = self.current()
         if latest is not None and (latest.mode is Mode.HALT or latest.halt.halted):
@@ -242,7 +278,7 @@ class ModeManager:
         reason = "重连后账户 ID 或类型与启动时不同；需重启并重新完成启动校验"
         # 闩锁：同一进程里不能恢复到换掉的账户上，必须重启走完整的 start 校验
         self._refused = reason
-        return self._commit_halt(reason, SYSTEM_ACTOR, [observed])
+        return self._commit_halt(reason, SYSTEM_ACTOR, [observed], safe=True)
 
     # ---------- 急停与恢复 ----------
 
@@ -254,6 +290,21 @@ class ModeManager:
             return self._commit_halt(text, who, [])
         except Exception:
             self._refused = f"HALT 写入失败：{text}"
+            raise
+
+    def safe_halt(self, reason: str, *, actor: str) -> ModeChange:
+        """SAFE HALT：账户、订单、风险或关键数据状态不可信（V4.1 7.4）。
+
+        与 halt 相同地持久化并保证尝试落盘；另外关闭 HALT 下的降风险通道（保护性止损、紧急平仓），
+        直到人工恢复。OMS 的 on_unresolved、对账发现的负持仓与外来订单、
+        数据门禁的状态不可信都必须走这里。
+        """
+        text = reason.strip() or "未说明原因"
+        who = _normalize_actor(actor)
+        try:
+            return self._commit_halt(text, who, [], safe=True)
+        except Exception:
+            self._refused = f"SAFE HALT 写入失败：{text}"
             raise
 
     def resume(self, target: Mode, *, actor: str, checks: ResumeChecks) -> ModeChange:
@@ -312,9 +363,12 @@ class ModeManager:
             detail=detail,
         )
 
-    def _commit_halt(self, reason: str, actor: str, extra: list[AuditEvent]) -> ModeChange:
+    def _commit_halt(
+        self, reason: str, actor: str, extra: list[AuditEvent], *, safe: bool = False
+    ) -> ModeChange:
         halt = HaltState(halted=True, reason=reason, since=self._clock(), set_by=actor)
-        return self._commit(Mode.HALT, halt, actor, extra, ("halt", (("reason", reason),)))
+        detail: Detail = (("reason", reason), ("safe", "true" if safe else "false"))
+        return self._commit(Mode.HALT, halt, actor, extra, ("halt", detail))
 
     def _commit(
         self,
