@@ -37,7 +37,7 @@ from server.risk.mode_manager import ModeConfig, ModeManager, ResumeChecks
 from server.risk.parameters import RiskParameters
 from server.risk.rulesets import build_rule_set
 from tests.integration.risk.test_limit_rules_engine import PARAMS
-from tests.support.oms import ACCOUNT, SPY, Env
+from tests.support.oms import ACCOUNT, SPY, Env, market
 
 V = RiskVerdict
 S = OrderStatus
@@ -75,7 +75,7 @@ class Context:
                 as_of=self.env.clock(),
             ),
             instruments=self.instruments,
-            last_prices={"SPY": self.last},
+            **market(self.env.clock(), {"SPY": self.last}),
             nav=Decimal(200000),
             start_of_day_nav=Decimal(200000),
             strategy_drawdown={"s": Decimal(0)},

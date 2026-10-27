@@ -30,6 +30,7 @@ from typing import ClassVar, Protocol
 from server.domain.account import CashBalance, Position
 from server.domain.enums import OrderClass, RiskVerdict, Side
 from server.domain.instrument import Instrument
+from server.domain.market import Quote
 from server.domain.order_state import OrderStatus
 from server.domain.orders import (
     EMERGENCY_FLATTEN_SOURCE,
@@ -117,7 +118,11 @@ class RiskContext(ValueModel):
     - nav / start_of_day_nav：账户净值与当日开盘净值（美元，R-02b 限额与日内亏损）；
     - strategy_drawdown：各策略当前回撤（比例）；
     - recent_submissions：近期本系统签发时间（下单频率）；
-    - stop_cooldown：发生过保护性止损成交的标的 → 冷却信息（止损后冷却期）。
+    - stop_cooldown：发生过保护性止损成交的标的 → 冷却信息（止损后冷却期）；
+    - quotes：各标的的最新报价（R-03 数据门禁核对新鲜度、价差、质量标记；last_prices 取自它）；
+    - clock_skew_ms：本机时钟 − 券商时钟（毫秒，带符号）；
+    - account_synced：持仓、现金、订单自上次连接以来已与券商同步（None 表示未知）；
+    - delayed_data_allowed：受保护配置是否允许延迟行情（ADR-06，只限 PAPER）。
     """
 
     now: UtcDatetime
@@ -131,6 +136,10 @@ class RiskContext(ValueModel):
     strategy_drawdown: Mapping[str, Decimal] | None = None
     recent_submissions: tuple[UtcDatetime, ...] | None = None
     stop_cooldown: Mapping[str, StopCooldown] | None = None
+    quotes: Mapping[str, Quote] | None = None
+    clock_skew_ms: int | None = None
+    account_synced: bool | None = None
+    delayed_data_allowed: bool = False
 
     def position(self, symbol: str) -> Decimal | None:
         if self.positions is None:
