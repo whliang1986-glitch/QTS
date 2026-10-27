@@ -20,7 +20,7 @@ from server.risk.engine import RiskContext, RiskEngine, Subject
 from server.risk.mode_manager import ModeConfig, ModeManager
 from server.risk.parameters import SPECS, Kind, RiskParameters
 from server.risk.rulesets import build_rule_set
-from tests.support.oms import ACCOUNT, SPY, Env
+from tests.support.oms import ACCOUNT, SPY, Env, market
 
 V = RiskVerdict
 FIXTURE = {"max_order_notional_nav": "0.05", "max_position_etf_nav": "0.04",
@@ -55,7 +55,7 @@ class Context:
                 as_of=self.env.clock(),
             ),
             "instruments": {"SPY": SPY},
-            "last_prices": {"SPY": Decimal(100)},
+            **market(self.env.clock(), {"SPY": Decimal(100)}),
             "nav": Decimal(100000),
             "start_of_day_nav": Decimal(100000),
             "strategy_drawdown": {"s": Decimal(0)},

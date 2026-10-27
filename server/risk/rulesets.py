@@ -6,13 +6,14 @@
 审计时能知道按哪一版参数放行。
 
 R-02b 在这里加入阈值规则（单笔、单标的、总敞口、现金缓冲、日内亏损、未成交订单数、
-频率、限价偏离、冷却期）。
+频率、限价偏离、冷却期）；R-03 加入数据门禁（账户同步、时钟偏差、报价新鲜度与价差）。
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 
+from server.risk.data_gate import DataGateRule
 from server.risk.default_deny import DefaultDenyRule, ProtectiveStopParams
 from server.risk.engine import RuleSet
 from server.risk.limits import limit_rules
@@ -23,7 +24,7 @@ def build_rule_set(params: RiskParameters) -> RuleSet:
     protective = ProtectiveStopParams(stop_distance=params["protective_stop_distance"])
     return RuleSet(
         version=f"params:{params.version}",
-        rules=(DefaultDenyRule(protective), *limit_rules(params)),
+        rules=(DefaultDenyRule(protective), DataGateRule(params), *limit_rules(params)),
     )
 
 

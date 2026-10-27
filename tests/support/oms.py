@@ -27,6 +27,7 @@ from server.domain.enums import (
     TimeInForce,
 )
 from server.domain.instrument import Instrument
+from server.domain.market import Quote
 from server.domain.order_state import OrderStatus
 from server.domain.orders import OrderIntent, RiskDecision
 from server.oms.binding import amendment_digest, intent_digest
@@ -44,6 +45,29 @@ SPY = Instrument(
     tick_size=Decimal("0.01"),
     trading_calendar="XNYS",
 )
+
+
+def market(now: datetime, prices: dict[str, Decimal]) -> dict[str, Any]:
+    """数据门禁（R-03）放行所需的上下文字段：实时新鲜报价、时钟无偏差、账户已同步。"""
+    tick = Decimal("0.01")
+    quotes = {
+        symbol: Quote(
+            symbol=symbol,
+            ts=now,
+            bid=price - tick,
+            ask=price + tick,
+            last=price,
+            source="test",
+            delayed=False,
+        )
+        for symbol, price in prices.items()
+    }
+    return {
+        "quotes": quotes,
+        "last_prices": dict(prices),
+        "clock_skew_ms": 0,
+        "account_synced": True,
+    }
 
 
 class Clock:
