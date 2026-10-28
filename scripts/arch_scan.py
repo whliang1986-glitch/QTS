@@ -20,6 +20,9 @@
   与 server/api 中出现（R-05，身份核验在 API 鉴权时接上）。
 - emergency-source：紧急平仓的来源标识（含字面量）只能出现在 domain 与 risk（R-05：HALT 下
   风控按它放行降风险单，策略、AI、API 不得冒用）。
+- recon-write：持仓调整的写入方法与对账报告的审计动作名只能在 storage 与 risk/reconcile.py（R-07：
+  防止伪造“对账通过”或改写预期持仓）。
+- recon-adopt：人工采用券商持仓为基准的入口与确认短语只能在 risk/reconcile.py 与 server/api。
 - risk-decision：RiskDecision 只能在 domain、storage、oms、risk、broker、backtest 中出现（R-01）；
   策略、AI、API、数据等包不得构造或引用风控决定。拿到实例后用 type(d) 构造的手法静态扫描拦不住，
   由于这些包本就不能调用 oms 提交入口，危害有限；运行时由 OMS 的摘要核对兜底。
@@ -92,6 +95,17 @@ CATEGORIES: dict[str, frozenset[str]] = {
         {"cancel_protective_stops", "emergency_flatten", "PROTECTIVE_CANCEL_PHRASE"}
     ),
     "emergency-source": frozenset({"EMERGENCY_FLATTEN_SOURCE", "risk.emergency_flatten"}),
+    # 对账（R-07）：持仓调整写入与对账审计动作名、人工采用基准的入口与确认短语
+    "recon-write": frozenset(
+        {
+            "add_position_adjustment",
+            "RECON_ACTION",
+            "ADOPT_ACTION",
+            "reconciliation",
+            "reconciliation_baseline",
+        }
+    ),
+    "recon-adopt": frozenset({"adopt_broker_positions", "ADOPT_PHRASE"}),
     # 以及账户类型基线所用的审计动作名（防止其他模块写同名审计伪造基线）
     "mode-write": frozenset({"append_mode_change", "commit_mode_and_audits", "account_observed"}),
 }
@@ -119,6 +133,8 @@ CATEGORY_RULE = {
     "protective-cancel-entry": "protective-cancel-entry",
     "emergency-confirm": "emergency-confirm",
     "emergency-source": "emergency-source",
+    "recon-write": "recon-write",
+    "recon-adopt": "recon-adopt",
 }
 CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "order": ("oms", "broker"),
@@ -137,6 +153,8 @@ CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "protective-cancel-entry": ("oms", "risk/emergency.py"),
     "emergency-confirm": ("risk/emergency.py", "api"),
     "emergency-source": ("domain", "risk"),
+    "recon-write": ("storage", "risk/reconcile.py"),
+    "recon-adopt": ("risk/reconcile.py", "api"),
 }
 CATEGORY_HINT = {
     "order": "只能在 server/oms 中使用",
@@ -154,6 +172,8 @@ CATEGORY_HINT = {
     "protective-cancel-entry": "只能由 server/risk/emergency.py 在二次确认后调用",
     "emergency-confirm": "只能经 server/api 的急停入口调用（人工二次确认，AI 无入口）",
     "emergency-source": "只能由 server/risk 的急停入口使用（domain 定义）",
+    "recon-write": "持仓调整与对账报告只能由 server/risk/reconcile.py 写入",
+    "recon-adopt": "只能经 server/api 的人工入口调用（Dylan 确认，AI 无入口）",
 }
 # broker 包内受保护名函数允许使用的装饰器
 BROKER_DECORATOR_ALLOWLIST = frozenset(

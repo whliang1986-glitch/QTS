@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Column, ForeignKey, Integer, MetaData, Table, Text
+from sqlalchemy import Column, ForeignKey, Integer, MetaData, Table, Text, UniqueConstraint
 
 metadata = MetaData()
 
@@ -193,6 +193,23 @@ order_amendment_results = Table(
     Column("recorded_at", Text, nullable=False),
 )
 
+# R-07（迁移 0006）：不来自本系统成交的持仓变化（人工基准、公司行动、外来成交确认）
+position_adjustments = Table(
+    "position_adjustments",
+    metadata,
+    Column("seq", Integer, primary_key=True, autoincrement=True),
+    Column("adjustment_id", Text, nullable=False, unique=True),
+    Column("account_id", Text, nullable=False),
+    Column("symbol", Text, nullable=False),
+    Column("quantity_delta", Text, nullable=False),
+    Column("kind", Text, nullable=False),
+    Column("reference", Text, nullable=False),
+    Column("actor", Text, nullable=False),
+    Column("recorded_at", Text, nullable=False),
+    Column("payload", Text, nullable=False),
+    UniqueConstraint("kind", "reference", name="position_adjustments_once"),
+)
+
 LEDGER_TABLES = frozenset(metadata.tables)
 # 每张账本表必须存在的触发器；打开账本时缺一个即拒绝（防止迁移重建表时触发器丢失）
 LEDGER_TRIGGERS = frozenset(
@@ -205,4 +222,6 @@ LEDGER_TRIGGERS = frozenset(
     | {"execution_supersessions_no_cross_intent"}
     # 迁移 0005：改单决定必须新且属于同一意图；改单结果的取值与先后关系
     | {"order_amendments_no_cross_intent", "order_amendment_results_no_bad_result"}
+    # 迁移 0006：持仓调整的类别取值；确认外来成交不得改数量
+    | {"position_adjustments_no_bad_kind"}
 )

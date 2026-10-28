@@ -18,7 +18,13 @@ from server.domain.order_state import EventKind, OrderEvent, OrderStatus
 from server.domain.orders import BrokerOrder, Execution, OrderIntent, RiskDecision, RuleHit
 from server.storage import schema
 from server.storage.errors import ConflictError, StorageError
-from server.storage.ledger import LEDGER_TABLES, LedgerRepository, apply_pragmas, open_ledger
+from server.storage.ledger import (
+    LEDGER_TABLES,
+    LedgerRepository,
+    PositionAdjustment,
+    apply_pragmas,
+    open_ledger,
+)
 from server.storage.migrate import current_revision, downgrade, head_revision, upgrade
 from sqlalchemy import create_engine
 
@@ -131,6 +137,12 @@ def full_repo(repo: LedgerRepository) -> LedgerRepository:
     repo.append_audit(make_audit())
     halt = HaltState(halted=True, reason="急停", since=T0, set_by="dylan")
     repo.append_mode_change("mc-1", Mode.HALT, halt, T0, "dylan")
+    repo.add_position_adjustment(
+        PositionAdjustment(
+            adjustment_id="adj-1", account_id="DU0000001", symbol="SPY", quantity_delta=Decimal(5),
+            kind="BASELINE", reference="b-1:SPY", actor="dylan", recorded_at=T0,
+        )
+    )  # fmt: skip
     return repo
 
 
@@ -295,6 +307,9 @@ REPLACE_CASES: dict[str, tuple[str, str]] = {
                                 "VALUES (1,'am-1','REJECTED','x')"),
     "execution_supersessions": ("recorded_at = 'x'", "(superseded_execution_id, "
                                 "superseding_execution_id, recorded_at) VALUES ('exec-1','exec-2','x')"),
+    "position_adjustments": ("quantity_delta = '9'", "(seq, adjustment_id, account_id, symbol, "
+                             "quantity_delta, kind, reference, actor, recorded_at, payload) "
+                             "VALUES (1,'adj-x','x','x','1','BASELINE','r-x','x','x','{}')"),
 }  # fmt: skip
 
 
@@ -708,3 +723,43 @@ def test_amendment_decision_must_be_fresh_and_of_same_intent(repo: LedgerReposit
                 new_price=Decimal(1), new_quantity=Decimal(1), at=T0,
             )  # fmt: skip
     assert repo.amendments_for("int-1") == []
+
+
+# ---------- 持仓调整（R-07，迁移 0006） ----------
+
+
+def _adjustment(**kw: object) -> PositionAdjustment:
+    data: dict[str, object] = {
+        "adjustment_id": "adj-1", "account_id": "DU0000001", "symbol": "SPY",
+        "quantity_delta": Decimal(5), "kind": "BASELINE", "reference": "b-1:SPY",
+        "actor": "dylan", "recorded_at": T0,
+    }  # fmt: skip
+    data.update(kw)
+    return PositionAdjustment(**data)  # type: ignore[arg-type]
+
+
+def test_position_adjustments_are_idempotent_and_unique(repo: LedgerRepository) -> None:
+    assert repo.add_position_adjustment(_adjustment()) is True
+    assert repo.add_position_adjustment(_adjustment()) is False  # 同内容重放
+    with pytest.raises(ConflictError):
+        repo.add_position_adjustment(_adjustment(quantity_delta=Decimal(6)))
+    with pytest.raises(ConflictError):  # 同一 (kind, reference) 只能一次
+        repo.add_position_adjustment(_adjustment(adjustment_id="adj-2"))
+    other = _adjustment(adjustment_id="adj-3", reference="b-1:QQQ", symbol="QQQ")
+    assert repo.add_position_adjustment(other) is True
+    assert [a.adjustment_id for a in repo.position_adjustments("DU0000001")] == ["adj-1", "adj-3"]
+    assert repo.position_adjustments("DU0000002") == []
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"kind": "WHATEVER"}, {"kind": "ACKNOWLEDGE", "quantity_delta": Decimal(1)}],
+)
+def test_position_adjustment_kind_is_enforced(
+    repo: LedgerRepository, bad: dict[str, object]
+) -> None:
+    with pytest.raises(StorageError):
+        repo.add_position_adjustment(_adjustment(**bad))
+    zero = _adjustment(adjustment_id="ack-1", kind="ACKNOWLEDGE", reference="exec-9",
+                       quantity_delta=Decimal(0))  # fmt: skip
+    assert repo.add_position_adjustment(zero) is True

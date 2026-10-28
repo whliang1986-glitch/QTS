@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -108,6 +109,20 @@ class Amendment:
     new_quantity: Decimal
     requested_at: str
     result: str | None
+
+
+@dataclass(frozen=True)
+class PositionAdjustment:
+    """一条持仓调整（R-07）：不来自本系统成交的持仓变化。kind 见迁移 0006。"""
+
+    adjustment_id: str
+    account_id: str
+    symbol: str
+    quantity_delta: Decimal
+    kind: str
+    reference: str
+    actor: str
+    recorded_at: datetime
 
 
 @dataclass(frozen=True)
@@ -484,6 +499,61 @@ class LedgerRepository:
         stmt = select(t.c.intent_id).order_by(t.c.issued_at, t.c.intent_id)
         with self._reading("ticket_issuance") as conn:
             return [str(i) for (i,) in conn.execute(stmt)]
+
+    def add_position_adjustment(self, adjustment: PositionAdjustment) -> bool:
+        """持仓调整（R-07）：只追加；同一 (kind, reference) 只能一次，内容不同抛 ConflictError。"""
+        payload = json.dumps(
+            {
+                "adjustment_id": adjustment.adjustment_id,
+                "account_id": adjustment.account_id,
+                "symbol": adjustment.symbol,
+                "quantity_delta": str(adjustment.quantity_delta),
+                "kind": adjustment.kind,
+                "reference": adjustment.reference,
+                "actor": adjustment.actor,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return self._insert_once(
+            schema.position_adjustments,
+            {
+                "adjustment_id": adjustment.adjustment_id,
+                "account_id": adjustment.account_id,
+                "symbol": adjustment.symbol,
+                "quantity_delta": str(adjustment.quantity_delta),
+                "kind": adjustment.kind,
+                "reference": adjustment.reference,
+                "actor": adjustment.actor,
+                "recorded_at": _iso(adjustment.recorded_at),
+                "payload": payload,
+            },
+            [
+                {"adjustment_id": adjustment.adjustment_id},
+                {"kind": adjustment.kind, "reference": adjustment.reference},
+            ],
+            lambda r: r.payload == payload,
+        )
+
+    def position_adjustments(self, account_id: str) -> list[PositionAdjustment]:
+        """某账户的全部持仓调整，按写入顺序。"""
+        t = schema.position_adjustments
+        stmt = select(t).where(t.c.account_id == account_id).order_by(t.c.seq)
+        with self._reading("position_adjustments") as conn:
+            rows = list(conn.execute(stmt))
+        return [
+            PositionAdjustment(
+                adjustment_id=row.adjustment_id,
+                account_id=row.account_id,
+                symbol=row.symbol,
+                quantity_delta=Decimal(row.quantity_delta),
+                kind=row.kind,
+                reference=row.reference,
+                actor=row.actor,
+                recorded_at=datetime.fromisoformat(row.recorded_at),
+            )
+            for row in rows
+        ]
 
     def max_numeric_broker_order_id(self) -> int:
         """账本里最大的数字订单号（没有则 0）；下一个订单号取 max(券商, 账本 + 1)。"""
