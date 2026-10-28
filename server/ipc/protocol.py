@@ -2,7 +2,8 @@
 
 帧格式：4 字节大端长度 + UTF-8 JSON；单帧上限 MAX_FRAME，
 超限、截断、不是 JSON 对象一律断开（失败即关闭）。
-一问一答：请求 {"type": "intent" | "command", ...}，回答 {"ok": bool, "result" | "error": ...}。
+一问一答：请求 {"id": n, "type": "intent" | "command", ...}，回答 {"id": n, "ok": bool,
+"result" | "error": ...}。客户端核对 id，对不上即按协议错误断开，迟到的回答不会被下一个请求读走。
 
 权限按对端身份（由传输层在连接时核验，见 transport）区分，不信任消息里的自报身份：
 - workerd：只能提交意图（策略只能提交意图，ADR-14）；
@@ -108,7 +109,8 @@ async def read_frame(reader: asyncio.StreamReader) -> dict[str, Any] | None:
         raise ProtocolError("帧体被截断") from exc
     try:
         message = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        # JSONDecodeError、超长整数（int 转换上限）都是 ValueError；深层嵌套是 RecursionError
         raise ProtocolError("帧不是合法的 UTF-8 JSON") from exc
     if not isinstance(message, dict):
         raise ProtocolError("消息必须是 JSON 对象")
@@ -137,7 +139,13 @@ class IpcServer:
                 message = await read_frame(reader)
                 if message is None:
                     return
-                await write_frame(writer, await self.dispatch(message, peer))
+                answer = {**await self.dispatch(message, peer), "id": message.get("id")}
+                try:
+                    await write_frame(writer, answer)
+                except ProtocolError:  # 结果过大：明确告诉对方，而不是一声不响地断开
+                    too_large = {"id": message.get("id"), "ok": False,
+                                 "error": "回答超过帧上限", "refused": False}  # fmt: skip
+                    await write_frame(writer, too_large)
         except ProtocolError as exc:
             log_event(log, logging.WARNING, "进程间消息格式不合法，断开",
                       role=peer.role.value, reason=str(exc))  # fmt: skip
@@ -155,8 +163,6 @@ class IpcServer:
                 return await self._intent(message)
             if kind == "command" and peer.role is Role.APID:
                 return await self._command(message)
-        except ValidationError:
-            return {"ok": False, "error": "意图格式不合法", "refused": True}
         except Exception as exc:
             refused = type(exc).__name__ in REFUSAL_ERRORS
             if not refused:
@@ -169,7 +175,10 @@ class IpcServer:
         raw = message.get("intent")
         if not isinstance(raw, str):
             return {"ok": False, "error": "缺少意图", "refused": True}
-        intent = OrderIntent.model_validate_json(raw)
+        try:  # 只有解析意图这一步的校验错误算“格式不合法”；核心内部的错误照常按内部错误回答
+            intent = OrderIntent.model_validate_json(raw)
+        except ValidationError:
+            return {"ok": False, "error": "意图格式不合法", "refused": True}
         outcome = await self._port.submit_intent(intent)
         return {
             "ok": True,
@@ -194,19 +203,37 @@ class IpcServer:
 
 
 class IpcClient:
-    """apid / workerd 侧：一问一答。连接断开或格式错误抛出，由调用方重连（意图留在 outbox）。"""
+    """apid / workerd 侧：一问一答。连接断开或格式错误抛出，由调用方重连（意图留在 outbox）。
+
+    一次请求中途出任何异常（含被取消、超时）都关闭连接并作废本客户端：
+    否则迟到的回答会被下一个请求读走，把 A 的结果当成 B 的。
+    """
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._reader = reader
         self._writer = writer
         self._lock = asyncio.Lock()
+        self._next_id = 0
+        self._broken = False
 
     async def request(self, message: Mapping[str, Any]) -> dict[str, Any]:
         async with self._lock:
-            await write_frame(self._writer, message)
-            answer = await read_frame(self._reader)
-        if answer is None:
-            raise ConnectionError("tradingd 关闭了连接")
+            if self._broken:
+                raise ConnectionError("连接已作废，请重连")
+            self._next_id += 1
+            request_id = self._next_id
+            try:
+                await write_frame(self._writer, {**message, "id": request_id})
+                answer = await read_frame(self._reader)
+                if answer is None:
+                    raise ConnectionError("tradingd 关闭了连接")
+                if answer.get("id") != request_id:
+                    raise ProtocolError("回答与请求不对应")
+            except BaseException:
+                self._broken = True
+                self._writer.close()
+                raise
+        del answer["id"]
         return answer
 
     async def submit_intent(self, intent: OrderIntent) -> dict[str, Any]:

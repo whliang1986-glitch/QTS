@@ -8,14 +8,18 @@ import json
 import socket
 import sqlite3
 from collections.abc import AsyncIterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import pytest_asyncio
+from server.domain.enums import TimeInForce
+from server.domain.orders import OrderIntent
 from server.ipc.outbox import (
     EXPIRED,
+    UNREADABLE,
     Outbox,
     OutboxConflictError,
     OutboxError,
@@ -40,6 +44,7 @@ from tests.support.oms import Env
 WORKERD = Peer(Role.WORKERD, "test-workerd")
 APID = Peer(Role.APID, "test-apid")
 AGE = timedelta(minutes=5)
+GTD = TimeInForce.GTD
 
 
 @pytest_asyncio.fixture
@@ -392,6 +397,10 @@ class Channel:
             answer = self.answers.pop(0)
             if isinstance(answer, BaseException):
                 raise answer
+            answer = json.loads(json.dumps(answer))
+            result = answer.get("result")
+            if isinstance(result, dict) and result.get("intent_id") == "*":  # 回显投来的意图号
+                result["intent_id"] = intent.intent_id
             return dict(answer)
         assert self.client is not None
         return await self.client.submit_intent(intent)
@@ -429,25 +438,35 @@ async def test_lost_answer_redelivery_does_not_place_twice(
 
 
 @pytest.mark.asyncio
-async def test_transient_failures_stop_delivery_in_order(env: Env, tmp_path: Path) -> None:
-    box = outbox(env, tmp_path)
-    for name in ("a", "b", "c"):
-        box.enqueue(reduce_intent(env, name))
-    ok = {"ok": True, "result": {"intent_id": "a", "verdict": "ALLOW", "status": "SUBMITTED"}}
-    for failure in (
+@pytest.mark.parametrize(
+    "failure",
+    [
         ConnectionError("断开"),
         ProtocolError("坏帧"),
         {"ok": False, "error": "NotReadyError", "refused": False},
         {"ok": False, "error": "RuntimeError", "refused": False},
         {"ok": False},
-    ):
-        channel = Channel([ok, failure])
-        report = await deliver_pending(box, channel, max_age=AGE)
-        assert report.remaining == 2, failure
-        assert channel.seen[-1] == "b"
-        assert [i.intent_id for i in box.pending()] == ["b", "c"]
-        ok = {}  # a 已有回执，之后不再投 a
-        channel.answers.clear()
+        {"ok": 1, "result": {"intent_id": "b", "verdict": "ALLOW"}},  # 不是严格的 true
+        {"ok": True, "result": {"intent_id": "a", "verdict": "ALLOW"}},  # 回答对不上意图
+        {"ok": True, "result": None},
+        {"ok": True},
+    ],
+    ids=lambda f: repr(f)[:40],
+)
+async def test_transient_failures_stop_delivery_in_order(
+    env: Env, tmp_path: Path, failure: Any
+) -> None:
+    box = outbox(env, tmp_path)
+    for name in ("a", "b", "c"):
+        box.enqueue(reduce_intent(env, name))
+    ok = {"ok": True, "result": {"intent_id": "a", "verdict": "ALLOW", "status": "SUBMITTED"}}
+    channel = Channel([ok, failure])
+    report = await deliver_pending(box, channel, max_age=AGE)
+    assert channel.answers == []  # 这一种失败确实被取出、确实到达了投递逻辑
+    assert channel.seen == ["a", "b"]
+    assert (report.delivered, report.remaining) == (1, 2)
+    assert [i.intent_id for i in box.pending()] == ["b", "c"]
+    assert box.receipt("b") is None  # 不写回执：留待重投
 
 
 @pytest.mark.asyncio
@@ -473,7 +492,7 @@ async def test_stale_intents_expire_instead_of_being_sent(env: Env, tmp_path: Pa
     env.clock.advance(AGE.total_seconds() + 1)
     box.enqueue(reduce_intent(env, "fresh", created_at=env.clock()))
     box.enqueue(reduce_intent(env, "edge", created_at=env.clock() - AGE))
-    ok = {"ok": True, "result": {"intent_id": "x", "verdict": "ALLOW", "status": None}}
+    ok = {"ok": True, "result": {"intent_id": "*", "verdict": "ALLOW", "status": None}}
     channel = Channel([ok, ok, ok])
     report = await deliver_pending(box, channel, max_age=AGE)
     assert channel.seen == ["future", "fresh", "edge"]  # future 只超前 AGE - 1 秒，不算离谱
@@ -517,3 +536,129 @@ async def test_tradingd_restart_keeps_intents_pending(env: Env, tmp_path: Path) 
 
 def test_peer_roles_are_the_only_two() -> None:
     assert {r.value for r in Role} == {"workerd", "apid"}
+
+
+# ---------- 评审后补充（S-01b 评审 P1 / P2） ----------
+
+
+@pytest.mark.asyncio
+async def test_answers_must_match_requests() -> None:
+    """服务端回了别的请求的回答：客户端按协议错误作废连接，不把它当成这次的结果。"""
+    (cr, cw), (sr, sw) = await stream_pair()
+    client = IpcClient(cr, cw)
+    pending = asyncio.create_task(client.request({"type": "intent"}))
+    request = await read_frame(sr)
+    assert request is not None and request["id"] == 1
+    await write_frame(sw, {"id": 99, "ok": True, "result": {}})
+    with pytest.raises(ProtocolError, match="不对应"):
+        await pending
+    with pytest.raises(ConnectionError, match="作废"):
+        await client.request({"type": "intent"})
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_poisons_the_client() -> None:
+    """读回答时被取消（例如超时）：迟到的回答不会被下一个请求读走。"""
+    (cr, cw), (sr, sw) = await stream_pair()
+    client = IpcClient(cr, cw)
+    pending = asyncio.create_task(client.request({"type": "intent"}))
+    assert await read_frame(sr) is not None
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    await write_frame(sw, {"id": 1, "ok": True, "result": {"late": True}})
+    with pytest.raises(ConnectionError, match="作废"):
+        await client.request({"type": "intent"})
+
+
+@pytest.mark.asyncio
+async def test_server_echoes_request_ids(env: Env, rig: Rig) -> None:
+    (cr, cw), (sr, sw) = await stream_pair()
+    task = asyncio.create_task(IpcServer(rig.core).serve(sr, sw, WORKERD))
+    await write_frame(cw, {"id": 7, "type": "hello"})
+    answer = await read_frame(cr)
+    assert answer is not None and answer["id"] == 7 and answer["refused"] is True
+    cw.close()
+    await asyncio.wait_for(task, 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [b"[" * 200_000, b'{"n": ' + b"9" * 5000 + b"}"],
+    ids=["deep-nesting", "huge-int"],
+)
+async def test_pathological_json_is_a_protocol_error(body: bytes) -> None:
+    with pytest.raises(ProtocolError):
+        await read_frame(await raw(frame(body)))
+
+
+@pytest.mark.asyncio
+async def test_internal_validation_errors_are_not_refusals(env: Env) -> None:
+    """核心内部抛出的校验错误不算“意图格式不合法”：回答暂时性错误，outbox 不写永久拒绝。"""
+
+    class Inner:
+        async def submit_intent(self, intent: Any) -> Any:
+            OrderIntent.model_validate({})  # 核心内部的校验错误
+
+        async def command(self, *_a: Any, **_kw: Any) -> Any:
+            raise AssertionError
+
+    answer = await IpcServer(Inner()).dispatch(
+        {"type": "intent", "intent": reduce_intent(env).model_dump_json()}, WORKERD
+    )
+    assert answer == {"ok": False, "error": "ValidationError", "refused": False}
+
+
+@pytest.mark.asyncio
+async def test_oversized_answers_are_reported_not_dropped(env: Env) -> None:
+    class Huge:
+        async def submit_intent(self, intent: Any) -> Any:
+            raise AssertionError
+
+        async def command(self, *_a: Any, **_kw: Any) -> Any:
+            return SimpleNamespace(ok=True, detail={"x": "y" * MAX_FRAME}, replayed=False)
+
+    async with Link(IpcServer(Huge()), APID) as client:
+        answer = await client.command("c", "reconcile", {}, actor="dylan")
+    assert answer == {"ok": False, "error": "回答超过帧上限", "refused": False}
+
+
+@pytest.mark.asyncio
+async def test_intents_past_their_own_expiry_are_not_sent(env: Env, tmp_path: Path) -> None:
+    box = outbox(env, tmp_path)
+    box.enqueue(
+        reduce_intent(env, "e", time_in_force=GTD, expires_at=env.clock() + timedelta(seconds=30))
+    )
+    box.enqueue(
+        reduce_intent(env, "f", time_in_force=GTD, expires_at=env.clock() + timedelta(seconds=90))
+    )
+    env.clock.advance(30)
+    ok = {"ok": True, "result": {"intent_id": "*", "verdict": "ALLOW", "status": None}}
+    channel = Channel([ok])
+    report = await deliver_pending(box, channel, max_age=AGE)
+    assert channel.seen == ["f"] and report.expired == 1
+    assert box.receipt("e") == Receipt("e", None, None, True, EXPIRED)
+
+
+@pytest.mark.asyncio
+async def test_unreadable_payload_does_not_block_the_queue(env: Env, tmp_path: Path) -> None:
+    box = outbox(env, tmp_path)
+    box._conn.execute(
+        "INSERT INTO outbox_intents (intent_id, payload, created_at) VALUES ('bad', '{}', 'x')"
+    )
+    box.enqueue(reduce_intent(env, "good"))
+    ok = {"ok": True, "result": {"intent_id": "*", "verdict": "ALLOW", "status": None}}
+    channel = Channel([ok])
+    report = await deliver_pending(box, channel, max_age=AGE)
+    assert channel.seen == ["good"] and report.delivered == 1
+    assert box.receipt("bad") == Receipt("bad", None, None, True, UNREADABLE)
+
+
+@pytest.mark.asyncio
+async def test_naive_clock_is_refused(env: Env, tmp_path: Path) -> None:
+    box = Outbox(tmp_path / "meta.db", clock=lambda: datetime(2026, 10, 23, 14, 0))  # noqa: DTZ001
+    box.enqueue(reduce_intent(env, "a"))
+    with pytest.raises(OutboxError, match="时区"):
+        await deliver_pending(box, Channel([]), max_age=AGE)
+    assert box.receipt("a") is None

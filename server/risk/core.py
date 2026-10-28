@@ -154,6 +154,9 @@ class TradingCore:
         account = self._modes.verified_account()
         if account is None or intent.account_id != account.account_id:
             raise IntakeError("意图账户不是本进程已校验的账户")
+        if intent.expires_at is not None and intent.expires_at <= self._clock():
+            # 不信任投递方的过期判断，按 tradingd 自己的时钟再查一次（防追单，V4.1 3.4）
+            raise IntakeError("意图已过有效期")
         async with self._lock:
             return await self._engine.submit(intent)
 
