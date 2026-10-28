@@ -566,9 +566,19 @@ async def test_cancelled_request_poisons_the_client() -> None:
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pending
-    await write_frame(sw, {"id": 1, "ok": True, "result": {"late": True}})
+    assert cw.is_closing()  # 客户端已关闭连接
+    # 迟到的回答：Linux 上对已关闭的连接写入会被重置（ConnectionResetError / BrokenPipeError），
+    # Windows 上可能写得进去——两种情况客户端都不能再读到它
+    with contextlib.suppress(ConnectionResetError, BrokenPipeError):
+        await write_frame(sw, {"id": 1, "ok": True, "result": {"late": True}})
     with pytest.raises(ConnectionError, match="作废"):
         await client.request({"type": "intent"})
+    # 作废后没有再发出任何请求：服务端只看到连接结束，看不到第二帧
+    try:
+        leftover = await asyncio.wait_for(read_frame(sr), 5)
+    except (ConnectionResetError, BrokenPipeError):
+        leftover = None
+    assert leftover is None
 
 
 @pytest.mark.asyncio
