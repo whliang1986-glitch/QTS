@@ -227,6 +227,11 @@ class RiskEngine:
         # 运行状态门禁（R-08：DEGRADED / 券商窗口）；None 表示未接入（S-01 必须接上）
         self._run_gate = run_gate
 
+    @property
+    def has_run_gate(self) -> bool:
+        """是否接入了运行状态门禁（交易核心装配时要求必须接入，R-08 / S-01a）。"""
+        return self._run_gate is not None
+
     # ---------- 入口 ----------
 
     async def submit(self, intent: OrderIntent) -> Outcome:

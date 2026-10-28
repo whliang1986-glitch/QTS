@@ -115,6 +115,10 @@ class LedgerContextProvider:
         self._clock = clock
         self._reported: set[tuple[str, tuple[str, ...]]] = set()
 
+    def reset_reports(self) -> None:
+        """人工恢复交易后调用：之前报告过的不可信状态再次出现时要重新报告（R-03 移交）。"""
+        self._reported.clear()
+
     async def snapshot(self, subject: Subject) -> RiskContext:
         account_id = subject.intent.account_id
         positions = await self._fetch("positions", self._account.positions)
