@@ -12,11 +12,12 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from server.domain.enums import Mode, OrderClass, OrderType, RiskVerdict, Side, TimeInForce
+from server.domain.order_state import OrderStatus
 from server.domain.orders import EMERGENCY_FLATTEN_SOURCE, PROTECTIVE_STOP_SOURCE
 from server.risk.config import parse_health_config
 from server.risk.context import LedgerContextProvider
-from server.risk.core import IntakeError, TradingCore
-from server.risk.emergency import EmergencyControls
+from server.risk.core import RESERVED_INTENT_PREFIXES, IntakeError, TradingCore
+from server.risk.emergency import EMERGENCY_ACTION, PROTECTIVE_CANCEL_PHRASE, EmergencyControls
 from server.risk.engine import RiskEngine
 from server.risk.mode_manager import ModeConfig, ModeManager, StartupRefusedError
 from server.risk.reconcile import ADOPT_PHRASE, Reconciler, ReconKind
@@ -25,6 +26,7 @@ from server.risk.run_state import RunStateMachine
 from server.storage.config import ConfigError, load_toml
 from server.storage.ledger import Amendment
 from tests.integration.risk.test_context import Quotes
+from tests.integration.risk.test_emergency import stop_intent
 from tests.integration.risk.test_limit_rules_engine import PARAMS
 from tests.integration.risk.test_reconcile import Actions
 from tests.support.oms import ACCOUNT, Env
@@ -32,6 +34,7 @@ from tests.support.oms import ACCOUNT, Env
 ROOT = Path(__file__).resolve().parents[3]
 HEALTH = ROOT / "config/runtime/health.toml"
 V = RiskVerdict
+S = OrderStatus
 
 
 def config(**kw: Any) -> ModeConfig:
@@ -589,3 +592,167 @@ async def test_expired_intents_are_refused_by_tradingd_itself(env: Env) -> None:
     with pytest.raises(IntakeError, match="有效期"):
         await rig.core.submit_intent(late)
     assert env.repo.risk_decisions_for("late") == []
+
+
+# ---------- 人工确认命令经交易核心执行（S-01a-arch 放宽之后） ----------
+
+
+@pytest.mark.asyncio
+async def test_protective_stop_cancel_needs_the_phrase_through_the_core(env: Env) -> None:
+    rig = Rig(env)
+    await rig.bring_up()
+    stop = stop_intent(env)
+    assert (await rig.engine.submit(stop)).decision.verdict is V.ALLOW
+    await env.pump()
+    wrong = await rig.core.command(
+        "r-s1", "cancel_protective_stops", {"confirmation": "确认"}, actor="dylan"
+    )
+    assert not wrong.ok and "确认短语" in wrong.detail["error"]
+    assert env.om.status("stop-1") is S.SUBMITTED
+    done = await rig.core.command(
+        "r-s2", "cancel_protective_stops", {"confirmation": PROTECTIVE_CANCEL_PHRASE},
+        actor="dylan",
+    )  # fmt: skip
+    assert done.ok and done.detail["orders"] == [
+        {"intent_id": "stop-1", "status": S.CANCEL_PENDING.value, "error": None}
+    ]
+    again = await rig.core.command(
+        "r-s2", "cancel_protective_stops", {"confirmation": PROTECTIVE_CANCEL_PHRASE},
+        actor="dylan",
+    )  # fmt: skip
+    assert again.replayed and again.detail == done.detail  # 重试不再撤一次
+    operations = [dict(a.detail)["operation"] for a in env.repo.audits(EMERGENCY_ACTION)]
+    assert operations.count('"cancel_protective_stops"') == 1
+
+
+@pytest.mark.asyncio
+async def test_emergency_flatten_through_the_core(env: Env) -> None:
+    rig = Rig(env)
+    await rig.bring_up()
+    await rig.core.command("r-h", "stop_new_orders", {"reason": "急停"}, actor="dylan")
+    preview = await rig.core.command("r-p", "preview_flatten", {}, actor="dylan")
+    pid, phrase = preview.detail["preview_id"], preview.detail["confirmation"]
+    wrong = await rig.core.command(
+        "r-f1", "emergency_flatten", {"preview_id": pid, "confirmation": "是"}, actor="dylan"
+    )
+    assert not wrong.ok and "确认短语" in wrong.detail["error"]
+    done = await rig.core.command(
+        "r-f2", "emergency_flatten", {"preview_id": pid, "confirmation": phrase}, actor="dylan"
+    )
+    assert done.ok, done.detail
+    (line,) = done.detail["lines"]
+    assert line["symbol"] == "SPY" and line["verdict"] == V.ALLOW.value and line["error"] is None
+    again = await rig.core.command(
+        "r-f2", "emergency_flatten", {"preview_id": pid, "confirmation": phrase}, actor="dylan"
+    )
+    assert again.replayed and again.detail == done.detail
+    reused = await rig.core.command(
+        "r-f3", "emergency_flatten", {"preview_id": pid, "confirmation": phrase}, actor="dylan"
+    )
+    assert not reused.ok  # 一次预览只能执行一次
+    flattens = [i for i in env.repo.submitted_intents() if i.startswith(RESERVED_INTENT_PREFIXES)]
+    assert len(flattens) == 1
+
+
+@pytest.mark.asyncio
+async def test_adopt_baseline_through_the_core(env: Env) -> None:
+    rig = Rig(env)
+    rig.healthy()
+    await rig.core.start()  # 首次启动：没有基准 → SAFE HALT
+    wrong = await rig.core.command("r-a1", "adopt_baseline", {"confirmation": "好"}, actor="dylan")
+    assert not wrong.ok and "确认短语" in wrong.detail["error"]
+    robot = await rig.core.command(
+        "r-a2", "adopt_baseline", {"confirmation": ADOPT_PHRASE}, actor="tradingd"
+    )
+    assert not robot.ok and "人工" in robot.detail["error"]
+    done = await rig.core.command(
+        "r-a3", "adopt_baseline", {"confirmation": ADOPT_PHRASE}, actor="dylan"
+    )
+    assert done.ok and done.detail["adjustments"]
+    settled = await rig.core.command("r-recon", "reconcile", {}, actor="dylan")
+    assert settled.detail["settled"]
+    assert (await rig.core.command("r-resume", "resume", {}, actor="dylan")).ok
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "params"),
+    [
+        ("cancel_protective_stops", {}),
+        ("cancel_protective_stops", {"confirmation": "x", "extra": "y"}),
+        ("emergency_flatten", {"confirmation": "x"}),
+        ("emergency_flatten", {"preview_id": "p"}),
+        ("adopt_baseline", {}),
+        ("adopt_baseline", {"phrase": "x"}),
+    ],
+)
+async def test_confirmation_commands_need_exact_params(
+    env: Env, name: str, params: dict[str, str]
+) -> None:
+    rig = Rig(env)
+    await rig.bring_up()
+    with pytest.raises(IntakeError, match="命令参数必须恰好是"):
+        await rig.core.command("r-x", name, params, actor="dylan")
+    assert env.repo.command_result("r-x") is None  # 不执行、不记录
+
+
+@pytest.mark.asyncio
+async def test_confirmation_commands_wait_for_the_core_lock(env: Env) -> None:
+    """三条确认命令与意图、回报串行：持锁期间不执行。"""
+    rig = Rig(env)
+    await rig.bring_up()
+    calls: list[str] = []
+
+    async def spy(*_a: Any, **_kw: Any) -> list[Any]:
+        calls.append("ran")
+        return []
+
+    rig.emergency.cancel_protective_stops = spy  # type: ignore[method-assign]
+    rig.emergency.emergency_flatten = spy  # type: ignore[method-assign]
+    rig.recon.adopt_broker_positions = spy  # type: ignore[method-assign]
+    for i, (name, params) in enumerate(
+        [
+            ("cancel_protective_stops", {"confirmation": "x"}),
+            ("emergency_flatten", {"preview_id": "p", "confirmation": "x"}),
+            ("adopt_baseline", {"confirmation": "x"}),
+        ]
+    ):
+        async with rig.core._lock:
+            task = asyncio.create_task(rig.core.command(f"r-l{i}", name, params, actor="dylan"))
+            await asyncio.sleep(0.05)
+            assert len(calls) == i, name
+            assert not task.done()
+        assert (await task).ok
+        assert len(calls) == i + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actor", ["tradingd", "guardd"])
+async def test_program_identities_are_refused_through_the_core(env: Env, actor: str) -> None:
+    rig = Rig(env)
+    await rig.bring_up()
+    assert (await rig.engine.submit(stop_intent(env))).decision.verdict is V.ALLOW
+    await env.pump()
+    stops = await rig.core.command(
+        "r-s", "cancel_protective_stops", {"confirmation": PROTECTIVE_CANCEL_PHRASE}, actor=actor
+    )
+    assert not stops.ok and "人工操作者" in stops.detail["error"]
+    assert env.om.status("stop-1") is S.SUBMITTED
+    await rig.core.command(
+        "r-s2", "cancel_protective_stops", {"confirmation": PROTECTIVE_CANCEL_PHRASE},
+        actor="dylan",
+    )  # fmt: skip
+    await env.pump()
+    await rig.core.command("r-h", "stop_new_orders", {"reason": "急停"}, actor="dylan")
+    preview = (await rig.core.command("r-p", "preview_flatten", {}, actor="dylan")).detail
+    flat = await rig.core.command(
+        "r-f", "emergency_flatten",
+        {"preview_id": preview["preview_id"], "confirmation": preview["confirmation"]},
+        actor=actor,
+    )  # fmt: skip
+    assert not flat.ok and "人工操作者" in flat.detail["error"]
+    assert not [i for i in env.repo.submitted_intents() if i.startswith(RESERVED_INTENT_PREFIXES)]
+    adopt = await rig.core.command(
+        "r-a", "adopt_baseline", {"confirmation": ADOPT_PHRASE}, actor=actor
+    )
+    assert not adopt.ok

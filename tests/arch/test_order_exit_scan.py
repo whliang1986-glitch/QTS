@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +27,45 @@ def _scan(tmp_path: Path, files: dict[str, str]) -> list[Violation]:
 
 def test_real_repository_is_clean() -> None:
     assert scan(ROOT / "server") == []
+
+
+CONFIRM_NAMES = (
+    "cancel_protective_stops",
+    "emergency_flatten",
+    "PROTECTIVE_CANCEL_PHRASE",
+    "adopt_broker_positions",
+    "ADOPT_PHRASE",
+)
+# 整词匹配（含 obj.method 写法）；domain 里的来源标识 "risk.emergency_flatten" 属于
+# emergency-source 规则，先剔除再匹配
+CONFIRM_PATTERN = re.compile(r"(?<!\w)(?:" + "|".join(CONFIRM_NAMES) + r")\b")
+SOURCE_LITERAL = "risk.emergency_flatten"
+
+
+def _uses_confirm_entry(text: str) -> bool:
+    return CONFIRM_PATTERN.search(text.replace(SOURCE_LITERAL, "")) is not None
+
+
+def test_confirm_pattern_catches_method_calls() -> None:
+    assert _uses_confirm_entry("await c.emergency_flatten(p)")
+    assert _uses_confirm_entry("x.cancel_protective_stops(actor=a)")
+    assert _uses_confirm_entry("HANDLERS = {'k': 'adopt_broker_positions'}")
+    assert _uses_confirm_entry("from server.risk.reconcile import ADOPT_PHRASE")
+    assert not _uses_confirm_entry('SOURCE = "risk.emergency_flatten"')
+    assert not _uses_confirm_entry("my_emergency_flattener = 1")
+
+
+def test_confirmation_entries_live_only_where_allowed_in_the_real_tree() -> None:
+    """S-01a-arch 放宽之后的实证：真实代码里三个确认入口与短语只出现在定义它们的模块、
+    交易核心与 api（server/api 目前还没有调用）。"""
+    users = {
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "server").rglob("*.py")
+        if _uses_confirm_entry(path.read_text(encoding="utf-8"))
+    }
+    allowed = {"server/risk/emergency.py", "server/risk/reconcile.py", "server/risk/core.py"}
+    assert {u for u in users if not u.startswith("server/api/")} <= allowed
+    assert "server/risk/core.py" in users
 
 
 def test_cli_exit_codes(tmp_path: Path) -> None:
@@ -616,6 +656,21 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "server/risk/core_helper.py",
         "await c.emergency_flatten(p, actor=a, confirmation=x)" + NL,
         "emergency-confirm",
+    ),
+    "进程间通信层直接执行紧急平仓": (
+        "server/ipc/protocol.py",
+        "await c.emergency_flatten(p, actor=a, confirmation=x)" + NL,
+        "emergency-confirm",
+    ),
+    "进程间通信层采用对账基准": (
+        "server/ipc/protocol.py",
+        "await r.adopt_broker_positions(actor=a, confirmation=c)" + NL,
+        "recon-adopt",
+    ),
+    "进程间通信层用分派表撤止损": (
+        "server/ipc/protocol.py",
+        "HANDLERS = {'x': 'cancel_protective_stops'}" + NL,
+        "dynamic-name",
     ),
     # ---- 失败即关闭 ----
     "语法错误": ("server/strategy/s.py", "def broken(:\n", "parse-error"),
