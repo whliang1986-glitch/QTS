@@ -19,6 +19,7 @@ LAYERS = [
     "ai",
     "api",
     "guard",
+    "platforms",
 ]
 
 
