@@ -151,10 +151,14 @@ CATEGORY_ALLOWED: dict[str, tuple[str, ...]] = {
     "risk-param-loosen": ("risk/parameters.py", "api"),
     "risk-param-write": ("risk/parameters.py",),
     "protective-cancel-entry": ("oms", "risk/emergency.py"),
-    "emergency-confirm": ("risk/emergency.py", "api"),
+    # risk/core.py：tradingd 交易核心执行 apid 经 IPC 转来的人工确认命令（S-01a）。
+    # 依据：Dylan 2026-10-28 本人授权（原话“关于同意放宽扫描规则，你自己决定选择把”、
+    # “我不会改，你怎样才能自己完成，我给你授权”）。只放这一个文件；
+    # 确认短语、人工身份校验、命令去重与审计不变。
+    "emergency-confirm": ("risk/emergency.py", "risk/core.py", "api"),
     "emergency-source": ("domain", "risk"),
     "recon-write": ("storage", "risk/reconcile.py"),
-    "recon-adopt": ("risk/reconcile.py", "api"),
+    "recon-adopt": ("risk/reconcile.py", "risk/core.py", "api"),  # 同上（S-01a）
 }
 CATEGORY_HINT = {
     "order": "只能在 server/oms 中使用",
