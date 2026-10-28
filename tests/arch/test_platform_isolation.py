@@ -7,6 +7,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from scripts.arch_scan import KNOWN_LAYERS
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -116,8 +117,5 @@ def test_platform_layer_is_a_leaf() -> None:
     contracts = {c["id"]: c for c in data["tool"]["importlinter"]["contracts"]}
     leaf = contracts["platforms-leaf"]
     assert leaf["source_modules"] == ["server.platforms"]
-    others = {
-        "domain", "storage", "ipc", "broker", "oms", "risk", "data",
-        "strategy", "backtest", "ai", "api", "guard",
-    }  # fmt: skip
+    others = set(KNOWN_LAYERS) - {"platforms"}  # 新增分层自动纳入（第二轮评审 P1-1）
     assert {m.removeprefix("server.") for m in leaf["forbidden_modules"]} == others

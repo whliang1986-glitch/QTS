@@ -672,6 +672,66 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "HANDLERS = {'x': 'cancel_protective_stops'}" + NL,
         "dynamic-name",
     ),
+    # ---- 装配层（S-01c 前置）：只放开 broker 导入，受保护名称规则照常生效 ----
+    "app 下单": ("server/app/tradingd.py", "await adapter.place_order(o)" + NL, "order-exit"),
+    "app 撤单": ("server/app/guardd.py", "await adapter.cancel_order(i)" + NL, "cancel-exit"),
+    "app 全局撤单": ("server/app/guardd.py", "ib.reqGlobalCancel()" + NL, "global-cancel"),
+    "app 直接调提交入口": (
+        "server/app/tradingd.py",
+        "await om.submit_approved_intent(i, d)" + NL,
+        "risk-bypass",
+    ),
+    "app 签发订单票据": ("server/app/tradingd.py", "t = OrderTicket(x=1)" + NL, "order-ticket"),
+    "app 构造风控决定": ("server/app/tradingd.py", "d = RiskDecision(x=1)" + NL, "risk-decision"),
+    "app 执行紧急平仓": (
+        "server/app/tradingd.py",
+        "await c.emergency_flatten(p, actor=a, confirmation=x)" + NL,
+        "emergency-confirm",
+    ),
+    "app 采用对账基准": (
+        "server/app/tradingd.py",
+        "await r.adopt_broker_positions(actor=a, confirmation=c)" + NL,
+        "recon-adopt",
+    ),
+    "app 冒用止损来源": (
+        "server/app/tradingd.py",
+        "s = PROTECTIVE_STOP_SOURCE" + NL,
+        "protective-source",
+    ),
+    "app 直接导入 oms": (
+        "server/app/tradingd.py",
+        "from server.oms import manager" + NL,
+        "oms-import",
+    ),
+    "app 直接导入 ib_async": ("server/app/tradingd.py", "import ib_async" + NL, "broker-sdk"),
+    "app 动态反射": ("server/app/tradingd.py", "getattr(adapter, name)()" + NL, "dynamic-call"),
+    "app 用字符串取下单方法": (
+        "server/app/tradingd.py",
+        "getattr(adapter, 'place_order')(o)" + NL,
+        "dynamic-name",
+    ),
+    "app 相对导入 oms": ("server/app/tradingd.py", "from ..oms import manager" + NL, "oms-import"),
+    "app 动态导入 oms": (
+        "server/app/tradingd.py",
+        "import importlib" + NL + "m = importlib.import_module('server.oms')" + NL,
+        "oms-import",
+    ),
+    "app 经 SDK 客户端下单": (
+        "server/app/tradingd.py",
+        "ib.client.placeOrder(1, c, o)" + NL,
+        "order-exit",
+    ),
+    "app 别名导入撤单": (
+        "server/app/guardd.py",
+        "from server.broker.ibkr import cancel_order as c" + NL,
+        "cancel-exit",
+    ),
+    "platforms 导入 broker": (
+        "server/platforms/w.py",
+        "import server.broker" + NL,
+        "broker-import",
+    ),
+    "ipc 导入 broker": ("server/ipc/t.py", "from server.broker import ibkr" + NL, "broker-import"),
     # ---- 失败即关闭 ----
     "语法错误": ("server/strategy/s.py", "def broken(:\n", "parse-error"),
 }
@@ -744,6 +804,11 @@ ALLOWED: dict[str, tuple[str, str]] = {
         "import server.oms\nfrom server.broker import fake\n",
     ),
     "data 导入 broker.ibkr": ("server/data/d.py", "from server.broker.ibkr import hist\n"),
+    "app 导入 broker.ibkr 构造适配器": (
+        "server/app/tradingd.py",
+        "from server.broker.ibkr import adapter" + NL + "a = adapter.IbkrAdapter(cfg)" + NL,
+    ),
+    "app 导入 risk 装配": ("server/app/tradingd.py", "from server.risk import core" + NL),
     "oms 动态导入 broker": ("server/oms/o.py", 'importlib.import_module("server.broker.fake")\n'),
     "strategy 导入 domain": (
         "server/strategy/s.py",

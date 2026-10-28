@@ -20,6 +20,7 @@ LAYERS = [
     "api",
     "guard",
     "platforms",
+    "app",
 ]
 
 

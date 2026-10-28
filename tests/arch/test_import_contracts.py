@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from scripts.arch_scan import KNOWN_LAYERS
 
 from tests.arch._layout import make_server_tree
 
@@ -48,7 +49,10 @@ def test_real_repository_passes() -> None:
 
 DOMAIN = "domain 不得依赖任何其他层"
 DECISION = "strategy、ai、api 不得依赖 broker（直接或间接）"
-ALLOWLIST = "只有 oms、guard、backtest、data 可以直接 import broker"
+ALLOWLIST = "只有 oms、guard、backtest、data、app（装配层）可以直接 import broker"
+APP_TOP = "装配层在依赖图顶端：其他层不得依赖 app（S-01c 前置）"
+APP_OMS = "装配层不得直接依赖 oms：OrderManager 由 risk 的装配函数构造（S-01c 前置）"
+FAKE = "FakeBroker 只给 backtest 与测试用（B-02），其他包不得依赖"
 NO_LEDGER = "ai、strategy 不得依赖 storage 与 risk（R-02a：不能伪造参数变更或风控决定）"
 CHANNEL = "ai、strategy 不得依赖平台层与进程间通道（S-01b：不能绕过 outbox 直连 tradingd）"
 LEAF = "平台适配层只依赖标准库，不得依赖任何业务层（S-01b）"
@@ -84,7 +88,31 @@ VIOLATIONS: dict[str, tuple[dict[str, str], str]] = {
     "平台层依赖 risk": ({"server/platforms/w.py": "import server.risk\n"}, LEAF),
     "domain 依赖平台层": ({"server/domain/x.py": "import server.platforms\n"}, DOMAIN),
     "平台层依赖 broker": ({"server/platforms/w.py": "import server.broker\n"}, ALLOWLIST),
+    # ---- 装配层（S-01c 前置）：在顶端、不直接依赖 oms、不碰 FakeBroker；放开 broker 不扩散 ----
+    "risk 依赖装配层": ({"server/risk/x.py": "import server.app\n"}, APP_TOP),
+    "broker 依赖装配层": ({"server/broker/x.py": "from server import app\n"}, APP_TOP),
+    "oms 依赖装配层": ({"server/oms/x.py": "import server.app.tradingd\n"}, APP_TOP),
+    "domain 依赖装配层": ({"server/domain/x.py": "import server.app\n"}, DOMAIN),
+    "平台层依赖装配层": ({"server/platforms/w.py": "import server.app\n"}, LEAF),
+    "装配层直接依赖 oms": ({"server/app/tradingd.py": "import server.oms\n"}, APP_OMS),
+    "装配层依赖 FakeBroker": ({"server/app/tradingd.py": "import server.broker.fake\n"}, FAKE),
+    "strategy 经装配层拿到 broker": (
+        {
+            "server/app/tradingd.py": "import server.broker\n",
+            "server/strategy/s.py": "import server.app.tradingd\n",
+        },
+        DECISION,
+    ),
+    "ipc 仍不能直接依赖 broker": ({"server/ipc/x.py": "import server.broker\n"}, ALLOWLIST),
 }
+
+
+@pytest.mark.parametrize("layer", sorted(KNOWN_LAYERS - {"app"}))
+def test_every_other_layer_is_forbidden_to_depend_on_app(tmp_path: Path, layer: str) -> None:
+    """逐层反例（评审 P1-2）：任何一层被从 app-is-top 删掉，这里都会失败。"""
+    result = _lint(_project(tmp_path, {f"server/{layer}/x.py": "import server.app\n"}))
+    broken = [line for line in result.stdout.splitlines() if line.rstrip().endswith("BROKEN")]
+    assert any(APP_TOP in line for line in broken), result.stdout
 
 
 @pytest.mark.parametrize(("files", "contract"), VIOLATIONS.values(), ids=VIOLATIONS.keys())
@@ -107,6 +135,15 @@ ALLOWED = {
     "strategy 依赖 domain": {"server/strategy/s.py": "import server.domain\n"},
     "ipc 依赖平台层": {"server/ipc/t.py": "import server.platforms\n"},
     "data 依赖平台层": {"server/data/l.py": "from server import platforms\n"},
+    "装配层依赖 broker": {"server/app/tradingd.py": "import server.broker.ibkr\n"},
+    "装配层经 risk 间接依赖 oms": {
+        "server/oms/core.py": "import server.broker\n",
+        "server/risk/core.py": "import server.oms.core\n",
+        "server/app/tradingd.py": "import server.risk.core\n",
+    },
+    "装配层依赖平台层与通道": {
+        "server/app/workerd.py": "import server.platforms\nimport server.ipc\n"
+    },
 }
 
 
