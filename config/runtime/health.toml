@@ -1,0 +1,29 @@
+# 运行状态机的组件登记（R-08 / S-01a）。普通运行配置，不是风控参数（风控参数在 config/risk，仅 Dylan 可改）。
+# 关键组件故障 → 持久化 SAFE HALT，须人工恢复；非关键组件故障 → DEGRADED（只放行降风险单与获准的策略）。
+# 超过 stale_after_seconds 没有报告即视为故障。取值按开发方建议，由协调方代 Dylan 确定（2026-10-28）：
+# 关键 30 秒，非关键 5 分钟；Dylan 可随时调整。
+
+[components.broker]        # 券商连接
+kind = "ACCOUNT"
+critical = true
+stale_after_seconds = 30
+
+[components.account_sync]  # 持仓、现金、订单与券商同步
+kind = "ACCOUNT"
+critical = true
+stale_after_seconds = 30
+
+[components.quotes]        # 实时行情
+kind = "DATA"
+critical = true
+stale_after_seconds = 30
+
+[components.news]          # 新闻（M3 起）
+kind = "DATA"
+critical = false
+stale_after_seconds = 300
+
+[components.model]         # AI 模型（M3 起）
+kind = "OTHER"
+critical = false
+stale_after_seconds = 300

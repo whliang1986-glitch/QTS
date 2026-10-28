@@ -725,6 +725,13 @@ class LedgerRepository:
 
     # ---------- 命令日志（request_id 去重） ----------
 
+    def command_result(self, request_id: str) -> CommandRecord | None:
+        """已执行命令的记录（S-01a：执行前先查，避免重复执行）。"""
+        row = self._fetch(schema.command_log, {"request_id": request_id})
+        if row is None:
+            return None
+        return CommandRecord(row.request_id, row.command, row.result, row.recorded_at)
+
     def record_command(
         self, request_id: str, command: str, result: str, at: datetime
     ) -> CommandRecord:
