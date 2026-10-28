@@ -154,6 +154,10 @@ class LedgerRepository:
         except (DBAPIError, ValidationError, ValueError) as exc:
             raise StorageError(f"读取 {what} 失败：{exc}") from exc
 
+    def check_integrity(self) -> None:
+        """健康检查（R-08）：迁移版本与全部只追加触发器都在；不完整抛 StorageError。"""
+        self._require_intact()
+
     def _require_intact(self) -> None:
         with self._reading("账本版本") as conn:
             try:

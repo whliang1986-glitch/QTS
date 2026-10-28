@@ -167,6 +167,10 @@ class ModeManager:
         """受保护配置是否允许延迟行情（ADR-06，配置校验保证只在 PAPER）；未完成启动校验为 False。"""
         return self._verified is not None and self._verified[0].allow_delayed_data
 
+    def configured_mode(self) -> Mode | None:
+        """本实例启动校验时受保护配置请求的模式（恢复交易的唯一目标）；未完成校验为 None。"""
+        return None if self._verified is None else self._verified[0].requested_mode
+
     def verified_account(self) -> Account | None:
         """本实例启动校验时券商报告的账户；未完成校验为 None。"""
         return None if self._verified is None else self._verified[1]

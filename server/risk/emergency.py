@@ -3,7 +3,7 @@
 1. 停止新增订单：持久化 HALT（ModeManager），重启不自动恢复；
    恢复走 ModeManager.resume 的健康检查与对账门槛。先 HALT 后写审计：审计失败不妨碍 HALT。
    HALT 下风控只放行降低风险的订单：OMS 随持仓创建的保护性止损、本模块的紧急平仓
-   （规则照查，见 engine._reduces_risk）；SAFE HALT（状态不可信）下连这两类也不放行。
+   （规则照查，见 engine.reduces_risk）；SAFE HALT（状态不可信）下连这两类也不放行。
 2. 撤销未成交订单：逐单撤开仓单与减仓单，**保护性止损默认保留**；请求发出不算成功，
    `unconfirmed_cancels()` 列出还没确认终态的订单（只在本进程内跟踪，重启后以 OMS 状态为准）。
    连止损一起撤要另行二次确认（逐字输入确认短语），走 OMS 唯一的止损撤单入口。
