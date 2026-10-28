@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -37,6 +37,9 @@ from server.storage.logs import log_event
 
 log = logging.getLogger(__name__)
 ACTOR = "tradingd"
+# tradingd 入口的意图限龄（S-01b 评审 P1-4 / S-01c 评审 P1-3）：与 workerd 的 outbox 限龄一致。
+# 只会更严、不会更松：放宽属于风控限值，须 Dylan 本人决定。
+INTENT_MAX_AGE = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -112,9 +115,9 @@ def build_trading_core(repo: LedgerRepository, broker: Any, inputs: CoreInputs) 
     core = TradingCore(
         repo, om, modes, mode_config=inputs.mode_config, broker_account=broker.account,
         engine=engine, reconciler=reconciler, run_state=run_state, emergency=emergency,
-        context=provider, clock=clock,
+        context=provider, clock=clock, intent_max_age=INTENT_MAX_AGE,
     )  # fmt: skip
     return Assembled(core, modes, run_state, reconciler)
 
 
-__all__ = ("ACTOR", "Assembled", "CoreInputs", "build_trading_core")
+__all__ = ("ACTOR", "INTENT_MAX_AGE", "Assembled", "CoreInputs", "build_trading_core")

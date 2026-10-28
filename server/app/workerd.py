@@ -15,12 +15,12 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
-from server.app.supervisor import EXIT_OK, EXIT_REFUSED
+from server.app.common import LOCK_WAIT_SECONDS, acquire_lock
+from server.app.supervisor import EXIT_BUSY, EXIT_OK, EXIT_REFUSED
 from server.ipc.outbox import Outbox, OutboxError, deliver_pending
 from server.ipc.protocol import IpcClient, Role
 from server.ipc.transport import Endpoints, TransportError, connect_role
 from server.platforms import LocalChannel, PlatformError
-from server.platforms.files import InstanceLock
 from server.storage.logs import log_event
 
 log = logging.getLogger(__name__)
@@ -36,16 +36,20 @@ class WorkerdSettings:
     max_age: timedelta = timedelta(minutes=5)
     deliver_seconds: float = 2.0
     connect_timeout: float = 5.0
+    deliver_timeout: float = 30.0  # 一轮投递的上限：tradingd 卡住时放弃这轮，下一轮重连重投
     instance: str = "qts"
+    lock_wait_seconds: float = LOCK_WAIT_SECONDS
 
 
 async def run_workerd(settings: WorkerdSettings, channel: LocalChannel, stop: asyncio.Event) -> int:
-    lock = InstanceLock(settings.runtime_dir / LOCK_FILE)
     try:
-        lock.acquire()
+        path = settings.runtime_dir / LOCK_FILE
+        lock = await acquire_lock(path, wait=settings.lock_wait_seconds)
     except PlatformError as exc:
-        log_event(log, logging.ERROR, "workerd 单实例锁拿不到，拒绝启动", reason=str(exc))
+        log_event(log, logging.ERROR, "workerd 单实例锁不可用，拒绝启动", reason=str(exc))
         return EXIT_REFUSED
+    if lock is None:
+        return EXIT_BUSY
     try:
         outbox = Outbox(settings.meta_path)
     except OutboxError as exc:
@@ -59,8 +63,16 @@ async def run_workerd(settings: WorkerdSettings, channel: LocalChannel, stop: as
             if client is None:
                 client = await _connect(endpoints, settings)
             if client is not None:
-                report = await deliver_pending(outbox, client, max_age=settings.max_age)
-                if report.remaining:  # 中途失败：连接可能已作废，下一轮重连
+                try:
+                    report = await asyncio.wait_for(
+                        deliver_pending(outbox, client, max_age=settings.max_age),
+                        settings.deliver_timeout,
+                    )
+                    failed = report.remaining > 0  # 中途失败：连接可能已作废
+                except TimeoutError:  # 请求被取消时客户端已自我作废（S-01b）
+                    log_event(log, logging.WARNING, "workerd 本轮投递超时，下一轮重连")
+                    failed = True
+                if failed:
                     await client.close()
                     client = None
             with contextlib.suppress(TimeoutError):

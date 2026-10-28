@@ -190,3 +190,38 @@ async def test_real_process_crash_is_restarted(tmp_path: Path) -> None:
     assert await asyncio.wait_for(sup.run(), 60) == {"child": "exited"}
     assert sleeps == [1]
     assert len(marker.read_text().splitlines()) == 2
+
+
+@pytest.mark.asyncio
+async def test_busy_exit_is_retried_with_backoff() -> None:
+    """锁还没释放（EXIT_BUSY）：按崩溃退避重试，而不是永久放弃。"""
+    from server.app.supervisor import EXIT_BUSY  # noqa: PLC0415
+
+    script = Script([EXIT_BUSY, EXIT_BUSY, EXIT_OK])
+    assert await supervisor(script).run() == {"tradingd": "exited"}
+    assert script.sleeps == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_stop_during_spawn_leaves_no_orphan() -> None:
+    """stop() 恰好发生在拉起期间：拉起来的子进程立即被终止。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    child = FakeChild(None)
+
+    async def slow_spawn(argv: Sequence[str]) -> Any:
+        started.set()
+        await release.wait()
+        return child
+
+    script = Script([])
+    sup = Supervisor([ChildSpec("t", ("x",))], spawn=slow_spawn, sleep=script.sleep,
+                     clock=script.clock)  # fmt: skip
+    task = asyncio.create_task(sup.run())
+    await started.wait()
+    stopping = asyncio.create_task(sup.stop())
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.wait_for(stopping, 5)
+    assert await asyncio.wait_for(task, 5) == {"t": "stopped"}
+    assert child.terminated

@@ -1,8 +1,8 @@
 """tradingd 心跳文件（S-01c）：tradingd 定时写，guardd 读。
 
 - 内容是一行 UTC ISO 时间；先写临时文件再 os.replace 原子替换，读者不会读到半行。
-- Windows 上读者恰好打开着文件时替换可能失败（PermissionError）：短暂重试，仍失败就抛出，
-  由 tradingd 记日志——少写一次心跳只会让 guardd 更早介入（偏保守），不会掩盖故障。
+- Windows 上读者恰好打开着文件时替换可能失败（PermissionError）：短暂重试，仍失败就抛出；
+  tradingd 捕获后记日志、跳过这一次。少写一次心跳只会让 guardd 更早介入（偏保守），不会掩盖故障。
 - 读：文件缺失、内容坏、不带时区一律当作“没有心跳”（失败即关闭：guardd 按心跳丢失处理）。
 """
 

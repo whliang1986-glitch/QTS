@@ -3,7 +3,7 @@
 只撤满足以下**全部**条件的单（任何一条不确定就不撤：guardd 宁可少撤，也不能误撤保护性止损）：
 - 券商侧订单类型是限价单（LIMIT）——止损单、认不出的类型一律不碰；
 - 有 orderRef，且账本里该 orderRef 对应的意图存在、类别是开仓（OPEN）、方向是买入；
-- 账本记录的 broker_order_id 与券商一致（防止 orderRef 被复用或冒用）。
+- 账本记录的 broker_order_id 与券商一致、账户一致（防止 orderRef 被复用或冒用）。
 不平仓、不下新单、不撤保护性止损、不用全局撤单；撤单不带止损确认参数
 （券商适配器对止损单会再拒一次）。
 账本只读打开（guardd 不写账本）；撤单结果写自己的日志。心跳恢复后不再动作。
@@ -114,6 +114,7 @@ class GuardWatchdog:
                 "不是开仓单",
             ),
             (order.side is Side.BUY, "券商侧方向不是买入"),
+            (intent is not None and intent.account_id == order.account_id, "账户与账本不一致"),
         )
         return next((why for ok, why in checks if not ok), None)
 

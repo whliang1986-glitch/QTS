@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from server.app.guardd import GuarddDeps, GuarddSettings, production_guard_broker, run_guardd
-from server.app.supervisor import EXIT_OK, EXIT_REFUSED
+from server.app.supervisor import EXIT_BUSY, EXIT_OK, EXIT_REFUSED
 from server.app.tradingd import EXIT_CRASH
 from server.app.workerd import WorkerdSettings, run_workerd
 from server.broker.fake.broker import FakeBroker
@@ -37,6 +37,7 @@ def worker_settings(daemon: Daemon, tmp_path: Path) -> WorkerdSettings:
         runtime_dir=daemon.settings.runtime_dir, meta_path=tmp_path / "meta.db",
         tradingd_account=daemon.me, deliver_seconds=0.05, instance=daemon.settings.instance,
         max_age=timedelta(days=3650),  # 测试时钟固定在过去：不让过期规则干扰投递本身
+        lock_wait_seconds=0.3,
     )  # fmt: skip
 
 
@@ -97,7 +98,7 @@ async def test_second_workerd_is_refused(tmp_path: Path) -> None:
     first = asyncio.create_task(run_workerd(settings, CHANNEL, stop))
     await asyncio.sleep(0.2)
     assert await asyncio.wait_for(run_workerd(settings, CHANNEL, asyncio.Event()), 10) == (
-        EXIT_REFUSED
+        EXIT_BUSY
     )
     stop.set()
     assert await asyncio.wait_for(first, 10) == EXIT_OK
@@ -129,7 +130,7 @@ async def test_workerd_refuses_an_impostor_tradingd(tmp_path: Path) -> None:
 
 def guard_settings(tmp_path: Path) -> GuarddSettings:
     return GuarddSettings(runtime_dir=tmp_path / "run", ledger_path=tmp_path / "ledger.db",
-                          check_seconds=0.05)  # fmt: skip
+                          check_seconds=0.05, lock_wait_seconds=0.3)  # fmt: skip
 
 
 @pytest.mark.asyncio
@@ -172,7 +173,7 @@ async def test_second_guardd_is_refused(tmp_path: Path) -> None:
     )
     await asyncio.sleep(0.2)
     second = GuarddDeps(broker=lambda: FakeBroker(env.server, client_id=98))
-    assert await run_guardd(guard_settings(tmp_path), second, asyncio.Event()) == EXIT_REFUSED
+    assert await run_guardd(guard_settings(tmp_path), second, asyncio.Event()) == EXIT_BUSY
     stop.set()
     assert await asyncio.wait_for(first, 10) == EXIT_OK
 
@@ -207,3 +208,20 @@ async def test_guardd_lost_connection_mid_check_is_a_crash(
         await asyncio.wait_for(run_guardd(guard_settings(tmp_path), deps, asyncio.Event()), 10)
         == EXIT_CRASH
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["client", "server"])
+async def test_guardd_contract_disconnect_is_a_crash(tmp_path: Path, how: str) -> None:
+    """契约里的断线（connected 变 False / 服务端断开）：guardd 按崩溃退出，由守护进程重连。"""
+    env = Env(tmp_path)
+    broker = FakeBroker(env.server, client_id=97)
+    stop = asyncio.Event()
+    deps = GuarddDeps(broker=lambda: broker, clock=env.clock)
+    guardd = asyncio.create_task(run_guardd(guard_settings(tmp_path), deps, stop))
+    await until(lambda: broker.connected)
+    if how == "client":
+        await broker.disconnect()
+    else:
+        env.server.drop_client(97)
+    assert await asyncio.wait_for(guardd, 10) == EXIT_CRASH

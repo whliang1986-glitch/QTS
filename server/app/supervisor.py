@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 
 EXIT_OK = 0
 EXIT_REFUSED = 78  # sysexits.h 的 EX_CONFIG：不要重启
+EXIT_BUSY = 75  # sysexits.h 的 EX_TEMPFAIL：暂时不能启动（例如锁还没释放），按崩溃退避重试
 INITIAL_DELAY = 1.0
 MAX_DELAY = 60.0
 STABLE_AFTER = 300.0
@@ -120,6 +121,9 @@ class Supervisor:
                           error=type(exc).__name__)  # fmt: skip
             else:
                 self._running[spec.name] = child
+                if self.stopping():  # stop() 恰好发生在拉起期间：别留下孤儿进程
+                    with contextlib.suppress(ProcessLookupError):
+                        child.terminate()
                 code = await child.wait()
                 self._running.pop(spec.name, None)
             if self.stopping():
@@ -162,6 +166,7 @@ class Supervisor:
 
 __all__ = (
     "ALERT_AFTER",
+    "EXIT_BUSY",
     "EXIT_OK",
     "EXIT_REFUSED",
     "Backoff",

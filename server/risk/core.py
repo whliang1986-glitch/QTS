@@ -25,7 +25,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from server.domain.account import Account
@@ -47,6 +47,7 @@ RESERVED_SOURCES = frozenset({PROTECTIVE_STOP_SOURCE, EMERGENCY_FLATTEN_SOURCE})
 # 内部生成的意图号命名空间（紧急平仓）：外部意图不得抢占
 RESERVED_INTENT_PREFIXES = ("flatten-",)
 STOP_COMMAND = "stop_new_orders"
+INTENT_FUTURE_TOLERANCE = timedelta(seconds=5)  # 意图生成时间超前于 tradingd 时钟的容忍
 # 命令被拒（确认短语不符、门槛不满足等）：结果照样写入命令日志，重试返回同一结果
 REFUSALS = (EmergencyError, ReconError, ModeError, RunStateError)
 
@@ -90,7 +91,11 @@ class TradingCore:
         context: LedgerContextProvider | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         actor: str = "tradingd",
+        intent_max_age: timedelta | None = None,
     ) -> None:
+        if intent_max_age is not None and intent_max_age <= timedelta(0):
+            raise ValueError("intent_max_age 必须为正")
+        self._intent_max_age = intent_max_age
         self._repo = repo
         self._oms = oms
         self._modes = modes
@@ -155,9 +160,14 @@ class TradingCore:
         account = self._modes.verified_account()
         if account is None or intent.account_id != account.account_id:
             raise IntakeError("意图账户不是本进程已校验的账户")
-        if intent.expires_at is not None and intent.expires_at <= self._clock():
+        now = self._clock()
+        if intent.expires_at is not None and intent.expires_at <= now:
             # 不信任投递方的过期判断，按 tradingd 自己的时钟再查一次（防追单，V4.1 3.4）
             raise IntakeError("意图已过有效期")
+        if self._intent_max_age is not None:
+            age = now - intent.created_at
+            if age > self._intent_max_age or age < -INTENT_FUTURE_TOLERANCE:
+                raise IntakeError("意图生成时间太久或在未来，按过期拒绝（防追单）")
         async with self._lock:
             return await self._engine.submit(intent)
 

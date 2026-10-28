@@ -1,0 +1,19 @@
+# 后台进程与路径（S-01c）。普通运行配置，不是风控参数。
+# 相对路径以本仓库根目录为基准；Windows 与 macOS / Linux 通用（路径分隔符一律写 /）。
+
+[processes]
+runtime_dir = "data/run"          # 单实例锁、心跳、Linux 套接字放这里（tradingd 专属运行目录）
+ledger = "data/ledger.db"          # 账本：只有 tradingd 写
+meta = "data/meta.db"              # workerd 的意图待发队列
+instance = "qts"                   # 端点名前缀（同一台机器上只跑一套）
+heartbeat_seconds = 15             # tradingd 写心跳的间隔
+guard_check_seconds = 15           # guardd 检查心跳的间隔
+guard_timeout_seconds = 90         # 心跳超过这么久没更新，guardd 逐单撤开仓单（V4.1 附录）
+workerd_max_age_seconds = 300      # 意图生成后超过这么久仍未投出即作废（防追单）
+
+# 各进程运行所用的系统账户。"self" 表示与启动守护进程的账户相同（本机桌面版的默认）。
+# 注意：三者相同账户时，进程之间的角色区分只能防程序错误，不是安全边界（见 docs/tasks/S-01b.md）。
+[processes.accounts]
+tradingd = "self"
+apid = "self"
+workerd = "self"

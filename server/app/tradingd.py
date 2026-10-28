@@ -1,7 +1,7 @@
 """tradingd 进程入口（S-01c）：唯一下单、唯一写账本的进程。
 
 启动顺序（失败即关闭）：
-1. 单实例锁（运行目录下 tradingd.lock）：已有实例在跑 → 拒绝启动（EXIT_REFUSED）；
+1. 单写者锁（账本旁的 ledger.db.lock）：等几秒仍被占 → EXIT_BUSY，守护进程退避后再试；
 2. 打开账本：未迁移或结构不完整 → 拒绝启动；
 3. 构造券商适配器（IBKR 适配器在 B-03 才有，之前生产入口一律拒绝启动，不拿模拟券商顶替）；
 4. 装配交易核心（server.risk.assembly），连接券商，先报告各组件健康，再 core.start()；
@@ -24,12 +24,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from server.app.supervisor import EXIT_OK, EXIT_REFUSED
+from server.app.common import LOCK_WAIT_SECONDS, AdapterNotAvailableError, acquire_lock
+from server.app.supervisor import EXIT_BUSY, EXIT_OK, EXIT_REFUSED
+from server.broker.base import BrokerUnavailableError
 from server.guard.heartbeat import HeartbeatFile
 from server.ipc.protocol import IpcServer, Role
 from server.ipc.transport import Endpoints, TransportError, serve_role
 from server.platforms import Listener, LocalChannel, PlatformError
-from server.platforms.files import InstanceLock
 from server.risk.assembly import Assembled, CoreInputs, build_trading_core
 from server.risk.mode_manager import ModeError
 from server.risk.run_state import RunStateMachine
@@ -41,15 +42,16 @@ log = logging.getLogger(__name__)
 
 EXIT_CRASH = 1
 HEARTBEAT_FILE = "tradingd.heartbeat"
-LOCK_FILE = "tradingd.lock"
+PROBE_TIMEOUT = 5.0
 
 
-class BrokerUnavailableError(Exception):
-    """券商适配器不能构造（例如 IBKR 适配器尚未实现）：拒绝启动。"""
+def ledger_lock(ledger_path: Path) -> Path:
+    """单写者锁放在账本旁边：不管配置里的运行目录是什么，同一个账本只能有一个 tradingd。"""
+    return ledger_path.with_name(ledger_path.name + ".lock")
 
 
 def production_broker() -> Any:
-    raise BrokerUnavailableError("IBKR 券商适配器尚未实现（B-03），tradingd 拒绝启动")
+    raise AdapterNotAvailableError("IBKR 券商适配器尚未实现（B-03），tradingd 拒绝启动")
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ class TradingdSettings:
     allowed: Mapping[Role, frozenset[str]]  # 每个端点允许连接的系统账户
     heartbeat_seconds: float = 15.0
     instance: str = "qts"
+    lock_wait_seconds: float = LOCK_WAIT_SECONDS
 
 
 @dataclass(frozen=True)
@@ -71,16 +74,19 @@ class TradingdDeps:
 
 
 async def run_tradingd(settings: TradingdSettings, deps: TradingdDeps, stop: asyncio.Event) -> int:
-    """跑到 stop 被置位（返回 EXIT_OK）或出错（EXIT_REFUSED / EXIT_CRASH）。"""
+    """跑到 stop 被置位（EXIT_OK）或出错（EXIT_REFUSED / EXIT_BUSY / EXIT_CRASH）。"""
     if set(settings.allowed) != set(Role):
         log_event(log, logging.ERROR, "tradingd 配置缺少端点的允许账户")
         return EXIT_REFUSED
-    lock = InstanceLock(settings.runtime_dir / LOCK_FILE)
     try:
-        lock.acquire()
+        lock = await acquire_lock(
+            ledger_lock(settings.ledger_path), wait=settings.lock_wait_seconds
+        )
     except PlatformError as exc:
-        log_event(log, logging.ERROR, "tradingd 单实例锁拿不到，拒绝启动", reason=str(exc))
+        log_event(log, logging.ERROR, "tradingd 单实例锁不可用，拒绝启动", reason=str(exc))
         return EXIT_REFUSED
+    if lock is None:  # 另一个 tradingd 还在（或刚崩溃、锁还没释放）：退避后再试
+        return EXIT_BUSY
     try:
         return await _run_locked(settings, deps, stop)
     finally:
@@ -92,7 +98,7 @@ async def _run_locked(settings: TradingdSettings, deps: TradingdDeps, stop: asyn
         repo = LedgerRepository(open_ledger(settings.ledger_path))
         broker = deps.broker()
         assembled = build_trading_core(repo, broker, deps.inputs())
-    except (StorageError, BrokerUnavailableError, PlatformError, ValueError) as exc:
+    except (StorageError, AdapterNotAvailableError, PlatformError, ValueError) as exc:
         log_event(log, logging.ERROR, "tradingd 装配失败，拒绝启动", error=type(exc).__name__,
                   reason=str(exc))  # fmt: skip
         return EXIT_REFUSED
@@ -102,15 +108,19 @@ async def _run_locked(settings: TradingdSettings, deps: TradingdDeps, stop: asyn
         log_event(log, logging.ERROR, "tradingd 连接券商失败", error=type(exc).__name__)
         return EXIT_CRASH
     try:
-        deps.report_health(assembled.run_state, broker)
-        await assembled.core.start()
-    except ModeError as exc:  # 启动校验不通过：重启也没用
-        log_event(log, logging.ERROR, "tradingd 启动校验失败，拒绝启动", reason=str(exc))
-        return EXIT_REFUSED
-    except Exception as exc:
-        log_event(log, logging.ERROR, "tradingd 启动出错", error=type(exc).__name__)
-        return EXIT_CRASH
-    return await _serve(settings, deps, assembled, broker, stop)
+        try:
+            deps.report_health(assembled.run_state, broker)
+            await assembled.core.start()
+        except ModeError as exc:  # 启动校验不通过：重启也没用
+            log_event(log, logging.ERROR, "tradingd 启动校验失败，拒绝启动", reason=str(exc))
+            return EXIT_REFUSED
+        except Exception as exc:
+            log_event(log, logging.ERROR, "tradingd 启动出错", error=type(exc).__name__)
+            return EXIT_CRASH
+        return await _serve(settings, deps, assembled, broker, stop)
+    finally:
+        with contextlib.suppress(Exception):
+            await broker.disconnect()
 
 
 async def _serve(
@@ -133,14 +143,22 @@ async def _serve(
     heartbeat = HeartbeatFile(settings.runtime_dir / HEARTBEAT_FILE)
 
     async def beat() -> None:
+        """心跳只在“券商连着、两个端点都能接受连接”时写：否则按崩溃退出，让 guardd 能介入。"""
         while True:
-            heartbeat.beat(deps.clock())
+            if not broker.connected:
+                raise BrokerUnavailableError("券商连接已断开")
+            for role in Role:
+                await _probe(deps.channel, endpoints.address(role))
+            try:
+                heartbeat.beat(deps.clock())
+            except PermissionError:  # Windows 上 guardd 恰好在读：跳过这一次，下次再写
+                log_event(log, logging.WARNING, "心跳文件暂时写不进去，跳过一次")
             deps.report_health(assembled.run_state, broker)
             await asyncio.sleep(settings.heartbeat_seconds)
 
     async def events() -> None:
         await assembled.core.handle_events(broker.events())
-        raise ConnectionError("券商回报流结束")
+        raise BrokerUnavailableError("券商回报流结束")
 
     tasks = [asyncio.create_task(beat()), asyncio.create_task(events())]
     stopper = asyncio.create_task(stop.wait())
@@ -152,7 +170,8 @@ async def _serve(
         for task in done:
             failure = task.exception()
             log_event(log, logging.ERROR, "tradingd 常驻任务出错，按崩溃退出",
-                      error=type(failure).__name__ if failure else "结束")  # fmt: skip
+                      error=type(failure).__name__ if failure else "结束",
+                      reason=str(failure) if failure else "")  # fmt: skip
         return EXIT_CRASH
     finally:
         for task in (*tasks, stopper):
@@ -161,8 +180,20 @@ async def _serve(
             with contextlib.suppress(BaseException):
                 await task
         _close(listeners)
-        with contextlib.suppress(Exception):
-            await broker.disconnect()
+
+
+async def _probe(channel: LocalChannel, address: str) -> None:
+    """自检端点还能接受连接（Windows 上 accept 循环出错会悄悄停止，S-01b 已知限制）。
+
+    只建立连接、不发任何请求就关闭；对端会按账户策略处理（同账户放行，异账户直接断开），都不影响自检结论。
+    """
+    try:
+        _reader, writer, _identity = await asyncio.wait_for(channel.connect(address), PROBE_TIMEOUT)
+    except (OSError, PlatformError, TimeoutError) as exc:
+        raise ConnectionError(f"端点 {address} 不再接受连接") from exc
+    writer.close()
+    with contextlib.suppress(OSError):
+        await writer.wait_closed()
 
 
 def _close(listeners: list[Listener]) -> None:
@@ -174,10 +205,9 @@ def _close(listeners: list[Listener]) -> None:
 __all__ = (
     "EXIT_CRASH",
     "HEARTBEAT_FILE",
-    "LOCK_FILE",
-    "BrokerUnavailableError",
     "TradingdDeps",
     "TradingdSettings",
+    "ledger_lock",
     "production_broker",
     "run_tradingd",
 )

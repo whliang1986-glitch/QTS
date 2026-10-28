@@ -199,3 +199,35 @@ def test_naive_heartbeat_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="时区"):
         HeartbeatFile(tmp_path / "hb").beat(datetime(2026, 10, 28, 12, 0))  # noqa: DTZ001
+
+
+@pytest.mark.asyncio
+async def test_unknown_order_ref_is_not_cancelled(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await place_book(env)
+    guard, _ = await guard_for(env, tmp_path, None)
+    monkeypatch.setattr(guard._repo, "get_intent", lambda _ref: None)
+    report = await guard.check()
+    assert report.cancelled == ()
+    assert "账本里没有这张单" in report.reasons.values()
+
+
+@pytest.mark.asyncio
+async def test_account_mismatch_is_not_cancelled(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await place_book(env)
+    guard, _ = await guard_for(env, tmp_path, None)
+    real = guard._repo.get_intent
+
+    def other_account(ref: str) -> Any:
+        intent = real(ref)
+        if intent is None:
+            return None
+        return type(intent).model_validate({**intent.model_dump(), "account_id": "DU9999999"})
+
+    monkeypatch.setattr(guard._repo, "get_intent", other_account)
+    report = await guard.check()
+    assert report.cancelled == ()
+    assert "账户与账本不一致" in report.reasons.values()
