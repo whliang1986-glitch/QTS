@@ -9,8 +9,9 @@
 - 意图入口：只接受已校验账户的意图；拒绝外部意图冒用保护性止损或紧急平仓的身份（类别或来源标识），
   这两类只能由 OMS 随持仓创建、或由急停命令生成（R-04 / R-05 移交）。
 - 命令入口：按 request_id 去重（账本命令日志，ADR-14）；同一 request_id 换了参数即冲突；
-  撤保护性止损、紧急平仓执行、采用对账基准这三个人工确认入口按 arch_scan 只能在 server/api 调用，
-  暂不经交易核心执行（放宽到交易核心须 Dylan 批准，见 S-01a 任务单）；
+  撤保护性止损、紧急平仓执行、采用对账基准这三个人工确认命令由交易核心转给急停 / 对账模块执行
+  （arch_scan 只放宽到本文件，Dylan 2026-10-28 授权，见 S-01a-arch 任务单）：确认短语与人工操作者
+  仍由那两个模块逐字核对，这里只做参数形状校验与串行化；
   命令结果（含被拒原因）写入命令日志，重试返回原结果。
   恢复交易只走 RunStateMachine.resume（六项门槛）。
 - 后台例行：处理券商回报、评估运行状态、盘中 / 日终对账（调度在 S-01d 接入）；
@@ -211,7 +212,10 @@ class TradingCore:
     def _handlers(self) -> dict[str, Callable[[Mapping[str, str], str], Awaitable[dict[str, Any]]]]:
         return {
             "cancel_open_orders": self._cancel_open_orders,
+            "cancel_protective_stops": self._cancel_protective_stops,
             "preview_flatten": self._preview_flatten,
+            "emergency_flatten": self._emergency_flatten,
+            "adopt_baseline": self._adopt_baseline,
             "reconcile": self._reconcile_now,
             "resume": self._resume,
         }
@@ -221,6 +225,32 @@ class TradingCore:
         async with self._lock:
             results = await self._emergency.cancel_open_orders(actor=actor)
         return {"orders": [_cancel_view(r) for r in results]}
+
+    async def _cancel_protective_stops(
+        self, params: Mapping[str, str], actor: str
+    ) -> dict[str, Any]:
+        _expect_params(params, {"confirmation"})
+        async with self._lock:
+            results = await self._emergency.cancel_protective_stops(
+                actor=actor, confirmation=params["confirmation"]
+            )
+        return {"orders": [_cancel_view(r) for r in results]}
+
+    async def _emergency_flatten(self, params: Mapping[str, str], actor: str) -> dict[str, Any]:
+        _expect_params(params, {"preview_id", "confirmation"})
+        async with self._lock:  # 平仓单与意图、回报串行
+            results = await self._emergency.emergency_flatten(
+                params["preview_id"], actor=actor, confirmation=params["confirmation"]
+            )
+        return {"lines": [_flatten_view(r) for r in results]}
+
+    async def _adopt_baseline(self, params: Mapping[str, str], actor: str) -> dict[str, Any]:
+        _expect_params(params, {"confirmation"})
+        async with self._lock:  # 采用基准时不能有回报在半路
+            adjustments = await self._reconciler.adopt_broker_positions(
+                actor=actor, confirmation=params["confirmation"]
+            )
+        return {"adjustments": list(adjustments)}
 
     async def _preview_flatten(self, params: Mapping[str, str], actor: str) -> dict[str, Any]:
         del params, actor
@@ -323,6 +353,22 @@ def _fingerprint(name: str, params: Mapping[str, str], actor: str) -> str:
     """命令指纹：命令名 + 规范化参数 + 操作者（同一 request_id 换人或换参数都算冲突）。"""
     body = {"command": name, "params": dict(params), "actor": actor}
     return json.dumps(body, sort_keys=True, ensure_ascii=False)
+
+
+def _expect_params(params: Mapping[str, str], keys: set[str]) -> None:
+    """人工确认命令的参数必须恰好是这些键（缺键或多键都拒绝，不执行、不记录）。"""
+    if set(params) != keys:
+        raise IntakeError(f"命令参数必须恰好是：{sorted(keys)}")
+
+
+def _flatten_view(result: Any) -> dict[str, Any]:
+    outcome = result.outcome
+    return {
+        "symbol": result.symbol,
+        "verdict": None if outcome is None else outcome.decision.verdict.value,
+        "status": None if outcome is None or outcome.status is None else outcome.status.value,
+        "error": result.error,
+    }
 
 
 def _cancel_view(result: Any) -> dict[str, Any]:

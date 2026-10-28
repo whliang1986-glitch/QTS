@@ -38,7 +38,7 @@ from server.domain.order_state import TERMINAL, OrderStatus
 from server.domain.orders import EMERGENCY_FLATTEN_SOURCE, OrderIntent
 from server.oms.manager import CancelRefusedError, OrderManager
 from server.risk.engine import ContextProvider, Outcome, RiskContext, RiskEngine, Subject
-from server.risk.mode_manager import ModeManager
+from server.risk.mode_manager import NON_HUMAN_ACTORS, ModeManager
 from server.risk.parameters import RiskParameters
 from server.storage.ledger import LedgerRepository
 from server.storage.logs import log_event, record_audit
@@ -148,8 +148,11 @@ class EmergencyControls:
         ]
 
     async def cancel_protective_stops(self, *, actor: str, confirmation: str) -> list[CancelResult]:
-        """连保护性止损一起撤：另行二次确认（逐字输入 PROTECTIVE_CANCEL_PHRASE）。"""
-        _require_actor(actor)
+        """连保护性止损一起撤：只能由人工发起，另行二次确认（逐字输入 PROTECTIVE_CANCEL_PHRASE）。
+
+        确认短语是公开常量，挡不住程序冒用，所以程序身份（tradingd、guardd 等）一律拒绝。
+        """
+        _require_human(actor)
         if confirmation != PROTECTIVE_CANCEL_PHRASE:
             raise EmergencyError("确认短语不一致，保护性止损未撤销")
         self._audit("cancel_protective_stops", actor)
@@ -188,8 +191,9 @@ class EmergencyControls:
         """按预览执行紧急平仓：确认短语一致、预览未过期、重新计算的计划与预览完全相同。
 
         串行执行；预览在第一次等待之前即被领取（一次预览只能执行一次，并发重复调用直接拒绝）。
+        只能由人工发起：确认短语是公开的（常量或预览里给出），挡不住程序冒用。
         """
-        _require_actor(actor)
+        _require_human(actor)
         preview = self._previews.get(preview_id)
         if preview is None:
             raise EmergencyError("没有这个平仓预览，请重新预览")
@@ -349,6 +353,13 @@ class EmergencyControls:
 def _require_actor(actor: str) -> None:
     if not actor.strip():
         raise EmergencyError("必须写明操作者")
+
+
+def _require_human(actor: str) -> None:
+    """撤保护性止损、紧急平仓执行：程序身份（tradingd、guardd 等）一律拒绝。"""
+    _require_actor(actor)
+    if actor.strip().lower() in NON_HUMAN_ACTORS:
+        raise EmergencyError("撤保护性止损与紧急平仓只能由人工操作者确认")
 
 
 def _still_matches(fresh: tuple[FlattenLine, ...], previewed: tuple[FlattenLine, ...]) -> bool:
