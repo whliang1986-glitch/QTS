@@ -657,3 +657,30 @@ async def test_missing_ledger_intent_fails_closed(
     monkeypatch.setattr(env.repo, "get_intent", lambda _i: None)
     with pytest.raises(EmergencyError, match="对账"):
         await rig.controls.preview_flatten()  # 少算挂单与止损会超卖，宁可拒绝
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actor", ["tradingd", "guardd", " System ", "apid", "workerd"])
+async def test_program_identities_cannot_confirm_stop_cancel_or_flatten(
+    env: Env, actor: str
+) -> None:
+    """确认短语是公开的：撤保护性止损、紧急平仓执行必须是人工操作者（S-01a-confirm 评审 P1）。"""
+    rig = Rig(env)
+    await _open_and_stop(env, rig)
+    with pytest.raises(EmergencyError, match="人工操作者"):
+        await rig.controls.cancel_protective_stops(
+            actor=actor, confirmation=PROTECTIVE_CANCEL_PHRASE
+        )
+    assert env.om.status("stop-1") is S.SUBMITTED
+    await rig.controls.cancel_protective_stops(actor="dylan", confirmation=PROTECTIVE_CANCEL_PHRASE)
+    await env.pump()
+    rig.modes.halt("急停", actor="dylan")
+    preview = await rig.controls.preview_flatten()
+    with pytest.raises(EmergencyError, match="人工操作者"):
+        await rig.controls.emergency_flatten(
+            preview.preview_id, actor=actor, confirmation=preview.confirmation
+        )
+    (result,) = await rig.controls.emergency_flatten(
+        preview.preview_id, actor="dylan", confirmation=preview.confirmation
+    )  # 被拒的那次没有领取预览
+    assert result.error is None
