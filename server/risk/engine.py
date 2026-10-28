@@ -184,7 +184,7 @@ class Outcome:
     status: OrderStatus | None  # 只有 ALLOW / REDUCE 且交给了 OMS 才有
 
 
-def _reduces_risk(subject: Subject) -> bool:
+def reduces_risk(subject: Subject) -> bool:
     """HALT 下可以放行的订单：OMS 随持仓创建的保护性止损、急停入口生成的紧急平仓（都不是改单）。"""
     intent = subject.intent
     if subject.amendment_id is not None:
@@ -210,6 +210,7 @@ class RiskEngine:
         new_id: Callable[[], str] = lambda: uuid.uuid4().hex,
         timeout: timedelta = timedelta(seconds=2),
         actor: str = "risk",
+        run_gate: Callable[[Subject], str | None] | None = None,
     ) -> None:
         self._repo = repo
         self._oms = oms
@@ -223,6 +224,8 @@ class RiskEngine:
         self._new_id = new_id
         self._timeout = timeout
         self._actor = actor
+        # 运行状态门禁（R-08：DEGRADED / 券商窗口）；None 表示未接入（S-01 必须接上）
+        self._run_gate = run_gate
 
     # ---------- 入口 ----------
 
@@ -289,12 +292,15 @@ class RiskEngine:
             self._modes.require_trading_allowed()
         except TradingHaltedError as exc:
             # HALT 下只放行降低风险的订单（保护性止损、紧急平仓），规则照查；其余一律拒绝（R-05）
-            if not (_reduces_risk(subject) and self._modes.risk_reducing_allowed()):
+            if not (reduces_risk(subject) and self._modes.risk_reducing_allowed()):
                 return self._engine_reject(subject, "mode_gate", str(exc))
         except Exception as exc:  # 模式状态读不出来：同样不放行
             return self._engine_reject(
                 subject, "mode_gate", f"模式状态不可用：{type(exc).__name__}"
             )
+        run_reason = self._run_state_reason(subject)
+        if run_reason is not None:
+            return self._engine_reject(subject, "run_state", run_reason)
         if subject.amendment_id is not None and (
             subject.quantity > subject.intent.quantity
             or subject.quantity != subject.quantity.to_integral_value()
@@ -308,6 +314,14 @@ class RiskEngine:
                 subject, "rule_set_missing", "风控规则集缺失（受保护参数未提交或不合法）"
             )
         return None
+
+    def _run_state_reason(self, subject: Subject) -> str | None:
+        if self._run_gate is None:
+            return None
+        try:
+            return self._run_gate(subject)
+        except Exception as exc:  # 运行状态算不出来：不放行
+            return f"运行状态不可用：{type(exc).__name__}"
 
     async def _evaluate(self, subject: Subject) -> RiskDecision:
         try:
