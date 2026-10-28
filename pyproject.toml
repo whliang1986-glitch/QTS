@@ -96,7 +96,7 @@ source_modules = ["server.domain"]
 forbidden_modules = [
     "server.storage", "server.ipc", "server.broker", "server.oms", "server.risk",
     "server.data", "server.strategy", "server.backtest", "server.ai", "server.api",
-    "server.guard", "server.platforms",
+    "server.guard", "server.platforms", "server.app",
 ]
 
 [[tool.importlinter.contracts]]
@@ -108,7 +108,7 @@ source_modules = ["server.platforms"]
 forbidden_modules = [
     "server.domain", "server.storage", "server.ipc", "server.broker", "server.oms",
     "server.risk", "server.data", "server.strategy", "server.backtest", "server.ai",
-    "server.api", "server.guard",
+    "server.api", "server.guard", "server.app",
 ]
 
 [[tool.importlinter.contracts]]
@@ -120,7 +120,7 @@ forbidden_modules = ["server.broker"]
 
 [[tool.importlinter.contracts]]
 id = "broker-importers-allowlist"
-name = "只有 oms、guard、backtest、data 可以直接 import broker"
+name = "只有 oms、guard、backtest、data、app（装配层）可以直接 import broker"
 type = "forbidden"
 source_modules = [
     "server.domain", "server.storage", "server.ipc", "server.risk",
@@ -154,13 +154,35 @@ source_modules = ["server.ai", "server.strategy"]
 forbidden_modules = ["server.platforms", "server.ipc"]
 
 [[tool.importlinter.contracts]]
+id = "app-is-top"
+name = "装配层在依赖图顶端：其他层不得依赖 app（S-01c 前置）"
+# 依据：Dylan 2026-10-28 本人确认新增装配层 server/app（见 scripts/arch_scan.py 的 BROKER_IMPORT_ALLOWED）
+type = "forbidden"
+source_modules = [
+    "server.domain", "server.storage", "server.ipc", "server.broker", "server.oms",
+    "server.risk", "server.data", "server.strategy", "server.backtest", "server.ai",
+    "server.api", "server.guard", "server.platforms",
+]
+forbidden_modules = ["server.app"]
+
+[[tool.importlinter.contracts]]
+id = "app-no-direct-oms"
+name = "装配层不得直接依赖 oms：OrderManager 由 risk 的装配函数构造（S-01c 前置）"
+type = "forbidden"
+source_modules = ["server.app"]
+forbidden_modules = ["server.oms"]
+# 只限直接 import：app 经 risk 间接用到 oms 是装配的本意
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
 id = "fake-broker-test-only"
-name = "FakeBroker 只给 backtest 与测试用（B-02）：其他包不能借它的控制面绕过 clientId 隔离与撤单保护"
+name = "FakeBroker 只给 backtest 与测试用（B-02），其他包不得依赖"
+# 其他包不能借它的控制面绕过 clientId 隔离与撤单保护
 type = "forbidden"
 source_modules = [
     "server.domain", "server.storage", "server.ipc", "server.oms", "server.risk",
     "server.data", "server.strategy", "server.ai", "server.api", "server.guard",
-    "server.platforms",
+    "server.platforms", "server.app",
 ]
 forbidden_modules = ["server.broker.fake"]
 

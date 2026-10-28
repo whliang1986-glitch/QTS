@@ -46,3 +46,22 @@ def test_broker_allowlist_covers_every_layer() -> None:
 def test_fake_broker_contract_covers_every_layer_but_broker_and_backtest() -> None:
     sources = _layers(_contracts()["fake-broker-test-only"]["source_modules"])
     assert sources == set(KNOWN_LAYERS) - {"broker", "backtest"}
+
+
+def test_no_layer_may_depend_on_the_assembly_layer() -> None:
+    """S-01c 前置：新增分层时必须同时补进 app-is-top，否则“其他层不得依赖 app”会悄悄失效。"""
+    contract = _contracts()["app-is-top"]
+    assert _layers(contract["source_modules"]) == set(KNOWN_LAYERS) - {"app"}
+    assert contract["forbidden_modules"] == ["server.app"]
+    assert not contract.get("allow_indirect_imports", False)
+
+
+def test_assembly_layer_does_not_import_oms_directly() -> None:
+    contract = _contracts()["app-no-direct-oms"]
+    assert contract["source_modules"] == ["server.app"]
+    assert contract["forbidden_modules"] == ["server.oms"]
+
+
+def test_platform_leaf_covers_every_other_layer() -> None:
+    forbidden = _layers(_contracts()["platforms-leaf"]["forbidden_modules"])
+    assert forbidden == set(KNOWN_LAYERS) - {"platforms"}

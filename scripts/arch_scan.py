@@ -58,7 +58,7 @@ from pathlib import Path
 KNOWN_LAYERS = frozenset(
     {
         "domain", "storage", "ipc", "broker", "oms", "risk", "data",
-        "strategy", "backtest", "ai", "api", "guard", "platforms",
+        "strategy", "backtest", "ai", "api", "guard", "platforms", "app",
     }
 )  # fmt: skip
 
@@ -186,7 +186,11 @@ BROKER_DECORATOR_ALLOWLIST = frozenset(
 )  # fmt: skip
 
 # ---- 导入白名单 ----
-BROKER_IMPORT_ALLOWED = ("oms", "guard", "backtest", "data", "broker")
+# app（装配层）只为构造券商适配器；受保护名称规则对它照常生效。
+# 依据：Dylan 2026-10-28 本人确认“同意新增装配层 server/app：登记为新分层，
+# 只把它加入 broker 导入白名单，并新增‘其他模块不得依赖 app’‘app 不得直接依赖 oms’两条约束，
+# 其他规则不变”。
+BROKER_IMPORT_ALLOWED = ("oms", "guard", "backtest", "data", "broker", "app")
 OMS_IMPORT_ALLOWED = ("oms", "risk", "backtest")
 SDK_ALLOWED = ("broker/ibkr",)
 BROKER_SDKS = frozenset({"ib_async", "ib_insync"})
