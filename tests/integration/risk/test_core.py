@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -576,6 +577,21 @@ async def test_resume_waits_for_in_flight_work(env: Env) -> None:
     assert not task.done()  # 恢复在锁外不会抢先执行
     rig.core._lock.release()
     assert (await task).ok
+
+
+@pytest.mark.asyncio
+async def test_expired_intents_are_refused_by_tradingd_itself(env: Env) -> None:
+    """不信任 workerd 的过期判断：tradingd 按自己的时钟拒绝已过有效期的意图（S-01b 评审 P1-4）。"""
+    rig = Rig(env)
+    await rig.bring_up()
+    until = env.clock() + timedelta(seconds=30)
+    late = reduce_intent(env, "late", time_in_force=TimeInForce.GTD, expires_at=until)
+    on_time = reduce_intent(env, "ok", time_in_force=TimeInForce.GTD, expires_at=until, quantity=1)
+    assert (await rig.core.submit_intent(on_time)).decision.verdict is V.ALLOW
+    env.clock.advance(30)
+    with pytest.raises(IntakeError, match="有效期"):
+        await rig.core.submit_intent(late)
+    assert env.repo.risk_decisions_for("late") == []
 
 
 # ---------- 人工确认命令经交易核心执行（S-01a-arch 放宽之后） ----------

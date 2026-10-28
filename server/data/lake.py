@@ -45,6 +45,7 @@ import pyarrow.parquet as pq
 from server.domain.enums import DataQuality
 from server.domain.market import MarketBar
 from server.domain.values import to_utc
+from server.platforms import files as platform_files
 
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 # 快照路径段：小写，不以点结尾（Windows 会去掉结尾的点），不用设备保留名
@@ -219,8 +220,8 @@ def _parquet_bytes(table: pa.Table) -> bytes:
 def _make_read_only(directory: Path, *, lock_directory: bool) -> None:
     for item in directory.iterdir():
         item.chmod(stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
-    if lock_directory and os.name != "nt":  # Windows 的目录只读属性不阻止删除，POSIX 上锁目录
-        directory.chmod(stat.S_IREAD | stat.S_IEXEC | stat.S_IRGRP | stat.S_IXGRP)
+    if lock_directory:
+        platform_files.lock_directory(directory)  # Windows 上不生效（目录只读属性不阻止删除）
 
 
 def _rmtree(path: Path) -> None:

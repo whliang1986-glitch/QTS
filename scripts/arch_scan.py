@@ -58,7 +58,7 @@ from pathlib import Path
 KNOWN_LAYERS = frozenset(
     {
         "domain", "storage", "ipc", "broker", "oms", "risk", "data",
-        "strategy", "backtest", "ai", "api", "guard",
+        "strategy", "backtest", "ai", "api", "guard", "platforms",
     }
 )  # fmt: skip
 

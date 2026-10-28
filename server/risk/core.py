@@ -55,6 +55,10 @@ class IntakeError(Exception):
     """意图或命令在进入风控之前就被拒绝。"""
 
 
+class NotReadyError(IntakeError):
+    """交易核心尚未完成启动：暂时性的，调用方可稍后用同一幂等键重试。"""
+
+
 @dataclass(frozen=True)
 class StartupReport:
     recovered: bool  # OMS 是否已向券商查单完毕（否则拒绝新单）
@@ -151,6 +155,9 @@ class TradingCore:
         account = self._modes.verified_account()
         if account is None or intent.account_id != account.account_id:
             raise IntakeError("意图账户不是本进程已校验的账户")
+        if intent.expires_at is not None and intent.expires_at <= self._clock():
+            # 不信任投递方的过期判断，按 tradingd 自己的时钟再查一次（防追单，V4.1 3.4）
+            raise IntakeError("意图已过有效期")
         async with self._lock:
             return await self._engine.submit(intent)
 
@@ -334,7 +341,7 @@ class TradingCore:
 
     def _require_ready(self) -> None:
         if not self._ready:
-            raise IntakeError("交易核心尚未完成启动")
+            raise NotReadyError("交易核心尚未完成启动")
 
 
 def _validate_command(request_id: Any, name: Any, params: Any, actor: Any) -> None:
@@ -379,4 +386,4 @@ def _cancel_view(result: Any) -> dict[str, Any]:
     }
 
 
-__all__ = ("CommandResult", "IntakeError", "StartupReport", "TradingCore")
+__all__ = ("CommandResult", "IntakeError", "NotReadyError", "StartupReport", "TradingCore")

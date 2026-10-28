@@ -96,7 +96,19 @@ source_modules = ["server.domain"]
 forbidden_modules = [
     "server.storage", "server.ipc", "server.broker", "server.oms", "server.risk",
     "server.data", "server.strategy", "server.backtest", "server.ai", "server.api",
-    "server.guard",
+    "server.guard", "server.platforms",
+]
+
+[[tool.importlinter.contracts]]
+id = "platforms-leaf"
+name = "平台适配层只依赖标准库，不得依赖任何业务层（S-01b）"
+# 操作系统差异只在这一层，业务代码不判断操作系统（tests/arch/test_platform_isolation.py）
+type = "forbidden"
+source_modules = ["server.platforms"]
+forbidden_modules = [
+    "server.domain", "server.storage", "server.ipc", "server.broker", "server.oms",
+    "server.risk", "server.data", "server.strategy", "server.backtest", "server.ai",
+    "server.api", "server.guard",
 ]
 
 [[tool.importlinter.contracts]]
@@ -112,7 +124,7 @@ name = "只有 oms、guard、backtest、data 可以直接 import broker"
 type = "forbidden"
 source_modules = [
     "server.domain", "server.storage", "server.ipc", "server.risk",
-    "server.strategy", "server.ai", "server.api",
+    "server.strategy", "server.ai", "server.api", "server.platforms",
 ]
 forbidden_modules = ["server.broker"]
 # 只限直接 import：risk 需要调用 oms 的提交入口，而 oms 依赖 broker
@@ -135,12 +147,20 @@ forbidden_modules = ["server.storage", "server.risk"]
 # allow_indirect_imports：把禁止范围收窄到 server.storage.ledger 与 server.risk，并重新评审。
 
 [[tool.importlinter.contracts]]
+id = "no-channel-from-ai-strategy"
+name = "ai、strategy 不得依赖平台层与进程间通道（S-01b：不能绕过 outbox 直连 tradingd）"
+type = "forbidden"
+source_modules = ["server.ai", "server.strategy"]
+forbidden_modules = ["server.platforms", "server.ipc"]
+
+[[tool.importlinter.contracts]]
 id = "fake-broker-test-only"
 name = "FakeBroker 只给 backtest 与测试用（B-02）：其他包不能借它的控制面绕过 clientId 隔离与撤单保护"
 type = "forbidden"
 source_modules = [
     "server.domain", "server.storage", "server.ipc", "server.oms", "server.risk",
     "server.data", "server.strategy", "server.ai", "server.api", "server.guard",
+    "server.platforms",
 ]
 forbidden_modules = ["server.broker.fake"]
 
