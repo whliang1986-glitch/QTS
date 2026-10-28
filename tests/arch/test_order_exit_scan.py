@@ -581,6 +581,42 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "from server.risk.reconcile import ADOPT_PHRASE" + NL,
         "recon-adopt",
     ),
+    # ---- S-01a：放宽只到交易核心这一个文件，其他位置仍被拒 ----
+    "risk 其他模块执行紧急平仓": (
+        "server/risk/limits.py",
+        "await c.emergency_flatten(p, actor=a, confirmation=x)" + NL,
+        "emergency-confirm",
+    ),
+    "risk 其他模块撤止损确认": (
+        "server/risk/engine.py",
+        "await c.cancel_protective_stops(actor=a, confirmation=x)" + NL,
+        "emergency-confirm",
+    ),
+    "risk 其他模块采用对账基准": (
+        "server/risk/context.py",
+        "await r.adopt_broker_positions(actor=a, confirmation=c)" + NL,
+        "recon-adopt",
+    ),
+    "oms 采用对账基准": (
+        "server/oms/o.py",
+        "await r.adopt_broker_positions(actor=a, confirmation=c)" + NL,
+        "recon-adopt",
+    ),
+    "ai 撤止损确认": (
+        "server/ai/a.py",
+        "await c.cancel_protective_stops(actor=a, confirmation=x)" + NL,
+        "emergency-confirm",
+    ),
+    "strategy 采用对账基准": (
+        "server/strategy/s.py",
+        "await r.adopt_broker_positions(actor=a, confirmation=c)" + NL,
+        "recon-adopt",
+    ),
+    "交易核心以外的文件冒用交易核心之名": (
+        "server/risk/core_helper.py",
+        "await c.emergency_flatten(p, actor=a, confirmation=x)" + NL,
+        "emergency-confirm",
+    ),
     # ---- 失败即关闭 ----
     "语法错误": ("server/strategy/s.py", "def broken(:\n", "parse-error"),
 }
@@ -614,6 +650,15 @@ ALLOWED: dict[str, tuple[str, str]] = {
     "api 急停确认入口": (
         "server/api/panel.py",
         "await c.emergency_flatten(p, actor=a, confirmation=x)" + NL,
+    ),
+    "交易核心执行人工确认命令（S-01a，Dylan 授权）": (
+        "server/risk/core.py",
+        "await self._emergency.emergency_flatten(p, actor=a, confirmation=x)"
+        + NL
+        + "await self._emergency.cancel_protective_stops(actor=a, confirmation=x)"
+        + NL
+        + "await self._reconciler.adopt_broker_positions(actor=a, confirmation=c)"
+        + NL,
     ),
     "急停模块撤保护性止损": (
         "server/risk/emergency.py",
