@@ -322,3 +322,17 @@ async def test_failed_identity_lookup_disconnects(
     assert await asyncio.wait_for(reader.read(), 5) == b""  # 服务端直接关闭，没有任何回答
     writer.close()
     assert port.calls == []
+
+
+@real
+@pytest.mark.asyncio
+async def test_serving_into_a_missing_directory_fails_closed(tmp_path: Path) -> None:
+    """平台层不替调用方建目录：目录不存在时监听失败要以平台错误报出（Linux），不是裸 OSError。"""
+    assert CHANNEL is not None
+    endpoints = Endpoints(CHANNEL, tmp_path / "missing", f"m-{uuid.uuid4().hex[:8]}")
+    try:
+        listener = await serve_role(endpoints, Role.WORKERD, {"x"}, IpcServer(Port()))
+    except TransportError:
+        return  # Linux：套接字目录不存在
+    listener.close()  # Windows 命名管道不依赖目录
+    await listener.wait_closed()

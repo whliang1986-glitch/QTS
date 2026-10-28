@@ -331,3 +331,26 @@ async def test_probe_of_a_missing_endpoint_raises(tmp_path: Path) -> None:
     address = Endpoints(CHANNEL, tmp_path, f"gone-{uuid.uuid4().hex[:8]}").address(Role.WORKERD)
     with pytest.raises(ConnectionError, match="不再接受连接"):
         await asyncio.wait_for(_probe(CHANNEL, address), 15)
+
+
+@pytest.mark.asyncio
+async def test_missing_runtime_directory_is_created_privately(env: Env, tmp_path: Path) -> None:
+    """运行目录及其父目录不存在：tradingd 自己建好（POSIX 上 0750）。
+
+    回归：CI ubuntu 上 Linux 套接字曾因目录不存在而绑不上。
+    """
+    import os  # noqa: PLC0415
+    import stat  # noqa: PLC0415
+
+    from server.platforms.files import PRIVATE_DIR_MODE  # noqa: PLC0415
+
+    daemon = Daemon(env, tmp_path)
+    nested = tmp_path / "not" / "yet" / "run"
+    object.__setattr__(daemon.settings, "runtime_dir", nested)
+    task = daemon.start()
+    await (await daemon.connect(Role.WORKERD)).close()
+    assert nested.is_dir()
+    if os.name != "nt":
+        assert stat.S_IMODE(nested.stat().st_mode) == PRIVATE_DIR_MODE
+    daemon.stop.set()
+    assert await asyncio.wait_for(task, 10) == EXIT_OK

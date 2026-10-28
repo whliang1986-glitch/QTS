@@ -30,6 +30,25 @@ def lock_directory(directory: Path) -> bool:
     return True
 
 
+PRIVATE_DIR_MODE = 0o750  # 属主读写进入，同组只读进入，其他人无权限
+
+
+def ensure_private_dir(directory: Path) -> Path:
+    """建好运行目录（含父目录）；POSIX 上收紧为 0750，Windows 沿用用户目录的继承权限。
+
+    目录已存在但不是目录、或建不起来、或权限设不上：抛 PlatformError（失败即关闭）。
+    """
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.is_dir():
+            raise PlatformError(f"{directory} 不是目录")
+        if os.name != "nt":
+            directory.chmod(PRIVATE_DIR_MODE)
+    except OSError as exc:
+        raise PlatformError(f"无法准备运行目录 {directory}：{exc}") from exc
+    return directory
+
+
 class InstanceLockedError(PlatformError):
     """锁已被另一个实例持有。"""
 
@@ -108,4 +127,10 @@ class InstanceLock:
         self.release()
 
 
-__all__ = ("InstanceLock", "InstanceLockedError", "lock_directory")
+__all__ = (
+    "PRIVATE_DIR_MODE",
+    "InstanceLock",
+    "InstanceLockedError",
+    "ensure_private_dir",
+    "lock_directory",
+)

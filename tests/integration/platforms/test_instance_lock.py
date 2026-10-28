@@ -83,3 +83,24 @@ async def test_lock_is_held_across_processes_and_freed_when_holder_dies(lock_pat
             await asyncio.sleep(0.1)
     else:
         pytest.fail("持锁进程退出后锁没有被释放")
+
+
+def test_private_dir_is_created_with_parents(tmp_path: Path) -> None:
+    from server.platforms.files import PRIVATE_DIR_MODE, ensure_private_dir  # noqa: PLC0415
+
+    target = tmp_path / "a" / "b" / "run"
+    assert ensure_private_dir(target) == target and target.is_dir()
+    ensure_private_dir(target)  # 已存在：幂等
+    if os.name != "nt":
+        import stat  # noqa: PLC0415
+
+        assert stat.S_IMODE(target.stat().st_mode) == PRIVATE_DIR_MODE
+
+
+def test_private_dir_refuses_a_file_in_the_way(tmp_path: Path) -> None:
+    from server.platforms.files import ensure_private_dir  # noqa: PLC0415
+
+    blocker = tmp_path / "run"
+    blocker.write_text("x", encoding="utf-8")
+    with pytest.raises(PlatformError):
+        ensure_private_dir(blocker)

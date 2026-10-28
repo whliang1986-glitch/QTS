@@ -32,6 +32,7 @@ from server.guard.heartbeat import HeartbeatFile
 from server.ipc.protocol import IpcServer, Role
 from server.ipc.transport import Endpoints, TransportError, serve_role
 from server.platforms import Listener, LocalChannel, PlatformError
+from server.platforms.files import ensure_private_dir
 from server.risk.assembly import Assembled, CoreInputs, build_trading_core
 from server.risk.mode_manager import ModeError
 from server.risk.run_state import RunStateMachine
@@ -132,6 +133,11 @@ async def _serve(
     broker: Any,
     stop: asyncio.Event,
 ) -> int:
+    try:  # 套接字（Linux）与心跳文件都放在运行目录：先建好并收紧权限（父目录可能不存在）
+        ensure_private_dir(settings.runtime_dir)
+    except PlatformError as exc:
+        log_event(log, logging.ERROR, "tradingd 运行目录不可用", reason=str(exc))
+        return EXIT_CRASH
     endpoints = Endpoints(deps.channel, settings.runtime_dir, settings.instance)
     server = IpcServer(assembled.core)
     listeners: list[Listener] = []
