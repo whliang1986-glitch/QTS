@@ -160,16 +160,23 @@ class TradingCore:
         account = self._modes.verified_account()
         if account is None or intent.account_id != account.account_id:
             raise IntakeError("意图账户不是本进程已校验的账户")
+        async with self._lock:
+            # 已签发（交给过券商）的意图是重投：跳过过期检查，由风控按 intent_id 返回原决定，
+            # 否则“已下单”会被回答成“已拒绝”（S-01c 第二轮评审 P1-A）。
+            # 在锁内检查：等锁期间意图也在变老。
+            if self._repo.issuance_for(intent.intent_id) is None:
+                self._refuse_stale(intent)
+            return await self._engine.submit(intent)
+
+    def _refuse_stale(self, intent: OrderIntent) -> None:
+        """不信任投递方的过期判断，按 tradingd 自己的时钟再查一次（防追单，V4.1 3.4）。"""
         now = self._clock()
         if intent.expires_at is not None and intent.expires_at <= now:
-            # 不信任投递方的过期判断，按 tradingd 自己的时钟再查一次（防追单，V4.1 3.4）
             raise IntakeError("意图已过有效期")
         if self._intent_max_age is not None:
             age = now - intent.created_at
             if age > self._intent_max_age or age < -INTENT_FUTURE_TOLERANCE:
                 raise IntakeError("意图生成时间太久或在未来，按过期拒绝（防追单）")
-        async with self._lock:
-            return await self._engine.submit(intent)
 
     # ---------- 命令 ----------
 

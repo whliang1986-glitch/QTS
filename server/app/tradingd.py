@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -47,7 +48,8 @@ PROBE_TIMEOUT = 5.0
 
 def ledger_lock(ledger_path: Path) -> Path:
     """单写者锁放在账本旁边：不管配置里的运行目录是什么，同一个账本只能有一个 tradingd。"""
-    return ledger_path.with_name(ledger_path.name + ".lock")
+    resolved = ledger_path.resolve()  # 经符号链接访问也落到同一把锁
+    return resolved.with_name(resolved.name + ".lock")
 
 
 def production_broker() -> Any:
@@ -149,6 +151,8 @@ async def _serve(
                 raise BrokerUnavailableError("券商连接已断开")
             for role in Role:
                 await _probe(deps.channel, endpoints.address(role))
+            if not broker.connected:  # 自检期间断了线：不写这次心跳
+                raise BrokerUnavailableError("券商连接已断开")
             try:
                 heartbeat.beat(deps.clock())
             except PermissionError:  # Windows 上 guardd 恰好在读：跳过这一次，下次再写
@@ -188,12 +192,20 @@ async def _probe(channel: LocalChannel, address: str) -> None:
     只建立连接、不发任何请求就关闭；对端会按账户策略处理（同账户放行，异账户直接断开），都不影响自检结论。
     """
     try:
-        _reader, writer, _identity = await asyncio.wait_for(channel.connect(address), PROBE_TIMEOUT)
+        await asyncio.wait_for(_probe_once(channel, address), PROBE_TIMEOUT)  # 连接与关闭一起限时
     except (OSError, PlatformError, TimeoutError) as exc:
         raise ConnectionError(f"端点 {address} 不再接受连接") from exc
-    writer.close()
-    with contextlib.suppress(OSError):
-        await writer.wait_closed()
+
+
+async def _probe_once(channel: LocalChannel, address: str) -> None:
+    _reader, writer, identity = await channel.connect(address)
+    try:
+        if identity.pid != os.getpid():  # 端点被别的进程占用（冒名）：同样按失效处理
+            raise ConnectionError(f"端点 {address} 的监听方不是本进程（{identity.describe()}）")
+    finally:
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
 
 
 def _close(listeners: list[Listener]) -> None:

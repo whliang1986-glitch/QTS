@@ -82,8 +82,8 @@ def _check_safety(seconds: Mapping[str, int]) -> None:
         raise ConfigError(f"guard_timeout_seconds 不得超过 {MAX_GUARD_TIMEOUT.seconds} 秒")
     if timeout < MIN_BEATS_PER_TIMEOUT * seconds["heartbeat_seconds"]:
         raise ConfigError("guard_timeout_seconds 至少要是 heartbeat_seconds 的 3 倍")
-    if seconds["guard_check_seconds"] >= timeout:
-        raise ConfigError("guard_check_seconds 必须小于 guard_timeout_seconds")
+    if seconds["guard_check_seconds"] * MIN_BEATS_PER_TIMEOUT > timeout:
+        raise ConfigError("guard_check_seconds 不得超过 guard_timeout_seconds 的三分之一")
     if seconds["workerd_max_age_seconds"] > MAX_INTENT_AGE.total_seconds():
         raise ConfigError(f"workerd_max_age_seconds 不得超过 {MAX_INTENT_AGE.seconds} 秒")
 

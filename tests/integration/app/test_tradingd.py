@@ -320,3 +320,14 @@ async def test_stale_intents_are_refused_by_tradingd(env: Env, tmp_path: Path) -
     await worker.close()
     daemon.stop.set()
     assert await asyncio.wait_for(task, 10) == EXIT_OK
+
+
+@pytest.mark.asyncio
+async def test_probe_of_a_missing_endpoint_raises(tmp_path: Path) -> None:
+    """真实的端点失效路径（第二轮评审 P2-3）：地址不存在时自检抛 ConnectionError，且不会挂住。"""
+    from server.app.tradingd import _probe  # noqa: PLC0415
+
+    assert CHANNEL is not None
+    address = Endpoints(CHANNEL, tmp_path, f"gone-{uuid.uuid4().hex[:8]}").address(Role.WORKERD)
+    with pytest.raises(ConnectionError, match="不再接受连接"):
+        await asyncio.wait_for(_probe(CHANNEL, address), 15)

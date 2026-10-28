@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,14 +70,22 @@ async def serve_role(
     async def on_peer(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter, identity: PeerIdentity
     ) -> None:
+        own = identity.pid == os.getpid()  # tradingd 自己的端点自检：只记 DEBUG，不刷告警
         if identity.account not in accounts:
-            log_event(log, logging.WARNING, "未登记的账户尝试连接 tradingd，断开",
+            level = logging.DEBUG if own else logging.WARNING
+            log_event(log, level, "未登记的账户尝试连接 tradingd，断开",
                       role=role.value, peer=identity.describe())  # fmt: skip
             writer.close()
             with contextlib.suppress(OSError):
                 await writer.wait_closed()
             return
-        log_event(log, logging.INFO, "进程间连接已建立", role=role.value, peer=identity.describe())
+        log_event(
+            log,
+            logging.DEBUG if own else logging.INFO,
+            "进程间连接已建立",
+            role=role.value,
+            peer=identity.describe(),
+        )
         await server.serve(reader, writer, Peer(role, identity.describe()))
 
     try:

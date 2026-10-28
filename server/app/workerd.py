@@ -43,7 +43,8 @@ class WorkerdSettings:
 
 async def run_workerd(settings: WorkerdSettings, channel: LocalChannel, stop: asyncio.Event) -> int:
     try:
-        path = settings.runtime_dir / LOCK_FILE
+        resolved = settings.meta_path.resolve()  # 锁跟着 meta.db 走：同一个队列只有一个投递者
+        path = resolved.with_name(resolved.name + ".lock")
         lock = await acquire_lock(path, wait=settings.lock_wait_seconds)
     except PlatformError as exc:
         log_event(log, logging.ERROR, "workerd 单实例锁不可用，拒绝启动", reason=str(exc))
