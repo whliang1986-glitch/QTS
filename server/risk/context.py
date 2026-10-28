@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Protocol
@@ -216,32 +217,12 @@ class LedgerContextProvider:
     def _claim(
         self, at_broker: Sequence[BrokerOpenOrder], known: set[str]
     ) -> dict[str, BrokerOpenOrder]:
-        """按 OMS 的回报认领口径（manager._intent_for）把券商订单归到本系统意图：
-        orderRef 是已签发的意图，券商订单号登记在同一意图名下，permId 已登记时也须一致；
-        否则是外来订单。同一意图在券商侧有两张未结束订单（重复下单或冒用 orderRef）也不可信。
-        """
-        claimed: dict[str, BrokerOpenOrder] = {}
-        foreign: list[str] = []
-        duplicates: list[str] = []
-        for record in at_broker:
-            ref = record.order_ref
-            if ref is None or ref not in known or not self._owned(record, ref):
-                foreign.append(_order_key(record))
-            elif ref in claimed:
-                duplicates += [_order_key(claimed[ref]), _order_key(record)]
-            else:
-                claimed[ref] = record
-        if foreign:
-            raise _UntrustedError(UNKNOWN_BROKER_ORDER, sorted(foreign))
-        if duplicates:
-            raise _UntrustedError(BROKER_ORDER_MISMATCH, sorted(set(duplicates)))
-        return claimed
-
-    def _owned(self, record: BrokerOpenOrder, ref: str) -> bool:
-        if self._repo.intent_for_broker_order(record.broker_order_id) != ref:
-            return False
-        known_perm = self._repo.perm_id_for(ref)
-        return record.perm_id is None or known_perm is None or record.perm_id == known_perm
+        claim = claim_open_orders(self._repo, at_broker, known)
+        if claim.foreign:
+            raise _UntrustedError(UNKNOWN_BROKER_ORDER, claim.foreign)
+        if claim.duplicates:
+            raise _UntrustedError(BROKER_ORDER_MISMATCH, claim.duplicates)
+        return claim.claimed
 
     def _open_order(self, intent_id: str, account_id: str) -> OpenOrder | None:
         """本账户一张未终态订单的保守视图：数量取签发与所有未被拒改单中的最大值减去已成交；
@@ -326,6 +307,50 @@ def _more_conservative(local: OpenOrder, record: BrokerOpenOrder) -> OpenOrder:
         remaining_quantity=remaining,
         limit_price=price,
     )
+
+
+def owned_by_us(
+    repo: LedgerRepository, broker_order_id: str | None, order_ref: str | None, perm_id: str | None
+) -> bool:
+    """券商侧订单或成交是否属于本系统：与 OMS 回报认领同一口径（manager._intent_for）。
+
+    orderRef 必须存在，且券商订单号登记在同一意图名下；permId 双方都有时必须一致。
+    """
+    if order_ref is None or broker_order_id is None:
+        return False
+    if repo.intent_for_broker_order(broker_order_id) != order_ref:
+        return False
+    known_perm = repo.perm_id_for(order_ref)
+    return perm_id is None or known_perm is None or perm_id == known_perm
+
+
+@dataclass(frozen=True)
+class OrderClaim:
+    claimed: dict[str, BrokerOpenOrder]  # 意图 → 券商订单
+    foreign: list[str]  # 外来订单键（排序）
+    duplicates: list[str]  # 同一意图有两张及以上券商订单的订单键（排序）
+
+
+def claim_open_orders(
+    repo: LedgerRepository, at_broker: Sequence[BrokerOpenOrder], known: set[str]
+) -> OrderClaim:
+    """把券商未结束订单归到本系统已签发的意图；认不出的是外来订单，同一意图多张是不一致。"""
+    claimed: dict[str, BrokerOpenOrder] = {}
+    foreign: list[str] = []
+    duplicates: set[str] = set()
+    for record in at_broker:
+        ref = record.order_ref
+        if (
+            ref is None
+            or ref not in known
+            or not owned_by_us(repo, record.broker_order_id, ref, record.perm_id)
+        ):
+            foreign.append(_order_key(record))
+        elif ref in claimed:
+            duplicates |= {_order_key(claimed[ref]), _order_key(record)}
+        else:
+            claimed[ref] = record
+    return OrderClaim(claimed, sorted(foreign), sorted(duplicates))
 
 
 class _UntrustedError(Exception):

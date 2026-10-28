@@ -560,6 +560,27 @@ VIOLATIONS: dict[str, tuple[str, str, str]] = {
         "sid = EMERGENCY_FLATTEN_SOURCE" + NL,
         "emergency-source",
     ),
+    # ---- R-07：对账 ----
+    "oms 直接写持仓调整": (
+        "server/oms/o.py",
+        "repo.add_position_adjustment(a)" + NL,
+        "recon-write",
+    ),
+    "risk 其他模块伪造对账报告": (
+        "server/risk/engine.py",
+        "record_audit(repo, action='reconciliation', actor=a, at=t)" + NL,
+        "dynamic-name",
+    ),
+    "ai 采用券商持仓": (
+        "server/ai/a.py",
+        "await r.adopt_broker_positions(actor=a, confirmation=c)" + NL,
+        "recon-adopt",
+    ),
+    "strategy 引用采用确认短语": (
+        "server/strategy/s.py",
+        "from server.risk.reconcile import ADOPT_PHRASE" + NL,
+        "recon-adopt",
+    ),
     # ---- 失败即关闭 ----
     "语法错误": ("server/strategy/s.py", "def broken(:\n", "parse-error"),
 }
@@ -582,6 +603,14 @@ ALLOWED: dict[str, tuple[str, str]] = {
     "guard 识别保护性止损": ("server/guard/g.py", "skip = c is OrderClass.PROTECTIVE_STOP\n"),
     "oms 使用止损来源": ("server/oms/p.py", "sid = PROTECTIVE_STOP_SOURCE\n"),
     "api 面板确认调松": ("server/api/panel.py", "store.confirm_loosen(rid)\n"),
+    "api 人工采用基准": (
+        "server/api/panel.py",
+        "await r.adopt_broker_positions(actor=a, confirmation=c)" + NL,
+    ),
+    "对账模块写持仓调整": (
+        "server/risk/reconcile.py",
+        "self._repo.add_position_adjustment(a)" + NL,
+    ),
     "api 急停确认入口": (
         "server/api/panel.py",
         "await c.emergency_flatten(p, actor=a, confirmation=x)" + NL,
