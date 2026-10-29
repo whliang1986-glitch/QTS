@@ -22,6 +22,7 @@ from server.data.provider import (
     UnsupportedCapabilityError,
     check_range,
 )
+from server.data.quality import UNADJUSTED
 from server.domain.corporate_actions import CorporateActionRecord
 from server.domain.market import MarketBar
 
@@ -60,7 +61,7 @@ def synthetic_daily_bars(  # noqa: PLR0913 - 生成参数全部显式给出
                 close=close,
                 volume=Decimal(1_000_000 + index),
                 source=source,
-                adjustment_version="none",
+                adjustment_version=UNADJUSTED,
             )
         )
     return bars

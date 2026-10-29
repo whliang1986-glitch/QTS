@@ -9,6 +9,9 @@
 - 合并与合并后的校验（与湖内已有分区的 schema 冲突、已有分区损坏、合并后不合法）也全部在写入前完成；
   写入前还会复核全部日期的最新版本仍是合并时那一版（防并发写入者）。只有磁盘等写入本身失败、
   或复核与提交之间极短窗口内的并发写入，才会出现“部分日期已写”；已写的日期分区各自完整，重跑幂等补齐。
+- 完整性检查只认日线（首期唯一的周期）；将来加分钟线时须先扩展检查，否则会被全部隔离。
+- 完整性检查（D-05）不通过的 K 线只进原始层（备查），不进标准化层，策略与回测读不到它；
+  某天本标的的 K 线全被隔离时，该日标准化分区不动（不用空行替换已有的数据），问题随结果返回。
 - 首期标准化层只允许单一来源：同日分区里有别的供应商写入的行时拒绝（否则 manifest 的来源、
   授权与 lineage 会把别家的行算在本供应商名下）。多供应商合并在 D-04 / D-05 设计。
 - 只合并本批有 K 线的日期：供应商修订时删掉的 K 线不会被删除（旧行保留），
@@ -18,13 +21,15 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from server.data.calendar import CalendarRangeError, TradingCalendar
 from server.data.lake import UTC_US, DataLake, LakeError, PartitionRef, bars_table, check_bars
 from server.data.provider import (
     PROVIDER_NAME,
@@ -35,6 +40,7 @@ from server.data.provider import (
     UnsupportedCapabilityError,
     check_range,
 )
+from server.data.quality import QualityIssue, check_completeness
 from server.domain.market import MarketBar
 from server.domain.values import to_utc
 
@@ -56,6 +62,7 @@ class IngestResult:
     raw: tuple[PartitionRef, ...]
     normalized: tuple[PartitionRef, ...]
     bars: int
+    quarantined: tuple[QualityIssue, ...] = ()
 
 
 def raw_dataset(provider: str, interval: Interval) -> str:
@@ -130,6 +137,31 @@ def _merge(
     return new.sort_by([("symbol", "ascending"), ("start", "ascending")])
 
 
+def _require_coverage(calendar: TradingCalendar, start: date, end: date) -> None:
+    try:
+        calendar.is_trading_day(start)
+        calendar.is_trading_day(end)
+    except CalendarRangeError as exc:
+        raise IngestError(f"交易日历不覆盖请求区间：{exc}") from exc
+
+
+def _quarantine(
+    batch: BarBatch, calendar: TradingCalendar, as_of: datetime, publish_lag: timedelta
+) -> tuple[set[datetime], list[QualityIssue]]:
+    """完整性检查（D-05）：返回要隔离的 K 线开始时间与问题。
+
+    as_of 取供应商拉取时刻与本机时钟中较早的一个：盘中拉到的当日 K 线、收盘后还没过发布延迟的
+    初步日线都按未完成隔离；供应商时间戳偏快也不会让它们混进标准化层。
+    """
+    try:
+        _, rejected, issues = check_completeness(
+            (i.bar for i in batch.bars), calendar=calendar, as_of=as_of, publish_lag=publish_lag
+        )
+    except CalendarRangeError as exc:
+        raise IngestError(f"交易日历不覆盖请求区间，无法做完整性检查：{exc}") from exc
+    return {b.start for b in rejected}, issues
+
+
 async def ingest_bars(  # noqa: PLR0913 - 周期是可选的关键字参数
     provider: DataProvider,
     lake: DataLake,
@@ -137,10 +169,16 @@ async def ingest_bars(  # noqa: PLR0913 - 周期是可选的关键字参数
     start: date,
     end: date,
     *,
+    calendar: TradingCalendar,
+    publish_lag: timedelta,
     interval: Interval = Interval.DAY,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> IngestResult:
     """拉取 [start, end] 内某标的的 K 线并入湖。供应商异常原样上抛，此时不写任何分区。"""
     check_range(start, end)
+    _require_coverage(calendar, start, end)
+    if publish_lag < timedelta(0):
+        raise IngestError("发布延迟不能为负")
     if not PROVIDER_NAME.fullmatch(provider.name):
         raise IngestError(f"供应商名不合法：{provider.name!r}")
     capabilities = provider.capabilities
@@ -150,9 +188,11 @@ async def ingest_bars(  # noqa: PLR0913 - 周期是可选的关键字参数
     fetched_at, by_day = _validate(
         batch, provider=provider.name, symbol=symbol, start=start, end=end, interval=interval
     )
+    as_of = min(fetched_at, to_utc(clock()))
+    isolated, issues = _quarantine(batch, calendar, as_of, publish_lag)
     raw_name, bars_name = raw_dataset(provider.name, interval), bars_dataset(interval)
     # 阶段一（只在内存中）：建表、与湖内最新版本合并、校验合并结果
-    tables: list[tuple[date, pa.Table, pa.Table, tuple[str | None, str | None]]] = []
+    tables: list[tuple[date, pa.Table, pa.Table | None, tuple[str | None, str | None]]] = []
     for day in sorted(by_day):
         items = sorted(by_day[day], key=lambda i: i.bar.start)
         try:
@@ -164,15 +204,18 @@ async def ingest_bars(  # noqa: PLR0913 - 周期是可选的关键字参数
                 },
                 schema=RAW_BARS_SCHEMA,
             )
-            normalized = bars_table([i.bar for i in items])
+            good = [i.bar for i in items if i.bar.start not in isolated]
+            normalized = bars_table(good) if good else None
         except (pa.ArrowException, LakeError) as exc:
             raise IngestError(f"{symbol} {day} 的 K 线无法按 schema 存储：{exc}") from exc
         try:
             raw_base = lake.latest("raw", raw_name, day)
             bars_base = lake.latest("normalized", bars_name, day)
             raw = _merge(lake, raw_base, raw, symbol, source=None)
-            merged = _merge(lake, bars_base, normalized, symbol, source=provider.name)
-            check_bars(merged, day)
+            merged = None
+            if normalized is not None:
+                merged = _merge(lake, bars_base, normalized, symbol, source=provider.name)
+                check_bars(merged, day)
         except LakeError as exc:
             raise IngestError(f"{day} 无法与湖内已有分区合并：{exc}") from exc
         tables.append((day, raw, merged, (_key(raw_base), _key(bars_base))))
@@ -192,6 +235,9 @@ async def ingest_bars(  # noqa: PLR0913 - 周期是可选的关键字参数
             "raw", raw_name, day, raw, provider=provider.name, fetched_at=fetched_at,
             license_url=capabilities.license_url,
         )  # fmt: skip
+        if merged is None:
+            raw_refs.append(raw_ref)
+            continue
         bar_ref = lake.write_partition(
             "normalized", bars_name, day, merged, provider=provider.name, fetched_at=fetched_at,
             license_url=capabilities.license_url, lineage=[raw_ref.key],
@@ -203,4 +249,5 @@ async def ingest_bars(  # noqa: PLR0913 - 周期是可选的关键字参数
         raw=tuple(raw_refs),
         normalized=tuple(bar_refs),
         bars=len(batch.bars),
+        quarantined=tuple(issues),
     )

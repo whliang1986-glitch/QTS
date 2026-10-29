@@ -24,6 +24,7 @@ from server.data.provider import (
 )
 from server.domain.market import MarketBar
 
+ZERO = timedelta(0)
 CALENDAR = TradingCalendar.nyse(start=date(2026, 9, 1), end=date(2026, 12, 31))
 START, END = date(2026, 10, 5), date(2026, 10, 9)  # 周一到周五，5 个交易日
 FETCHED = datetime(2026, 10, 10, 1, 0, tzinfo=UTC)
@@ -50,7 +51,16 @@ def _files(lake: DataLake) -> list[str]:
 @pytest.mark.asyncio
 async def test_raw_then_normalized_with_lineage_and_license(tmp_path: Path) -> None:
     lake = DataLake(tmp_path)
-    result = await ingest_bars(_provider(), lake, "SPY", START, END)
+    result = await ingest_bars(
+        _provider(),
+        lake,
+        "SPY",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
     assert result.days == (date(2026, 10, 5), date(2026, 10, 6), date(2026, 10, 7),
                            date(2026, 10, 8), date(2026, 10, 9))  # fmt: skip
     assert result.bars == 5
@@ -74,9 +84,27 @@ async def test_raw_then_normalized_with_lineage_and_license(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_rerun_is_idempotent(tmp_path: Path) -> None:
     lake = DataLake(tmp_path)
-    first = await ingest_bars(_provider(), lake, "SPY", START, END)
+    first = await ingest_bars(
+        _provider(),
+        lake,
+        "SPY",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
     files = _files(lake)
-    second = await ingest_bars(_provider(), lake, "SPY", START, END)
+    second = await ingest_bars(
+        _provider(),
+        lake,
+        "SPY",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
     assert _files(lake) == files
     assert [r.key for r in second.normalized] == [r.key for r in first.normalized]
 
@@ -85,8 +113,26 @@ async def test_rerun_is_idempotent(tmp_path: Path) -> None:
 async def test_second_symbol_merges_into_the_same_day_partitions(tmp_path: Path) -> None:
     lake = DataLake(tmp_path)
     provider = _provider(SPY=_bars("SPY"), QQQ=_bars("QQQ", "400.00"))
-    await ingest_bars(provider, lake, "SPY", START, END)
-    result = await ingest_bars(provider, lake, "QQQ", START, END)
+    await ingest_bars(
+        provider,
+        lake,
+        "SPY",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
+    result = await ingest_bars(
+        provider,
+        lake,
+        "QQQ",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
     assert all(ref.manifest.version == 2 for ref in (*result.raw, *result.normalized))
     assert len(lake.read_bars("SPY", START, END)) == 5  # 第一个标的没有丢
     assert len(lake.read_bars("QQQ", START, END)) == 5
@@ -96,10 +142,21 @@ async def test_second_symbol_merges_into_the_same_day_partitions(tmp_path: Path)
 @pytest.mark.asyncio
 async def test_vendor_revision_writes_a_new_version_and_keeps_the_old(tmp_path: Path) -> None:
     lake = DataLake(tmp_path)
-    await ingest_bars(_provider(), lake, "SPY", START, END)
+    await ingest_bars(
+        _provider(),
+        lake,
+        "SPY",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
     pinned = lake.snapshot("bars_1d", START, END)
     revised = _provider(SPY=_bars("SPY", "100.01"))
-    result = await ingest_bars(revised, lake, "SPY", START, END)
+    result = await ingest_bars(
+        revised, lake, "SPY", START, END, calendar=CALENDAR, publish_lag=ZERO, clock=lambda: FETCHED
+    )
     assert all(ref.manifest.version == 2 for ref in result.normalized)
     old = lake.read_bars("SPY", START, END, versions=pinned)
     new = lake.read_bars("SPY", START, END)
@@ -112,8 +169,20 @@ async def test_vendor_revision_writes_a_new_version_and_keeps_the_old(tmp_path: 
 @pytest.mark.asyncio
 async def test_partial_range_only_touches_days_with_bars(tmp_path: Path) -> None:
     lake = DataLake(tmp_path)
-    await ingest_bars(_provider(), lake, "SPY", START, END)
-    result = await ingest_bars(_provider(), lake, "SPY", date(2026, 10, 10), date(2026, 10, 11))
+    await ingest_bars(
+        _provider(),
+        lake,
+        "SPY",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
+    result = await ingest_bars(
+        _provider(), lake, "SPY", date(2026, 10, 10), date(2026, 10, 11),
+        calendar=CALENDAR, publish_lag=ZERO, clock=lambda: FETCHED,
+    )  # fmt: skip
     assert result.days == ()  # 周末：没有 K 线，不写任何分区
     assert result.raw == result.normalized == ()
 
@@ -151,7 +220,8 @@ class _Tampering(FakeDataProvider):
         elif self.change == "volume":
             items[0] = FetchedBar(_with(first.bar, volume=Decimal("1.12345")), first.raw)
         elif self.change == "precision":
-            items[0] = FetchedBar(_with(first.bar, close=Decimal("100.1234567")), first.raw)
+            precise = _with(first.bar, close=first.bar.close + Decimal("0.0000001"))
+            items[0] = FetchedBar(precise, first.raw)
         return replace(batch, bars=tuple(items))
 
 
@@ -176,7 +246,16 @@ async def test_contract_violations_refuse_the_whole_batch(
 ) -> None:
     lake = DataLake(tmp_path)
     with pytest.raises(IngestError, match=match):
-        await ingest_bars(_Tampering(change), lake, "SPY", START, END)
+        await ingest_bars(
+            _Tampering(change),
+            lake,
+            "SPY",
+            START,
+            END,
+            calendar=CALENDAR,
+            publish_lag=ZERO,
+            clock=lambda: FETCHED,
+        )
     assert _files(lake) == []  # 一个分区都没写
 
 
@@ -186,7 +265,16 @@ async def test_provider_failure_propagates_and_writes_nothing(tmp_path: Path) ->
     provider = _provider()
     provider.fail_with = ProviderUnavailableError("维护中")
     with pytest.raises(ProviderUnavailableError):
-        await ingest_bars(provider, lake, "SPY", START, END)
+        await ingest_bars(
+            provider,
+            lake,
+            "SPY",
+            START,
+            END,
+            calendar=CALENDAR,
+            publish_lag=ZERO,
+            clock=lambda: FETCHED,
+        )
     assert _files(lake) == []
 
 
@@ -199,14 +287,32 @@ async def test_unsupported_interval_is_refused_before_fetching(tmp_path: Path) -
 
     provider = _NoDaily(bars={"SPY": _bars("SPY")})
     with pytest.raises(UnsupportedCapabilityError):
-        await ingest_bars(provider, DataLake(tmp_path), "SPY", START, END)
+        await ingest_bars(
+            provider,
+            DataLake(tmp_path),
+            "SPY",
+            START,
+            END,
+            calendar=CALENDAR,
+            publish_lag=ZERO,
+            clock=lambda: FETCHED,
+        )
     assert provider.calls == []
 
 
 @pytest.mark.asyncio
 async def test_inverted_range_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="区间"):
-        await ingest_bars(_provider(), DataLake(tmp_path), "SPY", END, START)
+        await ingest_bars(
+            _provider(),
+            DataLake(tmp_path),
+            "SPY",
+            END,
+            START,
+            calendar=CALENDAR,
+            publish_lag=ZERO,
+            clock=lambda: FETCHED,
+        )
 
 
 def test_capabilities_and_rate_limit_validation() -> None:
@@ -225,10 +331,37 @@ async def test_rerun_after_merging_another_symbol_is_idempotent(tmp_path: Path) 
     """SPY → QQQ → SPY（内容不变）：从 Parquet 读回的他标的行 + 新行，内容哈希必须稳定。"""
     lake = DataLake(tmp_path)
     provider = _provider(SPY=_bars("SPY"), QQQ=_bars("QQQ", "400.00"))
-    await ingest_bars(provider, lake, "SPY", START, END)
-    await ingest_bars(provider, lake, "QQQ", START, END)
+    await ingest_bars(
+        provider,
+        lake,
+        "SPY",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
+    await ingest_bars(
+        provider,
+        lake,
+        "QQQ",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
     files = _files(lake)
-    again = await ingest_bars(provider, lake, "SPY", START, END)
+    again = await ingest_bars(
+        provider,
+        lake,
+        "SPY",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
     assert _files(lake) == files
     assert all(ref.manifest.version == 2 for ref in (*again.raw, *again.normalized))
 
@@ -245,7 +378,16 @@ async def test_incompatible_existing_partition_refuses_the_whole_batch(tmp_path:
     )  # fmt: skip
     before = _files(lake)
     with pytest.raises(IngestError, match="schema"):
-        await ingest_bars(_provider(), lake, "SPY", START, END)
+        await ingest_bars(
+            _provider(),
+            lake,
+            "SPY",
+            START,
+            END,
+            calendar=CALENDAR,
+            publish_lag=ZERO,
+            clock=lambda: FETCHED,
+        )
     assert _files(lake) == before
 
 
@@ -253,7 +395,16 @@ async def test_incompatible_existing_partition_refuses_the_whole_batch(tmp_path:
 async def test_another_providers_rows_are_not_merged(tmp_path: Path) -> None:
     """标准化层首期单一来源：别家写过的日分区不合并，避免来源、授权与 lineage 失真（评审 P1-2）。"""
     lake = DataLake(tmp_path)
-    await ingest_bars(_provider(), lake, "SPY", START, END)
+    await ingest_bars(
+        _provider(),
+        lake,
+        "SPY",
+        START,
+        END,
+        calendar=CALENDAR,
+        publish_lag=ZERO,
+        clock=lambda: FETCHED,
+    )
     before = _files(lake)
     other = FakeDataProvider(
         "other", bars={"QQQ": synthetic_daily_bars(
@@ -261,7 +412,16 @@ async def test_another_providers_rows_are_not_merged(tmp_path: Path) -> None:
         )}, clock=lambda: FETCHED,
     )  # fmt: skip
     with pytest.raises(IngestError, match="其他供应商"):
-        await ingest_bars(other, lake, "QQQ", START, END)
+        await ingest_bars(
+            other,
+            lake,
+            "QQQ",
+            START,
+            END,
+            calendar=CALENDAR,
+            publish_lag=ZERO,
+            clock=lambda: FETCHED,
+        )
     assert _files(lake) == before
 
 
@@ -274,7 +434,14 @@ async def test_invalid_provider_name_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(IngestError, match="供应商名"):
         await ingest_bars(
-            _BadName(bars={"SPY": _bars("SPY")}), DataLake(tmp_path), "SPY", START, END
+            _BadName(bars={"SPY": _bars("SPY")}),
+            DataLake(tmp_path),
+            "SPY",
+            START,
+            END,
+            calendar=CALENDAR,
+            publish_lag=ZERO,
+            clock=lambda: FETCHED,
         )
 
 
@@ -306,7 +473,16 @@ async def test_concurrent_writer_between_merge_and_write_is_detected(tmp_path: P
 
     lake = _Racing(tmp_path)
     with pytest.raises(IngestError, match="别的写入者"):
-        await ingest_bars(_provider(), lake, "SPY", START, END)
+        await ingest_bars(
+            _provider(),
+            lake,
+            "SPY",
+            START,
+            END,
+            calendar=CALENDAR,
+            publish_lag=ZERO,
+            clock=lambda: FETCHED,
+        )
     assert lake.raw_queries == 2  # 确实在复核时插入了改动
     assert lake.partitions("normalized", "bars_1d") == {}
     assert set(lake.partitions("raw", "fake_bars_1d")) == {second}  # 只有别人写的那一天
