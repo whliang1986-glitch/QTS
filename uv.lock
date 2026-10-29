@@ -771,6 +771,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "sqlalchemy" },
+    { name = "tzdata" },
 ]
 
 [package.dev-dependencies]
@@ -796,6 +797,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=21,<23" },
     { name = "pydantic", specifier = ">=2.11,<3" },
     { name = "sqlalchemy", specifier = ">=2.0.36,<2.1" },
+    { name = "tzdata", specifier = ">=2024.1" },
 ]
 
 [package.metadata.requires-dev]

@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 
 TICK_SECONDS = 1.0
 LOOKBACK_DAYS = 7  # 日终对账补做最多往回找几天（跨周末、长假）
+CALENDAR_WARN_DAYS = 30  # 交易日历覆盖剩余不足这么多天时，每天告警一次
 
 
 class Calendar(Protocol):
@@ -41,6 +42,9 @@ class Calendar(Protocol):
     def is_open(self, at: datetime) -> bool: ...
 
     def next_session(self, after: datetime) -> Session: ...
+
+    @property
+    def end(self) -> date: ...
 
 
 class Core(Protocol):
@@ -74,6 +78,8 @@ class ScheduleSettings:
     intraday_every: timedelta = timedelta(minutes=5)
     end_of_day_delay: timedelta = timedelta(minutes=10)
     broker_window: BrokerWindow | None = None
+    # 对账超过它仍未返回：记 ERROR（不中途取消）
+    reconcile_timeout: timedelta = timedelta(minutes=2)
 
 
 @dataclass
@@ -83,6 +89,7 @@ class _State:
     eod_done: set[date] = field(default_factory=set)
     eod_retry_at: datetime | None = None  # 日终对账出错后，下一次重试的时刻
     calendar_ok: bool = True  # 日历是否可用（状态变化时才记日志，不每秒刷屏）
+    expiry_warned: date | None = None  # 哪一天已经告警过“日历快到期”
 
 
 class Scheduler:
@@ -99,6 +106,8 @@ class Scheduler:
             raise ValueError("assess_every 与 intraday_every 必须为正")
         if settings.end_of_day_delay < timedelta(0):
             raise ValueError("end_of_day_delay 不能为负")
+        if settings.reconcile_timeout <= timedelta(0):
+            raise ValueError("reconcile_timeout 必须为正")
         self._core = core
         self._calendar = calendar
         self._settings = settings
@@ -111,20 +120,46 @@ class Scheduler:
         return window is not None and window.contains(at)
 
     async def run(self) -> None:
-        """常驻：每 TICK_SECONDS 检查一次到期的任务。"""
-        while True:
-            await self.run_due()
-            await self._sleep(TICK_SECONDS)
+        """常驻：评估与对账是两个独立循环，对账卡住时评估照常（S-01e）。任一循环出错即抛出。"""
+        try:
+            async with asyncio.TaskGroup() as group:
+                group.create_task(self._loop(self.run_assess_due))
+                group.create_task(self._loop(self.run_reconcile_due))
+        except ExceptionGroup as group_error:  # 让 tradingd 的日志看到根因，而不是 ExceptionGroup
+            raise group_error.exceptions[0] from group_error
+
+    async def _loop(self, step: Callable[[], Awaitable[list[str]]]) -> None:
+        try:
+            while True:
+                await step()
+                await self._sleep(TICK_SECONDS)
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling() > 0:
+                raise  # 确实是外部（tradingd 停止）在取消
+            # 内部冒出来的取消（券商库、被别处取消的任务）：
+            # TaskGroup 会把“已取消”的子任务当作正常结束，
+            # 循环就悄悄停了。改成出错，让调度器整体抛出、tradingd 按崩溃退出（S-01e 评审 P1-1）。
+            raise RuntimeError("调度循环被意外取消") from None
 
     async def run_due(self) -> list[str]:
-        """跑一次到期的任务，返回跑了哪些（测试与日志用）。"""
+        """跑一次到期的任务（评估在前），返回跑了哪些（测试与日志用）。"""
+        return [*await self.run_assess_due(), *await self.run_reconcile_due()]
+
+    async def run_assess_due(self) -> list[str]:
+        now = self._clock()
+        state = self._state
+        if state.next_assess is not None and now < state.next_assess:
+            return []
+        self._core.assess()
+        state.next_assess = now + self._settings.assess_every
+        self._warn_if_calendar_expiring(now)
+        return ["assess"]
+
+    async def run_reconcile_due(self) -> list[str]:
         now = self._clock()
         done: list[str] = []
         state = self._state
-        if state.next_assess is None or now >= state.next_assess:
-            self._core.assess()
-            state.next_assess = now + self._settings.assess_every
-            done.append("assess")
         sessions = self._recent_sessions(now)
         if sessions is None:
             return done
@@ -133,13 +168,14 @@ class Scheduler:
             await self._reconcile(ReconKind.INTRADAY)
             state.last_intraday = now
             done.append("intraday")
+            now = self._clock()  # 对账可能花了不少时间
         pending = self._eod_pending(now, sessions)
         if pending is not None and (state.eod_retry_at is None or now >= state.eod_retry_at):
             if await self._reconcile(ReconKind.END_OF_DAY):
                 state.eod_done.add(pending.day)
                 state.eod_retry_at = None
-            else:  # 出错：按盘中对账的间隔重试，不把这一天记为已做
-                state.eod_retry_at = now + self._settings.intraday_every
+            else:  # 出错：按盘中对账的间隔重试（从失败那一刻算），不把这一天记为已做
+                state.eod_retry_at = self._clock() + self._settings.intraday_every
             done.append("end_of_day")
         return done
 
@@ -173,10 +209,50 @@ class Scheduler:
             return True
         return now - last >= self._settings.intraday_every
 
-    async def _reconcile(self, kind: ReconKind) -> bool:
-        """返回对账是否正常跑完（有没有差异另说：差异由对账模块自己 SAFE HALT）。"""
+    def _warn_if_calendar_expiring(self, now: datetime) -> None:
+        """日历覆盖快到头：每天告警一次。到期后对账会暂停（失败即关闭），需要重启 tradingd 续期。"""
+        if self._state.expiry_warned == now.date():
+            return  # 每天最多一次（包括“读不到覆盖范围”）
         try:
-            clean = await self._core.reconcile(kind)
+            left = (self._calendar.end - now.date()).days
+        except Exception as exc:
+            self._state.expiry_warned = now.date()
+            log_event(log, logging.ERROR, "读不到交易日历的覆盖范围", error=type(exc).__name__)
+            return
+        if left < 0:
+            self._state.expiry_warned = now.date()
+            log_event(log, logging.ERROR, "交易日历已到期，对账已暂停，请重启 tradingd 续期",
+                      days_over=-left)  # fmt: skip
+        elif left < CALENDAR_WARN_DAYS:
+            self._state.expiry_warned = now.date()
+            log_event(log, logging.WARNING, "交易日历即将到期，请重启 tradingd 续期",
+                      days_left=left)  # fmt: skip
+
+    async def _reconcile(self, kind: ReconKind) -> bool:
+        """返回对账是否正常跑完（有没有差异另说：差异由对账模块自己 SAFE HALT）。
+
+        - 超过 reconcile_timeout 仍未返回：调度器自己不放弃它（不重发、不另起一次），
+          每隔 reconcile_timeout 记一次 ERROR（带已等待时长），直到它返回；
+          评估在另一个循环里照常进行。
+        - 调度器被取消（tradingd 停止）：一并取消这次对账并等它结束，不留孤儿任务
+          （否则它会在券商断开后继续跑，写出误报的 SAFE HALT）。对账开始时已清空上次结果，
+          中途取消不会沿用旧结论；下次启动会先对账。
+        """
+        task = asyncio.ensure_future(self._core.reconcile(kind))
+        limit = self._settings.reconcile_timeout.total_seconds()
+        waited = 0.0
+        try:
+            finished, _ = await asyncio.wait({task}, timeout=limit)
+            while not finished:
+                waited += limit
+                log_event(log, logging.ERROR, "对账超时仍未返回，继续等待", kind=kind.value,
+                          waited_seconds=int(waited))  # fmt: skip
+                finished, _ = await asyncio.wait({task}, timeout=limit)
+            clean = task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.wait({task})
+            raise
         except Exception as exc:
             log_event(log, logging.ERROR, "调度的对账出错，稍后重试", kind=kind.value,
                       error=type(exc).__name__)  # fmt: skip
