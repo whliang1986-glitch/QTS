@@ -1,0 +1,13 @@
+# tradingd 的调度（S-01d）。普通运行配置。交易时段、提前收市、节假日一律由交易日历决定，这里不写开收盘时刻。
+
+[schedule]
+assess_seconds = 15                # 例行评估运行状态（健康、券商窗口、对账结果）
+intraday_reconcile_minutes = 5     # 常规时段内的盘中对账间隔（V4.1：每 5 分钟）
+end_of_day_delay_minutes = 10      # 收盘后多久做日终对账（等最后的成交回报到齐）
+
+# 券商（IB Gateway）每日自动重启的窗口：必须与 IBC / Gateway 里设置的自动重启时间一致。
+# 窗口内拒绝新增风险、不做盘中对账。时区写明，换算由系统时区库完成（Windows 与 macOS 一致）。
+[schedule.broker_restart]
+timezone = "America/New_York"
+start = "23:45"
+minutes = 15

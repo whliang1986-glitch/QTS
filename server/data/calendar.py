@@ -166,6 +166,14 @@ class TradingCalendar:
             day += timedelta(days=1)
         raise CalendarRangeError(f"{after} 之后在日历范围内没有交易时段")
 
+    def session_day(self, at: datetime) -> date:
+        """at 这一刻对应的交易时段（当日有效的 DAY 订单按它归属）：盘中是当天，否则是下一个时段。"""
+        moment = _require_aware(at)
+        session = self.session(moment.date())
+        if session is not None and session.open <= moment < session.close:
+            return session.day
+        return self.next_session(moment).day
+
     def sessions_between(self, first: date, last: date) -> Iterator[Session]:
         self._check_day(first)
         self._check_day(last)

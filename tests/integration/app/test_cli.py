@@ -132,3 +132,96 @@ def test_tighter_values_are_accepted(tmp_path: Path) -> None:
     settings = parse(tmp_path, text)
     assert settings.guard_timeout == timedelta(seconds=60)
     assert settings.workerd_max_age == timedelta(seconds=120)
+
+
+# ---------- S-01d：调度配置 ----------
+
+SCHEDULE = """
+[schedule]
+assess_seconds = 15
+intraday_reconcile_minutes = 5
+end_of_day_delay_minutes = 10
+
+[schedule.broker_restart]
+timezone = "America/New_York"
+start = "23:45"
+minutes = 15
+"""
+
+
+def parse_schedule(tmp_path: Path, text: str) -> object:
+    from server.app.settings import parse_schedule_settings  # noqa: PLC0415
+
+    path = tmp_path / "schedule.toml"
+    path.write_text(text, encoding="utf-8")
+    return parse_schedule_settings(load_toml(path, name="schedule"))
+
+
+def test_repository_schedule_loads() -> None:
+    from server.app.__main__ import DEFAULT_SCHEDULE  # noqa: PLC0415
+    from server.app.settings import parse_schedule_settings  # noqa: PLC0415
+
+    schedule = parse_schedule_settings(load_toml(DEFAULT_SCHEDULE, name="schedule"))
+    assert schedule.intraday_every == timedelta(minutes=5)
+    assert schedule.broker_window is not None
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("intraday_reconcile_minutes = 5", "intraday_reconcile_minutes = 6"),  # 不得调疏
+        ("intraday_reconcile_minutes = 5", "intraday_reconcile_minutes = 0"),
+        ("assess_seconds = 15", "assess_seconds = 0"),
+        ("end_of_day_delay_minutes = 10", "end_of_day_delay_minutes = -1"),
+        ('timezone = "America/New_York"', 'timezone = "Mars/Olympus"'),
+        ('start = "23:45"', 'start = "24:00"'),
+        ('start = "23:45"', 'start = "9:30"'),
+        ("minutes = 15\n", "minutes = 121\n"),
+        ("minutes = 15\n", "minutes = 15\nextra = 1\n"),
+        ("[schedule]\n", "[schedule]\nunknown = 1\n"),
+    ],
+)
+def test_bad_schedule_is_refused(tmp_path: Path, old: str, new: str) -> None:
+    with pytest.raises(ConfigError):
+        parse_schedule(tmp_path, SCHEDULE.replace(old, new))
+
+
+def test_missing_schedule_makes_tradingd_refuse(tmp_path: Path) -> None:
+    good = tmp_path / "processes.toml"
+    good.write_text(GOOD, encoding="utf-8")
+    missing = tmp_path / "nope.toml"
+    assert main(["tradingd", "--config", str(good), "--schedule", str(missing)]) == EXIT_REFUSED
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("assess_seconds = 15", "assess_seconds = 16"),  # 评估不得调疏
+        ("end_of_day_delay_minutes = 10", "end_of_day_delay_minutes = 61"),  # 日终不得拖过 1 小时
+        ('timezone = "America/New_York"', 'timezone = "america/new_york"'),  # 大小写两系统一致
+        ('timezone = "America/New_York"', 'timezone = "America"'),  # 目录名不是时区
+    ],
+)
+def test_schedule_limits_and_strict_time_zones(tmp_path: Path, old: str, new: str) -> None:
+    with pytest.raises(ConfigError):
+        parse_schedule(tmp_path, SCHEDULE.replace(old, new))
+
+
+def test_scheduler_and_core_share_one_calendar_and_window() -> None:
+    """S-01d 评审 P1-4：调度器与交易核心的日历、券商窗口同源。"""
+    from datetime import UTC, date, datetime  # noqa: PLC0415
+
+    from server.app.__main__ import DEFAULT_SCHEDULE, production_time  # noqa: PLC0415
+    from server.app.common import AdapterNotAvailableError  # noqa: PLC0415
+    from server.app.settings import parse_schedule_settings  # noqa: PLC0415
+
+    schedule = parse_schedule_settings(load_toml(DEFAULT_SCHEDULE, name="schedule"))
+    time = production_time(schedule, date(2026, 10, 28))
+    scheduler = time.scheduler(object())
+    assert scheduler._calendar is time.calendar
+    window = schedule.broker_window
+    assert window is not None
+    moment = datetime(2026, 10, 29, 3, 50, tzinfo=UTC)  # 23:50 ET：窗口内
+    assert time.broker_window(moment) is scheduler.in_broker_window(moment) is True
+    with pytest.raises(AdapterNotAvailableError, match="broker_window"):
+        time.inputs()
