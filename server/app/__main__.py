@@ -34,6 +34,7 @@ from server.app.tradingd import (
 )
 from server.app.workerd import WorkerdSettings, run_workerd
 from server.data.calendar import TradingCalendar
+from server.data.calendar_config import parse_calendar_overrides
 from server.platforms import LocalChannel, PlatformError, local_channel
 from server.risk.assembly import CoreInputs
 from server.storage.config import ConfigError, load_toml
@@ -41,6 +42,7 @@ from server.storage.config import ConfigError, load_toml
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "config" / "runtime" / "processes.toml"
 DEFAULT_SCHEDULE = ROOT / "config" / "runtime" / "schedule.toml"
+DEFAULT_CALENDAR_OVERRIDES = ROOT / "config" / "runtime" / "calendar_overrides.toml"
 CHILDREN = ("tradingd", "workerd", "guardd")
 CHILD_ARGV = (sys.executable, "-m", "server.app")
 
@@ -70,15 +72,58 @@ class TimeWiring:
         )
 
 
-def production_time(schedule: ScheduleSettings, today: date) -> TimeWiring:
-    """NYSE 交易日历覆盖前 7 天到后约 13 个月。
+def production_time(
+    schedule: ScheduleSettings,
+    today: date,
+    overrides: Path = DEFAULT_CALENDAR_OVERRIDES,
+    *,
+    required: bool = False,
+) -> TimeWiring:
+    """NYSE 交易日历：覆盖前 7 天到后约 13 个月，并叠加临时休市 / 提前收市登记（S-01f）。
 
-    受保护配置里的临时休市 / 提前收市登记在 D 组接入前不加载（日历库自带的节假日照常生效）。
+    - 登记文件不存在：required（命令行显式指定了路径）时拒绝；否则视为没有登记并记 WARNING；
+    - 路径读不了（权限、父路径不是目录等）、格式或内容有误（含试图新增开市、推迟收盘、
+      登记在本就休市的日子）、登记晚于覆盖范围（基本是笔误）：
+      抛 ConfigError / ValueError，拒绝启动（78）；
+    - 早于覆盖范围的旧登记不影响当前日历：忽略并记日志，不因过期的旧登记挡住启动。
     """
+    log = logging.getLogger(__name__)
+    start, end = today - timedelta(days=7), today + timedelta(days=400)
+    closures: frozenset[date] = frozenset()
+    early: dict[date, datetime] = {}
+    try:
+        overrides.stat()
+        present = True
+    except FileNotFoundError:
+        present = False
+    except OSError as exc:  # 不能把“读不了”当成“没有登记”
+        raise ConfigError(f"无法读取临时日历登记 {overrides}：{exc}") from exc
+    if not present:
+        if required:
+            raise ConfigError(f"指定的临时日历登记文件不存在：{overrides.resolve()}")
+        log.warning("没有临时日历登记文件（%s），只用日历库自带的节假日", overrides.resolve())
+    else:
+        closures, early = parse_calendar_overrides(load_toml(overrides, name="calendar"))
+        later = sorted(d for d in {*closures, *early} if d > end)
+        if later:
+            raise ConfigError(f"临时日历登记晚于覆盖范围（{end} 之后），多半是笔误：{later}")
+        older = sorted(d for d in {*closures, *early} if d < start)
+        if older:
+            log.warning("临时日历登记早于覆盖范围，忽略：%s", older)
+        closures = frozenset(d for d in closures if d >= start)
+        early = {d: t for d, t in early.items() if d >= start}
     calendar = TradingCalendar.nyse(
-        start=today - timedelta(days=7), end=today + timedelta(days=400)
+        start=start, end=end, adhoc_closures=closures, adhoc_early_closes=early
     )
     return TimeWiring(calendar, schedule)
+
+
+def child_arguments(config: Path, root: Path, schedule: Path, overrides: Path) -> tuple[str, ...]:
+    """守护进程拉起子进程时透传的参数（绝对路径）：子进程用的配置与守护进程校验过的完全一致。"""
+    return (
+        "--config", str(config.resolve()), "--root", str(root.resolve()),
+        "--schedule", str(schedule.resolve()), "--calendar-overrides", str(overrides.resolve()),
+    )  # fmt: skip
 
 
 def load(config: Path, channel: LocalChannel, root: Path = ROOT) -> ProcessSettings:
@@ -87,14 +132,13 @@ def load(config: Path, channel: LocalChannel, root: Path = ROOT) -> ProcessSetti
     )
 
 
-async def _run(  # noqa: PLR0913 - 命令行解析后的全部输入
+async def _run(
     command: str,
     *,
     settings: ProcessSettings,
     time: TimeWiring,
     channel: LocalChannel,
-    config: Path,
-    root: Path,
+    child_args: tuple[str, ...],
 ) -> int:
     stop = asyncio.Event()
     if command == "tradingd":
@@ -118,10 +162,7 @@ async def _run(  # noqa: PLR0913 - 命令行解析后的全部输入
             check_seconds=settings.guard_check_seconds, timeout=settings.guard_timeout,
         )  # fmt: skip
         return await run_guardd(guard, GuarddDeps(), stop)
-    specs = [
-        ChildSpec(name, (*CHILD_ARGV, name, "--config", str(config), "--root", str(root)))
-        for name in CHILDREN
-    ]
+    specs = [ChildSpec(name, (*CHILD_ARGV, name, *child_args)) for name in CHILDREN]
     outcomes = await Supervisor(specs).run()
     logging.getLogger(__name__).warning("守护进程结束：%s", outcomes)
     return 0
@@ -133,19 +174,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--schedule", type=Path, default=DEFAULT_SCHEDULE)
+    parser.add_argument("--calendar-overrides", type=Path, default=None)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     try:
         channel = local_channel()
         settings = load(args.config, channel, args.root)
         schedule = parse_schedule_settings(load_toml(args.schedule, name="schedule"))
-        time = production_time(schedule, datetime.now(UTC).date())
-    except (ConfigError, PlatformError, ValueError) as exc:  # 日历数据错误同样拒绝启动
+        overrides = args.calendar_overrides or DEFAULT_CALENDAR_OVERRIDES
+        today = datetime.now(UTC).date()
+        time = production_time(
+            schedule, today, overrides, required=args.calendar_overrides is not None
+        )
+    except (ConfigError, PlatformError, ValueError, OSError) as exc:  # 日历数据错误同样拒绝启动
         logging.getLogger(__name__).error("配置或平台不可用，拒绝启动：%s", exc)
         return EXIT_REFUSED
     return asyncio.run(
         _run(args.command, settings=settings, time=time, channel=channel,
-             config=args.config, root=args.root)
+             child_args=child_arguments(args.config, args.root, args.schedule, overrides))
     )  # fmt: skip
 
 
