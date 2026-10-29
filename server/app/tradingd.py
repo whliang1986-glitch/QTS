@@ -10,7 +10,7 @@
 6. 常驻：处理券商回报流、定时写心跳（给 guardd）。
    回报流断开或任何常驻任务出错 → 以崩溃退出（退出码 1），由守护进程退避重启；
    重启后照样先查券商、再对账（S-01a）。
-例行评估、盘中 / 日终对账的调度在 S-01d。
+例行评估、盘中 / 日终对账由调度器（server.app.scheduler，S-01d）作为常驻任务执行。
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from server.app.common import LOCK_WAIT_SECONDS, AdapterNotAvailableError, acquire_lock
+from server.app.scheduler import Scheduler
 from server.app.supervisor import EXIT_BUSY, EXIT_OK, EXIT_REFUSED
 from server.broker.base import BrokerUnavailableError
 from server.guard.heartbeat import HeartbeatFile
@@ -74,6 +75,8 @@ class TradingdDeps:
     broker: Callable[[], Any] = production_broker
     report_health: Callable[[RunStateMachine, Any], None] = lambda _rs, _b: None
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    # 调度器（S-01d）：给定交易核心，返回 Scheduler；None 表示不调度（只用于测试）
+    scheduler: Callable[[Any], Scheduler] | None = None
 
 
 async def run_tradingd(settings: TradingdSettings, deps: TradingdDeps, stop: asyncio.Event) -> int:
@@ -171,6 +174,8 @@ async def _serve(
         raise BrokerUnavailableError("券商回报流结束")
 
     tasks = [asyncio.create_task(beat()), asyncio.create_task(events())]
+    if deps.scheduler is not None:  # 调度器出错同样按崩溃退出
+        tasks.append(asyncio.create_task(deps.scheduler(assembled.core).run()))
     stopper = asyncio.create_task(stop.wait())
     try:
         done, _ = await asyncio.wait([*tasks, stopper], return_when=asyncio.FIRST_COMPLETED)

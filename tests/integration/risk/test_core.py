@@ -814,3 +814,45 @@ async def test_redelivery_of_an_issued_intent_replays_even_when_old(env: Env) ->
     never = reduce_intent(env, "never", created_at=env.clock() - timedelta(minutes=6))
     with pytest.raises(IntakeError, match="防追单"):
         await core.submit_intent(never)  # 从未签发的旧意图照样拒绝
+
+
+@pytest.mark.asyncio
+async def test_day_intents_expire_across_trading_sessions(env: Env) -> None:
+    """S-01d：当日有效（DAY）的意图跨交易时段作废；日历查不到也拒绝（失败即关闭）。"""
+    from datetime import date  # noqa: PLC0415
+
+    from server.data.calendar import TradingCalendar  # noqa: PLC0415
+
+    cal = TradingCalendar.nyse(start=date(2026, 10, 1), end=date(2026, 12, 31))
+    rig = Rig(env)
+
+    def core_with(session_day: Any) -> TradingCore:
+        return TradingCore(
+            env.repo, env.om, rig.modes, mode_config=config(), broker_account=env.broker.account,
+            engine=rig.engine, reconciler=rig.recon, run_state=rig.run_state,
+            emergency=rig.emergency, context=rig.provider, clock=env.clock,
+            session_day=session_day,
+        )  # fmt: skip
+
+    core = core_with(cal.session_day)
+    rig.healthy()
+    await core.start()
+    # 现在是 2026-10-23（周五）盘中；前一天盘中生成的 DAY 意图已过期
+    with pytest.raises(IntakeError, match="跨交易时段"):
+        await core.submit_intent(
+            reduce_intent(env, "yday", created_at=env.clock() - timedelta(days=1))
+        )
+    same = reduce_intent(env, "today", created_at=env.clock() - timedelta(hours=3))  # 盘前
+    assert (await core.submit_intent(same)).decision is not None
+    gtd = reduce_intent(env, "gtd", created_at=env.clock() - timedelta(days=1),
+                        time_in_force=TimeInForce.GTD,
+                        expires_at=env.clock() + timedelta(days=1))  # fmt: skip
+    assert (await core.submit_intent(gtd)).decision is not None  # 指定到期的单不受这条约束
+
+    def broken(_at: Any) -> Any:
+        raise RuntimeError("日历超出范围")
+
+    other = core_with(broken)
+    other._ready = True  # 只验证入口的过期判断
+    with pytest.raises(IntakeError, match="无法判断"):
+        await other.submit_intent(reduce_intent(env, "x"))

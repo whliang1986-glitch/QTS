@@ -104,9 +104,7 @@ if sys.platform == "linux":
 
             try:
                 server = await asyncio.start_unix_server(connected, path=address)
-            except (
-                OSError
-            ) as exc:  # 目录不存在、无权限、路径被占：失败即关闭，交给上层按平台错误处理
+            except OSError as exc:  # 目录不存在、无权限、路径被占：失败即关闭
                 raise PlatformError(f"无法在 {address} 上监听：{exc}") from exc
             try:
                 os.chmod(path, SOCKET_MODE)

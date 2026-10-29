@@ -16,12 +16,15 @@ import argparse
 import asyncio
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from server.app.common import AdapterNotAvailableError
 from server.app.guardd import GuarddDeps, GuarddSettings, run_guardd
-from server.app.settings import ProcessSettings, parse_process_settings
+from server.app.scheduler import Scheduler, ScheduleSettings
+from server.app.settings import ProcessSettings, parse_process_settings, parse_schedule_settings
 from server.app.supervisor import EXIT_REFUSED, ChildSpec, Supervisor
 from server.app.tradingd import (
     TradingdDeps,
@@ -29,12 +32,14 @@ from server.app.tradingd import (
     run_tradingd,
 )
 from server.app.workerd import WorkerdSettings, run_workerd
+from server.data.calendar import TradingCalendar
 from server.platforms import LocalChannel, PlatformError, local_channel
 from server.risk.assembly import CoreInputs
 from server.storage.config import ConfigError, load_toml
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "config" / "runtime" / "processes.toml"
+DEFAULT_SCHEDULE = ROOT / "config" / "runtime" / "schedule.toml"
 CHILDREN = ("tradingd", "workerd", "guardd")
 CHILD_ARGV = (sys.executable, "-m", "server.app")
 
@@ -45,14 +50,32 @@ def production_inputs() -> CoreInputs:
     )
 
 
+def production_scheduler(schedule: ScheduleSettings) -> Callable[[Any], Scheduler]:
+    """生产调度：config/runtime/schedule.toml + NYSE 交易日历（覆盖未来约 13 个月）。
+
+    受保护配置里的临时休市 / 提前收市登记在 D 组接入前不加载（日历库自带的节假日照常生效）。
+    """
+    today = datetime.now(UTC).date()
+    calendar = TradingCalendar.nyse(
+        start=today - timedelta(days=7), end=today + timedelta(days=400)
+    )
+    return lambda core: Scheduler(core, calendar, schedule)
+
+
 def load(config: Path, channel: LocalChannel, root: Path = ROOT) -> ProcessSettings:
     return parse_process_settings(
         load_toml(config, name="processes"), base=root, me=channel.current_account()
     )
 
 
-async def _run(
-    command: str, settings: ProcessSettings, channel: LocalChannel, config: Path, root: Path
+async def _run(  # noqa: PLR0913 - 命令行解析后的全部输入
+    command: str,
+    *,
+    settings: ProcessSettings,
+    schedule: ScheduleSettings,
+    channel: LocalChannel,
+    config: Path,
+    root: Path,
 ) -> int:
     stop = asyncio.Event()
     if command == "tradingd":
@@ -61,7 +84,8 @@ async def _run(
             allowed=settings.allowed(), heartbeat_seconds=settings.heartbeat_seconds,
             instance=settings.instance,
         )  # fmt: skip
-        return await run_tradingd(trading, TradingdDeps(channel, production_inputs), stop)
+        deps = TradingdDeps(channel, production_inputs, scheduler=production_scheduler(schedule))
+        return await run_tradingd(trading, deps, stop)
     if command == "workerd":
         worker = WorkerdSettings(
             runtime_dir=settings.runtime_dir, meta_path=settings.meta,
@@ -89,15 +113,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("command", choices=("supervise", *CHILDREN))
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument("--schedule", type=Path, default=DEFAULT_SCHEDULE)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     try:
         channel = local_channel()
         settings = load(args.config, channel, args.root)
+        schedule = parse_schedule_settings(load_toml(args.schedule, name="schedule"))
     except (ConfigError, PlatformError) as exc:
         logging.getLogger(__name__).error("配置或平台不可用，拒绝启动：%s", exc)
         return EXIT_REFUSED
-    return asyncio.run(_run(args.command, settings, channel, args.config, args.root))
+    return asyncio.run(
+        _run(args.command, settings=settings, schedule=schedule, channel=channel,
+             config=args.config, root=args.root)
+    )  # fmt: skip
 
 
 if __name__ == "__main__":

@@ -9,12 +9,15 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from server.app.scheduler import BrokerWindow, ScheduleSettings
 from server.ipc.protocol import Role
 from server.storage.config import ConfigError, LoadedConfig
 
@@ -109,10 +112,62 @@ def _account(value: Any, key: str, me: str) -> str:
     return me if value == SELF else value
 
 
+# ---------- 调度（S-01d） ----------
+
+_SCHEDULE_KEYS = {
+    "assess_seconds",
+    "intraday_reconcile_minutes",
+    "end_of_day_delay_minutes",
+    "broker_restart",
+}
+_WINDOW_KEYS = {"timezone", "start", "minutes"}
+MAX_INTRADAY_MINUTES = 5  # V4.1：盘中对账至少每 5 分钟一次；只能调密，不能调疏
+MAX_WINDOW_MINUTES = 120
+
+
+def parse_schedule_settings(loaded: LoadedConfig) -> ScheduleSettings:
+    table = loaded.only_table("schedule")
+    if set(table) != _SCHEDULE_KEYS:
+        raise ConfigError(f"[schedule] 的键必须恰好是：{sorted(_SCHEDULE_KEYS)}")
+    assess = _positive_int(table["assess_seconds"], "assess_seconds")
+    intraday = _positive_int(table["intraday_reconcile_minutes"], "intraday_reconcile_minutes")
+    if intraday > MAX_INTRADAY_MINUTES:
+        raise ConfigError(f"intraday_reconcile_minutes 不得超过 {MAX_INTRADAY_MINUTES}")
+    delay = table["end_of_day_delay_minutes"]
+    if type(delay) is not int or delay < 0:
+        raise ConfigError("end_of_day_delay_minutes 必须是非负整数")
+    return ScheduleSettings(
+        assess_every=timedelta(seconds=assess),
+        intraday_every=timedelta(minutes=intraday),
+        end_of_day_delay=timedelta(minutes=delay),
+        broker_window=_broker_window(table["broker_restart"]),
+    )
+
+
+def _broker_window(raw: Any) -> BrokerWindow:
+    if not isinstance(raw, Mapping) or set(raw) != _WINDOW_KEYS:
+        raise ConfigError(f"[schedule.broker_restart] 的键必须恰好是：{sorted(_WINDOW_KEYS)}")
+    name, start, minutes = raw["timezone"], raw["start"], raw["minutes"]
+    if not isinstance(name, str) or not name:
+        raise ConfigError("broker_restart.timezone 必须是时区名，例如 America/New_York")
+    try:
+        zone = ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ConfigError(f"broker_restart.timezone 不认识：{name}") from exc
+    if not isinstance(start, str) or not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", start):
+        raise ConfigError("broker_restart.start 必须写成 HH:MM（24 小时制）")
+    length = _positive_int(minutes, "broker_restart.minutes")
+    if length > MAX_WINDOW_MINUTES:
+        raise ConfigError(f"broker_restart.minutes 不得超过 {MAX_WINDOW_MINUTES}")
+    hour, minute = (int(part) for part in start.split(":"))
+    return BrokerWindow(zone, time(hour, minute), timedelta(minutes=length))
+
+
 __all__ = (
     "MAX_GUARD_TIMEOUT",
     "MAX_INTENT_AGE",
     "SELF",
     "ProcessSettings",
     "parse_process_settings",
+    "parse_schedule_settings",
 )

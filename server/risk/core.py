@@ -25,11 +25,11 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from server.domain.account import Account
-from server.domain.enums import OrderClass
+from server.domain.enums import OrderClass, TimeInForce
 from server.domain.orders import EMERGENCY_FLATTEN_SOURCE, PROTECTIVE_STOP_SOURCE, OrderIntent
 from server.oms.manager import OrderManager
 from server.risk.context import LedgerContextProvider
@@ -92,10 +92,12 @@ class TradingCore:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         actor: str = "tradingd",
         intent_max_age: timedelta | None = None,
+        session_day: Callable[[datetime], date] | None = None,
     ) -> None:
         if intent_max_age is not None and intent_max_age <= timedelta(0):
             raise ValueError("intent_max_age 必须为正")
         self._intent_max_age = intent_max_age
+        self._session_day = session_day
         self._repo = repo
         self._oms = oms
         self._modes = modes
@@ -177,6 +179,13 @@ class TradingCore:
             age = now - intent.created_at
             if age > self._intent_max_age or age < -INTENT_FUTURE_TOLERANCE:
                 raise IntakeError("意图生成时间太久或在未来，按过期拒绝（防追单）")
+        if self._session_day is not None and intent.time_in_force is TimeInForce.DAY:
+            try:
+                same = self._session_day(intent.created_at) == self._session_day(now)
+            except Exception as exc:  # 日历查不到：失败即关闭
+                raise IntakeError(f"无法判断当日意图所属的交易时段：{type(exc).__name__}") from exc
+            if not same:
+                raise IntakeError("当日有效的意图已跨交易时段，按过期拒绝（防追单）")
 
     # ---------- 命令 ----------
 

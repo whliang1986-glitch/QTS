@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -59,6 +59,7 @@ class CoreInputs:
     corporate_actions: CorporateActionSource
     broker_window: Callable[[datetime], bool]
     degraded_allowed: Mapping[str, frozenset[str]]
+    session_day: Callable[[datetime], date] | None = None  # 交易日历：当日意图跨时段作废
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
 
@@ -116,6 +117,7 @@ def build_trading_core(repo: LedgerRepository, broker: Any, inputs: CoreInputs) 
         repo, om, modes, mode_config=inputs.mode_config, broker_account=broker.account,
         engine=engine, reconciler=reconciler, run_state=run_state, emergency=emergency,
         context=provider, clock=clock, intent_max_age=INTENT_MAX_AGE,
+        session_day=inputs.session_day,
     )  # fmt: skip
     return Assembled(core, modes, run_state, reconciler)
 
