@@ -12,6 +12,8 @@ dependencies = [
     "pyarrow>=21,<23",
     "pydantic>=2.11,<3",
     "sqlalchemy>=2.0.36,<2.1",
+    # zoneinfo 在 Windows 上没有系统时区库，全靠 tzdata（S-01e：显式声明，不依赖 pandas 的传递依赖）
+    "tzdata>=2024.1",
 ]
 
 [dependency-groups]

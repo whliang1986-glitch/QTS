@@ -81,6 +81,11 @@ class TradingCalendar:
         self._start = start
         self._end = end
 
+    @property
+    def end(self) -> date:
+        """日历覆盖的最后一天（含）；之后的查询一律抛 CalendarRangeError。"""
+        return self._end
+
     @classmethod
     def nyse(
         cls,
