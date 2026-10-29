@@ -1,10 +1,21 @@
-"""文件与目录权限的平台差异（S-01b 起：业务代码不得自己判断操作系统）。"""
+"""文件与目录的平台差异（S-01b 起：业务代码不得自己判断操作系统）。
+
+- lock_directory：把目录设为只读（数据湖分区封存）。
+- InstanceLock：单实例锁（S-01c）。同一把锁同一时刻只能被一个进程持有，
+  用来保证 tradingd 是账本的唯一写者、guardd / workerd 不会起两份。
+  进程退出（含崩溃）时操作系统自动释放，不会留下“死锁文件”。
+  Windows 用 msvcrt.locking，Linux 用 fcntl.flock；macOS 尚未实现（P-MAC），明确报错。
+"""
 
 from __future__ import annotations
 
 import os
 import stat
+import sys
 from pathlib import Path
+from types import TracebackType
+
+from server.platforms.base import PlatformError, PlatformNotImplementedError
 
 
 def lock_directory(directory: Path) -> bool:
@@ -19,4 +30,107 @@ def lock_directory(directory: Path) -> bool:
     return True
 
 
-__all__ = ("lock_directory",)
+PRIVATE_DIR_MODE = 0o750  # 属主读写进入，同组只读进入，其他人无权限
+
+
+def ensure_private_dir(directory: Path) -> Path:
+    """建好运行目录（含父目录）；POSIX 上收紧为 0750，Windows 沿用用户目录的继承权限。
+
+    目录已存在但不是目录、或建不起来、或权限设不上：抛 PlatformError（失败即关闭）。
+    """
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.is_dir():
+            raise PlatformError(f"{directory} 不是目录")
+        if os.name != "nt":
+            directory.chmod(PRIVATE_DIR_MODE)
+    except OSError as exc:
+        raise PlatformError(f"无法准备运行目录 {directory}：{exc}") from exc
+    return directory
+
+
+class InstanceLockedError(PlatformError):
+    """锁已被另一个实例持有。"""
+
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _try_lock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # 锁第 0 个字节；已被锁时立即抛 OSError
+
+    def _unlock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+elif sys.platform == "linux":
+    import fcntl
+
+    def _try_lock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+else:
+
+    def _try_lock(fd: int) -> None:
+        raise PlatformNotImplementedError(f"{sys.platform} 的单实例锁尚未实现（P-MAC）")
+
+    def _unlock(fd: int) -> None:
+        raise PlatformNotImplementedError(f"{sys.platform} 的单实例锁尚未实现（P-MAC）")
+
+
+class InstanceLock:
+    """单实例锁：with InstanceLock(path): ...；拿不到锁抛 InstanceLockedError。"""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fd: int | None = None
+
+    def acquire(self) -> InstanceLock:
+        if self._fd is not None:
+            raise PlatformError("同一个锁对象不能重复获取")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            _try_lock(fd)
+        except OSError as exc:
+            os.close(fd)
+            raise InstanceLockedError(f"{self._path} 已被另一个实例持有") from exc
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        return self
+
+    def release(self) -> None:
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            _unlock(fd)
+        finally:
+            os.close(fd)
+
+    @property
+    def held(self) -> bool:
+        return self._fd is not None
+
+    def __enter__(self) -> InstanceLock:
+        return self.acquire()
+
+    def __exit__(
+        self, kind: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        self.release()
+
+
+__all__ = (
+    "PRIVATE_DIR_MODE",
+    "InstanceLock",
+    "InstanceLockedError",
+    "ensure_private_dir",
+    "lock_directory",
+)

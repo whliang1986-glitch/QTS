@@ -756,3 +756,61 @@ async def test_program_identities_are_refused_through_the_core(env: Env, actor: 
         "r-a", "adopt_baseline", {"confirmation": ADOPT_PHRASE}, actor=actor
     )
     assert not adopt.ok
+
+
+@pytest.mark.asyncio
+async def test_intent_age_limit_is_enforced_by_tradingd(env: Env) -> None:
+    """S-01c 评审 P1-3：tradingd 入口按自己的时钟限龄（太旧、离谱地超前都拒绝；限值只能为正）。"""
+    rig = Rig(env)
+    core = TradingCore(
+        env.repo, env.om, rig.modes, mode_config=config(), broker_account=env.broker.account,
+        engine=rig.engine, reconciler=rig.recon, run_state=rig.run_state,
+        emergency=rig.emergency, context=rig.provider, clock=env.clock,
+        intent_max_age=timedelta(minutes=5),
+    )  # fmt: skip
+    rig.healthy()
+    await core.start()
+    with pytest.raises(IntakeError, match="防追单"):
+        await core.submit_intent(
+            reduce_intent(env, "old", created_at=env.clock() - timedelta(minutes=6))
+        )
+    with pytest.raises(IntakeError, match="防追单"):
+        await core.submit_intent(
+            reduce_intent(env, "future", created_at=env.clock() + timedelta(seconds=10))
+        )
+    edge = reduce_intent(env, "edge", created_at=env.clock() - timedelta(minutes=5))
+    assert (await core.submit_intent(edge)).decision is not None  # 恰好 5 分钟仍接受
+    with pytest.raises(ValueError, match="intent_max_age"):
+        TradingCore(
+            env.repo, env.om, rig.modes, mode_config=config(), broker_account=env.broker.account,
+            engine=rig.engine, reconciler=rig.recon, run_state=rig.run_state,
+            emergency=rig.emergency, intent_max_age=timedelta(0),
+        )  # fmt: skip
+
+
+@pytest.mark.asyncio
+async def test_redelivery_of_an_issued_intent_replays_even_when_old(env: Env) -> None:
+    """S-01c 第二轮评审 P1-A：已签发的意图在限龄之后重投，返回原决定，不被回答成“过期拒绝”。"""
+    rig = Rig(env)
+    core = TradingCore(
+        env.repo, env.om, rig.modes, mode_config=config(), broker_account=env.broker.account,
+        engine=rig.engine, reconciler=rig.recon, run_state=rig.run_state,
+        emergency=rig.emergency, context=rig.provider, clock=env.clock,
+        intent_max_age=timedelta(minutes=5),
+    )  # fmt: skip
+    rig.healthy()
+    await core.start()
+    await rig.recon.adopt_broker_positions(actor="dylan", confirmation=ADOPT_PHRASE)
+    await core.command("r-recon", "reconcile", {}, actor="dylan")
+    assert (await core.command("r-resume", "resume", {}, actor="dylan")).ok
+    intent = reduce_intent(env, "issued", created_at=env.clock())
+    first = await core.submit_intent(intent)
+    assert first.decision.verdict is V.ALLOW
+    assert env.repo.issuance_for("issued") is not None
+    env.clock.advance(10 * 60)  # 回答丢了，10 分钟后才重投
+    again = await core.submit_intent(intent)
+    assert again.decision.decision_id == first.decision.decision_id
+    assert len(env.repo.risk_decisions_for("issued")) == 1
+    never = reduce_intent(env, "never", created_at=env.clock() - timedelta(minutes=6))
+    with pytest.raises(IntakeError, match="防追单"):
+        await core.submit_intent(never)  # 从未签发的旧意图照样拒绝
