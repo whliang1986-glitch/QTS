@@ -6,6 +6,7 @@ import subprocess
 import sys
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from server.app.__main__ import DEFAULT_CONFIG, ROOT, main
@@ -225,3 +226,180 @@ def test_scheduler_and_core_share_one_calendar_and_window() -> None:
     assert time.broker_window(moment) is scheduler.in_broker_window(moment) is True
     with pytest.raises(AdapterNotAvailableError, match="broker_window"):
         time.inputs()
+
+
+# ---------- S-01f：临时休市 / 提前收市登记（只能更严） ----------
+
+
+def _time(tmp_path: Path, text: str | None) -> object:
+    from datetime import date  # noqa: PLC0415
+
+    from server.app.__main__ import DEFAULT_SCHEDULE, production_time  # noqa: PLC0415
+    from server.app.settings import parse_schedule_settings  # noqa: PLC0415
+
+    schedule = parse_schedule_settings(load_toml(DEFAULT_SCHEDULE, name="schedule"))
+    path = tmp_path / "calendar_overrides.toml"
+    if text is not None:
+        path.write_text(text, encoding="utf-8")
+    return production_time(schedule, date(2026, 10, 29), path)
+
+
+def test_repository_overrides_file_loads_and_changes_nothing() -> None:
+    from datetime import date  # noqa: PLC0415
+
+    from server.app.__main__ import (  # noqa: PLC0415
+        DEFAULT_CALENDAR_OVERRIDES,
+        DEFAULT_SCHEDULE,
+        production_time,
+    )
+    from server.app.settings import parse_schedule_settings  # noqa: PLC0415
+
+    schedule = parse_schedule_settings(load_toml(DEFAULT_SCHEDULE, name="schedule"))
+    time = production_time(schedule, date(2026, 10, 29), DEFAULT_CALENDAR_OVERRIDES)
+    assert time.calendar.session(date(2026, 12, 24)) is not None  # 仓库里没有任何登记
+
+
+def test_missing_overrides_file_means_no_overrides(tmp_path: Path) -> None:
+    from datetime import date  # noqa: PLC0415
+
+    time = _time(tmp_path, None)
+    assert time.calendar.session(date(2026, 12, 24)) is not None  # type: ignore[attr-defined]
+
+
+def test_closures_and_early_closes_are_applied_to_the_shared_calendar(tmp_path: Path) -> None:
+    from datetime import UTC, date, datetime  # noqa: PLC0415
+
+    time: Any = _time(
+        tmp_path,
+        "[calendar]\nadhoc_closures = [2026-12-24]\n\n"
+        "[[calendar.adhoc_early_closes]]\ndate = 2026-12-23\nclose = 12:00:00\n",
+    )
+    assert time.calendar.session(date(2026, 12, 24)) is None  # 整天休市
+    early = time.calendar.session(date(2026, 12, 23))
+    assert early.close == datetime(2026, 12, 23, 17, 0, tzinfo=UTC) and early.early_close
+    assert time.scheduler(object())._calendar is time.calendar  # 调度器与交易核心同源
+
+
+CAL_ERR = "calendar"  # CalendarDataError（只能更严的构造校验）
+CFG_ERR = "config"  # ConfigError（解析与格式）
+EARLY = "[[calendar.adhoc_early_closes]]\ndate = {d}\nclose = {t}\n"
+BOTH = "[calendar]\nadhoc_closures = [2026-12-24]\n\n" + EARLY.format(d="2026-12-24", t="12:00:00")
+
+
+@pytest.mark.parametrize(
+    ("text", "kind", "match"),
+    [
+        ("[calendar]\nadhoc_closures = [2026-12-25]\n", CAL_ERR, "本就不是交易日"),  # 圣诞
+        ("[calendar]\nadhoc_closures = [2026-11-01]\n", CAL_ERR, "本就不是交易日"),  # 周日
+        (EARLY.format(d="2026-12-23", t="17:00:00"), CAL_ERR, "只能提前"),  # 推迟收盘
+        (EARLY.format(d="2026-12-23", t="16:00:00"), CAL_ERR, "只能提前"),  # 等于原收盘
+        (EARLY.format(d="2026-12-23", t="09:00:00"), CAL_ERR, "晚于开盘"),  # 早于开盘
+        (EARLY.format(d="2026-12-26", t="12:00:00"), CAL_ERR, "不是交易日"),  # 周六＝新增开市
+        (EARLY.format(d="2026-11-27", t="13:30:00"), CAL_ERR, "只能提前"),  # 已提前的日子再推迟
+        ("[calendar]\nadhoc_closures = [2026-12-24, 2026-12-24]\n", CFG_ERR, "重复"),
+        ("[calendar]\nadhoc_closures = [2026-12-24T00:00:00]\n", CFG_ERR, "本地日期"),
+        ("[calendar]\nadhoc_openings = [2026-12-25]\n", CFG_ERR, "未知字段"),  # 想新增开市日
+        (BOTH, CAL_ERR, "同时登记"),
+        ("[calendar]\nadhoc_closures = [2062-12-24]\n", CFG_ERR, "晚于覆盖范围"),  # 年份笔误
+        ("not toml at all", CFG_ERR, "TOML"),
+    ],
+)
+def test_loosening_or_malformed_overrides_are_refused(
+    tmp_path: Path, text: str, kind: str, match: str
+) -> None:
+    from server.data.calendar import CalendarDataError  # noqa: PLC0415
+
+    error: type[Exception] = CalendarDataError if kind == CAL_ERR else ConfigError
+    with pytest.raises(error, match=match):
+        _time(tmp_path, text)
+
+
+def test_earlier_close_on_an_already_short_day_is_accepted(tmp_path: Path) -> None:
+    from datetime import UTC, date, datetime  # noqa: PLC0415
+
+    time: Any = _time(tmp_path, "[calendar]\n" + EARLY.format(d="2026-11-27", t="12:00:00"))
+    close = time.calendar.session(date(2026, 11, 27)).close
+    assert close == datetime(2026, 11, 27, 17, 0, tzinfo=UTC)
+
+
+def test_early_close_during_daylight_saving_time(tmp_path: Path) -> None:
+    """夏令时（EDT，UTC-4）期间的提前收市：13:00 ET = 17:00 UTC。"""
+    from datetime import UTC, date, datetime  # noqa: PLC0415
+
+    time: Any = _time(tmp_path, "[calendar]\n" + EARLY.format(d="2027-06-15", t="13:00:00"))
+    close = time.calendar.session(date(2027, 6, 15)).close
+    assert close == datetime(2027, 6, 15, 17, 0, tzinfo=UTC)
+
+
+def test_stale_entries_before_the_coverage_are_ignored(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from datetime import date  # noqa: PLC0415
+
+    caplog.set_level("WARNING")
+    time: Any = _time(tmp_path, "[calendar]\nadhoc_closures = [2025-12-24, 2026-12-24]\n")
+    assert time.calendar.session(date(2026, 12, 24)) is None  # 范围内的照常生效
+    assert any("早于覆盖范围" in r.getMessage() for r in caplog.records)
+
+
+def test_unreadable_overrides_are_refused(tmp_path: Path) -> None:
+    from datetime import date  # noqa: PLC0415
+
+    from server.app.__main__ import DEFAULT_SCHEDULE, production_time  # noqa: PLC0415
+    from server.app.settings import parse_schedule_settings  # noqa: PLC0415
+
+    schedule = parse_schedule_settings(load_toml(DEFAULT_SCHEDULE, name="schedule"))
+    folder = tmp_path / "calendar_overrides.toml"
+    folder.mkdir()  # 是目录而不是文件
+    with pytest.raises(ConfigError):
+        production_time(schedule, date(2026, 10, 29), folder)
+    bom = tmp_path / "bom.toml"
+    bom.write_bytes(b"\xef\xbb\xbf[calendar]\nadhoc_closures = []\n")
+    with pytest.raises(ConfigError, match="BOM"):
+        production_time(schedule, date(2026, 10, 29), bom)
+
+
+def test_explicit_missing_path_is_refused_default_missing_is_not(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from datetime import date  # noqa: PLC0415
+
+    from server.app.__main__ import DEFAULT_SCHEDULE, production_time  # noqa: PLC0415
+    from server.app.settings import parse_schedule_settings  # noqa: PLC0415
+
+    schedule = parse_schedule_settings(load_toml(DEFAULT_SCHEDULE, name="schedule"))
+    missing = tmp_path / "typo.toml"
+    with pytest.raises(ConfigError, match="不存在"):
+        production_time(schedule, date(2026, 10, 29), missing, required=True)
+    caplog.set_level("WARNING")
+    production_time(schedule, date(2026, 10, 29), missing)
+    assert any("没有临时日历登记文件" in r.getMessage() for r in caplog.records)
+
+
+def test_children_receive_the_same_validated_paths(tmp_path: Path) -> None:
+    """守护进程把校验过的 --schedule 与 --calendar-overrides 透传给子进程（绝对路径）。"""
+    from server.app.__main__ import child_arguments  # noqa: PLC0415
+
+    args = child_arguments(Path("c.toml"), Path("."), Path("s.toml"), tmp_path / "o.toml")
+    pairs = dict(zip(args[::2], args[1::2], strict=True))
+    assert set(pairs) == {"--config", "--root", "--schedule", "--calendar-overrides"}
+    assert all(Path(v).is_absolute() for v in pairs.values())
+    assert pairs["--calendar-overrides"] == str((tmp_path / "o.toml").resolve())
+
+
+def test_bad_overrides_make_tradingd_refuse(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """登记有误：启动校验阶段就以 78 拒绝，日志写明是日历登记的问题（不是适配器缺失）。"""
+    good = tmp_path / "processes.toml"
+    good.write_text(GOOD, encoding="utf-8")
+    bad = tmp_path / "calendar_overrides.toml"
+    bad.write_text("[calendar]\nadhoc_closures = [2026-12-25]\n", encoding="utf-8")
+    caplog.set_level("ERROR")
+    assert main(["tradingd", "--config", str(good), "--calendar-overrides", str(bad)]) == (
+        EXIT_REFUSED
+    )
+    assert any(
+        "配置或平台不可用" in r.getMessage() and "不是交易日" in r.getMessage()
+        for r in caplog.records
+    )
