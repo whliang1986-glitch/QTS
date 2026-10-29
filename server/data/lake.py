@@ -479,6 +479,18 @@ class DataLake:
         """重新计算内容哈希，与 manifest 不符即报错（数据被改动）。"""
         self._read_verified(ref)
 
+    def read_partition(self, ref: PartitionRef) -> pa.Table:
+        """读整个分区（校验哈希后解析）：入湖合并同日分区时用（D-01a）。"""
+        return self._read_verified(ref)
+
+    def latest(self, layer: str, dataset: str, day: date) -> PartitionRef | None:
+        """某日期分区的最新版本；没有分区或没有版本时返回 None。"""
+        if layer not in IMMUTABLE_LAYERS:
+            raise LakeError(f"按日期分区只用于 {IMMUTABLE_LAYERS}")
+        _check(_NAME, dataset, "数据集名")
+        refs = self._versions(self.root / layer / dataset / f"date={day.isoformat()}")
+        return refs[-1] if refs else None
+
     def read_bars(
         self,
         symbol: str,
@@ -619,6 +631,14 @@ class DataLake:
         for target in targets:
             _rmtree(target)
         return targets
+
+
+def check_bars(table: pa.Table, day: date) -> None:
+    """写入前预检标准化 K 线分区（与 write_partition 的检查相同），不合法抛 LakeError。"""
+    try:
+        _check_bars(_canonical(table), day)
+    except (pa.ArrowException, ValueError, TypeError) as exc:
+        raise LakeError(f"{day} 的 K 线分区不合法：{exc}") from exc
 
 
 def _check_bars(table: pa.Table, day: date) -> None:
