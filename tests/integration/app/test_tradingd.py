@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -23,6 +23,7 @@ from server.app.tradingd import (
     TradingdSettings,
     run_tradingd,
 )
+from server.data.calendar import TradingCalendar
 from server.guard.heartbeat import HeartbeatFile
 from server.ipc.protocol import Role
 from server.ipc.transport import Endpoints, connect_role
@@ -48,6 +49,7 @@ def _channel() -> LocalChannel | None:
 
 
 CHANNEL = _channel()
+CALENDAR = TradingCalendar.nyse(start=date(2026, 10, 1), end=date(2026, 12, 31))
 pytestmark = pytest.mark.skipif(CHANNEL is None, reason="当前平台的通道尚未实现")
 
 
@@ -66,6 +68,7 @@ class Daemon:
         )
         self.broker_factory = overrides.pop("broker", lambda: env.broker)
         self.mode_config = overrides.pop("mode_config", config())
+        self.scheduler = overrides.pop("scheduler", None)
         self.stop = asyncio.Event()
         self.task: asyncio.Task[int] | None = None
 
@@ -82,7 +85,7 @@ class Daemon:
             start_of_day_nav=lambda _a: Decimal(200000),
             strategy_drawdown=lambda: {"s": Decimal(0)}, stop_cooldown=dict,
             corporate_actions=Actions(), broker_window=lambda _now: False,
-            degraded_allowed={}, clock=self.env.clock,
+            degraded_allowed={}, session_day=CALENDAR.session_day, clock=self.env.clock,
         )  # fmt: skip
 
     @staticmethod
@@ -94,7 +97,7 @@ class Daemon:
         assert CHANNEL is not None
         return TradingdDeps(
             channel=CHANNEL, inputs=self.inputs, broker=self.broker_factory,
-            report_health=self.healthy, clock=self.env.clock,
+            report_health=self.healthy, clock=self.env.clock, scheduler=self.scheduler,
         )  # fmt: skip
 
     def start(self) -> asyncio.Task[int]:
@@ -354,3 +357,79 @@ async def test_missing_runtime_directory_is_created_privately(env: Env, tmp_path
         assert stat.S_IMODE(nested.stat().st_mode) == PRIVATE_DIR_MODE
     daemon.stop.set()
     assert await asyncio.wait_for(task, 10) == EXIT_OK
+
+
+# ---------- S-01d：调度器作为 tradingd 的常驻任务 ----------
+
+
+@pytest.mark.asyncio
+async def test_scheduler_runs_assess_and_intraday_reconcile_inside_tradingd(
+    env: Env, tmp_path: Path
+) -> None:
+    """测试时钟固定在 2026-10-23（周五）14:00 UTC，正在常规时段内：调度器评估并做盘中对账。"""
+    from datetime import date  # noqa: PLC0415
+
+    from server.app.scheduler import Scheduler, ScheduleSettings  # noqa: PLC0415
+    from server.data.calendar import TradingCalendar  # noqa: PLC0415
+
+    cal = TradingCalendar.nyse(start=date(2026, 10, 1), end=date(2026, 12, 31))
+    calls: list[str] = []
+
+    class Spy:
+        def __init__(self, core: Any) -> None:
+            self.core = core
+
+        def assess(self) -> str:
+            calls.append("assess")
+            return str(self.core.assess())
+
+        async def reconcile(self, kind: Any) -> bool:
+            calls.append(kind.value)
+            return bool(await self.core.reconcile(kind))
+
+    def factory(core: Any) -> Scheduler:
+        return Scheduler(Spy(core), cal, ScheduleSettings(), clock=env.clock)
+
+    daemon = Daemon(env, tmp_path, scheduler=factory)
+    task = daemon.start()
+    await (await daemon.connect(Role.WORKERD)).close()
+    for _ in range(100):
+        if "INTRADAY" in calls:
+            break
+        await asyncio.sleep(0.05)
+    assert calls[:2] == ["assess", "INTRADAY"]
+    daemon.stop.set()
+    assert await asyncio.wait_for(task, 10) == EXIT_OK
+
+
+@pytest.mark.asyncio
+async def test_scheduler_crash_is_a_tradingd_crash(env: Env, tmp_path: Path) -> None:
+    class Broken:
+        async def run(self) -> None:
+            raise RuntimeError("调度器坏了")
+
+    daemon = Daemon(env, tmp_path, scheduler=lambda _core: Broken())
+    assert await asyncio.wait_for(daemon.start(), 10) == EXIT_CRASH
+
+
+@pytest.mark.asyncio
+async def test_assembled_core_rejects_day_intents_from_an_earlier_session(
+    env: Env, tmp_path: Path
+) -> None:
+    """装配层出来的交易核心确实接了交易日历（S-01d 评审 P1-1）：前一个时段生成的当日意图被拒。"""
+    daemon = Daemon(env, tmp_path)
+    task = daemon.start()
+    worker = await daemon.connect(Role.WORKERD)
+    yday = env.make_intent("yday", quantity=Decimal(1), created_at=env.clock() - timedelta(days=1))
+    answer = await worker.submit_intent(yday)
+    assert answer["refused"] is True
+    await worker.close()
+    daemon.stop.set()
+    assert await asyncio.wait_for(task, 10) == EXIT_OK
+
+
+def test_core_inputs_require_a_session_calendar() -> None:
+    import dataclasses  # noqa: PLC0415
+
+    fields = {f.name: f for f in dataclasses.fields(CoreInputs)}
+    assert fields["session_day"].default is dataclasses.MISSING  # 必填，不能悄悄关掉

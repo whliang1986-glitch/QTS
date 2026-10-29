@@ -16,8 +16,9 @@ import argparse
 import asyncio
 import logging
 import sys
-from collections.abc import Callable, Sequence
-from datetime import UTC, datetime, timedelta
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -44,22 +45,40 @@ CHILDREN = ("tradingd", "workerd", "guardd")
 CHILD_ARGV = (sys.executable, "-m", "server.app")
 
 
-def production_inputs() -> CoreInputs:
-    raise AdapterNotAvailableError(
-        "行情、账户同步等数据源尚未接入（B-03 / D 组），tradingd 拒绝启动"
-    )
+@dataclass(frozen=True)
+class TimeWiring:
+    """生产时间来源：一份交易日历、一个券商窗口，调度器与交易核心共用（S-01d 评审 P1-4）。"""
+
+    calendar: TradingCalendar
+    schedule: ScheduleSettings
+
+    def scheduler(self, core: Any) -> Scheduler:
+        return Scheduler(core, self.calendar, self.schedule)
+
+    def broker_window(self, at: datetime) -> bool:
+        window = self.schedule.broker_window
+        return window is not None and window.contains(at)
+
+    def inputs(self) -> CoreInputs:
+        """交易核心的数据来源：broker_window 与 session_day 必须取自这里（与调度器同源）。
+
+        行情、账户同步等在 B-03 / D 组接入前不可用：拒绝启动。
+        """
+        raise AdapterNotAvailableError(
+            "行情、账户同步等数据源尚未接入（B-03 / D 组），tradingd 拒绝启动；"
+            "接入时 broker_window=self.broker_window、session_day=self.calendar.session_day"
+        )
 
 
-def production_scheduler(schedule: ScheduleSettings) -> Callable[[Any], Scheduler]:
-    """生产调度：config/runtime/schedule.toml + NYSE 交易日历（覆盖未来约 13 个月）。
+def production_time(schedule: ScheduleSettings, today: date) -> TimeWiring:
+    """NYSE 交易日历覆盖前 7 天到后约 13 个月。
 
     受保护配置里的临时休市 / 提前收市登记在 D 组接入前不加载（日历库自带的节假日照常生效）。
     """
-    today = datetime.now(UTC).date()
     calendar = TradingCalendar.nyse(
         start=today - timedelta(days=7), end=today + timedelta(days=400)
     )
-    return lambda core: Scheduler(core, calendar, schedule)
+    return TimeWiring(calendar, schedule)
 
 
 def load(config: Path, channel: LocalChannel, root: Path = ROOT) -> ProcessSettings:
@@ -72,7 +91,7 @@ async def _run(  # noqa: PLR0913 - 命令行解析后的全部输入
     command: str,
     *,
     settings: ProcessSettings,
-    schedule: ScheduleSettings,
+    time: TimeWiring,
     channel: LocalChannel,
     config: Path,
     root: Path,
@@ -84,7 +103,7 @@ async def _run(  # noqa: PLR0913 - 命令行解析后的全部输入
             allowed=settings.allowed(), heartbeat_seconds=settings.heartbeat_seconds,
             instance=settings.instance,
         )  # fmt: skip
-        deps = TradingdDeps(channel, production_inputs, scheduler=production_scheduler(schedule))
+        deps = TradingdDeps(channel, time.inputs, scheduler=time.scheduler)
         return await run_tradingd(trading, deps, stop)
     if command == "workerd":
         worker = WorkerdSettings(
@@ -120,11 +139,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         channel = local_channel()
         settings = load(args.config, channel, args.root)
         schedule = parse_schedule_settings(load_toml(args.schedule, name="schedule"))
-    except (ConfigError, PlatformError) as exc:
+        time = production_time(schedule, datetime.now(UTC).date())
+    except (ConfigError, PlatformError, ValueError) as exc:  # 日历数据错误同样拒绝启动
         logging.getLogger(__name__).error("配置或平台不可用，拒绝启动：%s", exc)
         return EXIT_REFUSED
     return asyncio.run(
-        _run(args.command, settings=settings, schedule=schedule, channel=channel,
+        _run(args.command, settings=settings, time=time, channel=channel,
              config=args.config, root=args.root)
     )  # fmt: skip
 

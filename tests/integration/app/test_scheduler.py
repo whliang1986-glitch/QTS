@@ -50,7 +50,8 @@ def make(at: datetime, **kw: Any) -> tuple[Scheduler, Core, Clock]:
 @pytest.mark.asyncio
 async def test_assess_runs_on_its_own_interval() -> None:
     sched, _core, clock = make(OPEN - timedelta(hours=3))
-    assert await sched.run_due() == ["assess"]
+    # 刚启动：评估，并补做最近一个已收盘时段（10-27）的日终对账
+    assert await sched.run_due() == ["assess", "end_of_day"]
     clock.now += timedelta(seconds=10)
     assert await sched.run_due() == []
     clock.now += timedelta(seconds=5)
@@ -75,12 +76,39 @@ async def test_intraday_reconcile_every_five_minutes_only_in_session() -> None:
 @pytest.mark.asyncio
 async def test_end_of_day_once_after_close() -> None:
     sched, core, clock = make(CLOSE + timedelta(minutes=5))
-    assert "end_of_day" not in await sched.run_due()  # 收盘后 10 分钟才做
+    await sched.run_due()  # 启动时补做 10-27 的日终对账
+    assert core.calls.count("END_OF_DAY") == 1
+    clock.now = CLOSE + timedelta(minutes=9)
+    assert "end_of_day" not in await sched.run_due()  # 收盘后 10 分钟才做当天的
     clock.now = CLOSE + timedelta(minutes=10)
     assert "end_of_day" in await sched.run_due()
     clock.now += timedelta(hours=1)
     assert "end_of_day" not in await sched.run_due()  # 同一天只做一次
-    assert core.calls.count("END_OF_DAY") == 1
+    assert core.calls.count("END_OF_DAY") == 2
+
+
+@pytest.mark.asyncio
+async def test_end_of_day_failure_is_retried_not_marked_done() -> None:
+    """日终对账出错：不记为已做，按盘中间隔重试，成功后才算（评审 P1-2）。"""
+    sched, core, clock = make(CLOSE + timedelta(minutes=10))
+    core.fail = True
+    assert "end_of_day" in await sched.run_due()
+    clock.now += timedelta(minutes=1)
+    assert "end_of_day" not in await sched.run_due()  # 还没到重试时刻
+    clock.now += timedelta(minutes=4)
+    core.fail = False
+    assert "end_of_day" in await sched.run_due()  # 重试成功
+    clock.now += timedelta(minutes=10)
+    assert "end_of_day" not in await sched.run_due()
+    assert core.calls.count("END_OF_DAY") == 2
+
+
+@pytest.mark.asyncio
+async def test_restart_after_utc_midnight_still_catches_up() -> None:
+    """10-28 收盘后、UTC 午夜之后（美东 21:00）才重启：仍补做 10-28 的日终对账（评审 P1-2）。"""
+    sched, core, _ = make(datetime(2026, 10, 29, 1, 0, tzinfo=UTC))
+    assert "end_of_day" in await sched.run_due()
+    assert core.calls == ["assess", "END_OF_DAY"]
 
 
 @pytest.mark.asyncio
@@ -92,25 +120,28 @@ async def test_restart_after_close_catches_up_end_of_day() -> None:
 
 @pytest.mark.asyncio
 async def test_early_close_is_driven_by_the_calendar() -> None:
-    """感恩节次日 2026-11-27 13:00 ET 提前收市：日终对账跟着日历走，不硬编码 16:00。"""
+    """感恩节次日 2026-11-27 13:00 ET 提前收市：盘中对账与日终对账跟着日历走，不硬编码 16:00。"""
     early_close = datetime(2026, 11, 27, 18, 0, tzinfo=UTC)  # 13:00 ET（冬令时）
     session = CAL.session(date(2026, 11, 27))
     assert session is not None and session.close == early_close and session.early_close
-    sched, _core, clock = make(early_close + timedelta(minutes=10))
-    assert "end_of_day" in await sched.run_due()
-    clock.now = early_close - timedelta(minutes=1)
-    sched2, _core2, _ = make(early_close - timedelta(minutes=1))
-    assert "intraday" in await sched2.run_due()
+    before, _core, _ = make(early_close - timedelta(minutes=1))
+    assert "intraday" in await before.run_due()
+    after, _core, _ = make(early_close + timedelta(hours=2))  # 15:00 ET：平常还在盘中
+    done = await after.run_due()
+    assert "intraday" not in done and "end_of_day" in done
 
 
 @pytest.mark.asyncio
-async def test_holiday_and_weekend_do_nothing_but_assess() -> None:
-    thanksgiving = datetime(2026, 11, 26, 16, 0, tzinfo=UTC)
-    sched, _core, _ = make(thanksgiving)
-    assert await sched.run_due() == ["assess"]
-    saturday = datetime(2026, 10, 31, 16, 0, tzinfo=UTC)
-    sched, _core, _ = make(saturday)
-    assert await sched.run_due() == ["assess"]
+async def test_holiday_and_weekend_have_no_intraday_reconcile() -> None:
+    for moment in (
+        datetime(2026, 11, 26, 16, 0, tzinfo=UTC),  # 感恩节
+        datetime(2026, 10, 31, 16, 0, tzinfo=UTC),  # 周六
+    ):
+        sched, core, clock = make(moment)
+        await sched.run_due()  # 只会补做前一个交易日的日终对账
+        assert "INTRADAY" not in core.calls
+        clock.now += timedelta(minutes=30)
+        assert await sched.run_due() == ["assess"]
 
 
 @pytest.mark.asyncio
@@ -146,7 +177,7 @@ def test_broker_window_crosses_midnight_in_its_own_time_zone() -> None:
 
 @pytest.mark.asyncio
 async def test_no_intraday_reconcile_inside_the_broker_window() -> None:
-    noon = datetime(2026, 10, 28, 12, 0, tzinfo=ET)
+    noon = datetime(2026, 10, 28, 16, 0, tzinfo=UTC)  # 12:00 ET
     window = BrokerWindow(ET, time(11, 55), timedelta(minutes=15))
     sched, _core, _ = make(noon, broker_window=window)
     assert sched.in_broker_window(noon)

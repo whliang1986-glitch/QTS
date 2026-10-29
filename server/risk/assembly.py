@@ -59,7 +59,8 @@ class CoreInputs:
     corporate_actions: CorporateActionSource
     broker_window: Callable[[datetime], bool]
     degraded_allowed: Mapping[str, frozenset[str]]
-    session_day: Callable[[datetime], date] | None = None  # 交易日历：当日意图跨时段作废
+    # 交易日历：当日有效的意图跨时段作废。必填，不提供就装配不出交易核心（S-01d 评审 P1-1）
+    session_day: Callable[[datetime], date]
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
 

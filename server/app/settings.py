@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import time, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from server.app.scheduler import BrokerWindow, ScheduleSettings
 from server.ipc.protocol import Role
@@ -122,6 +122,8 @@ _SCHEDULE_KEYS = {
 }
 _WINDOW_KEYS = {"timezone", "start", "minutes"}
 MAX_INTRADAY_MINUTES = 5  # V4.1：盘中对账至少每 5 分钟一次；只能调密，不能调疏
+MAX_ASSESS_SECONDS = 15  # 例行评估至少每 15 秒一次
+MAX_EOD_DELAY_MINUTES = 60  # 日终对账最晚收盘后 1 小时
 MAX_WINDOW_MINUTES = 120
 
 
@@ -130,12 +132,14 @@ def parse_schedule_settings(loaded: LoadedConfig) -> ScheduleSettings:
     if set(table) != _SCHEDULE_KEYS:
         raise ConfigError(f"[schedule] 的键必须恰好是：{sorted(_SCHEDULE_KEYS)}")
     assess = _positive_int(table["assess_seconds"], "assess_seconds")
+    if assess > MAX_ASSESS_SECONDS:
+        raise ConfigError(f"assess_seconds 不得超过 {MAX_ASSESS_SECONDS}")
     intraday = _positive_int(table["intraday_reconcile_minutes"], "intraday_reconcile_minutes")
     if intraday > MAX_INTRADAY_MINUTES:
         raise ConfigError(f"intraday_reconcile_minutes 不得超过 {MAX_INTRADAY_MINUTES}")
     delay = table["end_of_day_delay_minutes"]
-    if type(delay) is not int or delay < 0:
-        raise ConfigError("end_of_day_delay_minutes 必须是非负整数")
+    if type(delay) is not int or not 0 <= delay <= MAX_EOD_DELAY_MINUTES:
+        raise ConfigError(f"end_of_day_delay_minutes 必须是 0 到 {MAX_EOD_DELAY_MINUTES} 的整数")
     return ScheduleSettings(
         assess_every=timedelta(seconds=assess),
         intraday_every=timedelta(minutes=intraday),
@@ -150,9 +154,11 @@ def _broker_window(raw: Any) -> BrokerWindow:
     name, start, minutes = raw["timezone"], raw["start"], raw["minutes"]
     if not isinstance(name, str) or not name:
         raise ConfigError("broker_restart.timezone 必须是时区名，例如 America/New_York")
+    if name not in available_timezones():  # 精确匹配：Windows 不区分大小写的文件系统也不放过
+        raise ConfigError(f"broker_restart.timezone 不认识：{name}")
     try:
         zone = ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
+    except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
         raise ConfigError(f"broker_restart.timezone 不认识：{name}") from exc
     if not isinstance(start, str) or not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", start):
         raise ConfigError("broker_restart.start 必须写成 HH:MM（24 小时制）")
