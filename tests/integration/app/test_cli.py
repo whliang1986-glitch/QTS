@@ -88,7 +88,7 @@ def test_extra_top_level_tables_are_refused(tmp_path: Path) -> None:
 def test_bad_config_makes_every_command_refuse(tmp_path: Path) -> None:
     bad = tmp_path / "bad.toml"
     bad.write_text("[processes]\n", encoding="utf-8")
-    for command in ("supervise", "tradingd", "workerd", "guardd"):
+    for command in ("supervise", "tradingd", "apid", "workerd", "guardd"):
         assert main([command, "--config", str(bad)]) == EXIT_REFUSED
 
 

@@ -13,3 +13,12 @@
 | [C-02](C-02.md) | 事件与状态语义 | P0 | ACCEPTED |
 | [C-03](C-03.md) | SQLite 存储层与迁移 | P0 | ACCEPTED |
 | [C-04](C-04.md) | ModeManager 与实盘切换门禁 | P0 | ACCEPTED |
+| [S-02](S-02.md) | REST 与 WebSocket API | P0 | IN REVIEW |
+| [T-09](T-09.md) | 策略库与生命周期注册表（计划补充） | P1 | NOT STARTED |
+| [T-10](T-10.md) | 因子库（计划补充，约 6.5 工日，T-07 之后、T-09 之前） | P1 | NOT STARTED |
+| [T-10a](T-10.md#7-子任务) | 因子数据模型与注册表（1 工日，前置 T-07） | P1 | NOT STARTED |
+| [T-10b](T-10.md#7-子任务) | 因子计算接口与声明式积木（1.5 工日，前置 T-10a、D-07） | P1 | NOT STARTED |
+| [T-10c](T-10.md#7-子任务) | 因子手动添加、停用、删除（1 工日，前置 T-10a、S-02） | P1 | NOT STARTED |
+| [T-10d](T-10.md#7-子任务) | 因子自动验证流水线（2 工日，前置 T-10b、T-04） | P1 | NOT STARTED |
+| [T-10e](T-10.md#7-子任务) | 多重检验校正、报告固化与转正门禁（1 工日，前置 T-10d、T-07） | P1 | NOT STARTED |
+| [T-10f](T-10.md#7-子任务) | AI 因子候选通道（0.5 工日，前置 T-10e） | P1 | NOT STARTED |

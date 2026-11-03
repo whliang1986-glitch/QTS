@@ -3,11 +3,11 @@
 python -m server.app {supervise,tradingd,workerd,guardd} [--config 路径] [--root 目录]；
 --root 是配置里相对路径的基准目录，默认是仓库根目录（测试与多份部署时指定）。
 
-- supervise：守护进程，拉起 tradingd、workerd、guardd 并在崩溃后退避重启（apid 在 S-02 加入）。
+- supervise：守护进程，拉起 tradingd、apid、workerd、guardd 并在崩溃后退避重启。
   由操作系统的服务机制在开机 / 登录时启动它（docs/runbooks/S-01c-services.md）。
 - 其余子命令运行单个进程，退出码供守护进程判断是否重启（0 正常、78 拒绝启动、其他为崩溃）。
 - B-03（IBKR 适配器）与行情、账户同步数据源接入之前，tradingd 与 guardd 的生产入口
-  一律拒绝启动（78），守护进程不会反复拉起它们。
+  一律拒绝启动（78），守护进程不会反复拉起它们；apid 在令牌认证（S-03）接入之前同样拒绝启动。
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from server.app.apid import ApidSettings, run_apid
 from server.app.common import AdapterNotAvailableError
 from server.app.guardd import GuarddDeps, GuarddSettings, run_guardd
 from server.app.scheduler import Scheduler, ScheduleSettings
@@ -43,7 +44,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "config" / "runtime" / "processes.toml"
 DEFAULT_SCHEDULE = ROOT / "config" / "runtime" / "schedule.toml"
 DEFAULT_CALENDAR_OVERRIDES = ROOT / "config" / "runtime" / "calendar_overrides.toml"
-CHILDREN = ("tradingd", "workerd", "guardd")
+CHILDREN = ("tradingd", "apid", "workerd", "guardd")
 CHILD_ARGV = (sys.executable, "-m", "server.app")
 
 
@@ -149,6 +150,12 @@ async def _run(
         )  # fmt: skip
         deps = TradingdDeps(channel, time.inputs, scheduler=time.scheduler)
         return await run_tradingd(trading, deps, stop)
+    if command == "apid":
+        api = ApidSettings(
+            runtime_dir=settings.runtime_dir, ledger_path=settings.ledger,
+            tradingd_account=settings.accounts["tradingd"], instance=settings.instance,
+        )  # fmt: skip
+        return await run_apid(api, channel, stop)
     if command == "workerd":
         worker = WorkerdSettings(
             runtime_dir=settings.runtime_dir, meta_path=settings.meta,
