@@ -20,6 +20,7 @@ from typing import Any
 from pydantic.json_schema import models_json_schema
 from server.api.app import ApiDeps, create_app
 from server.api.models import STREAM_MODELS, StreamAuth
+from server.api.security import MemoryAudit
 
 ROOT = Path(__file__).resolve().parents[1]
 OPENAPI = ROOT / "docs" / "api" / "openapi.json"
@@ -47,7 +48,9 @@ class _Unused:
 
 def openapi() -> dict[str, Any]:
     unused = _Unused()
-    app = create_app(ApiDeps(authenticator=unused, ledger=unused, gateway=unused))
+    app = create_app(
+        ApiDeps(authenticator=unused, ledger=unused, gateway=unused, audit=MemoryAudit())
+    )
     return app.openapi()
 
 

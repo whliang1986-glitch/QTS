@@ -4,7 +4,11 @@
   账本读不了一律 503，不拿空列表冒充“没有订单”（失败即关闭）。
 - 命令：白名单 + 参数键校验后经本机通道交给 tradingd（commands.IpcCommandGateway）；
   操作者取认证结果；结果语义见 commands 模块与 docs/tasks/S-02.md。
-- 认证：每个路由与 WebSocket 都要认证（auth.Authenticator，S-03 实现）；viewer 不能发命令。
+- 认证：每个路由与 WebSocket 都要认证（auth.Authenticator；生产用 api.db 令牌，S-03）；
+  viewer 不能发命令；同一来源认证失败过多即限流（429）。
+- 高危命令须先申请二次确认（security.ConfirmationBook，S-03），tradingd 的确认短语另行核对。
+- 审计（S-03）：认证失败、限流、确认签发与拒绝、命令提交与结果写入 api.db；
+  命令提交的审计写不进去就不转发（503，失败即关闭）。审计里不记参数值（可能含确认短语）。
 - 生产不开放 /docs 与 /openapi.json（expose_docs=False）；OpenAPI 由 scripts/gen_api_types.py 导出。
 """
 
@@ -14,7 +18,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -30,8 +34,10 @@ from server.api.commands import (
     CATALOG,
     CommandError,
     CommandGateway,
+    CommandSpec,
     NotDeliveredError,
     OutcomeUnknownError,
+    Tier,
     check_command,
 )
 from server.api.models import (
@@ -39,6 +45,8 @@ from server.api.models import (
     CommandInfo,
     CommandRequest,
     CommandResponse,
+    ConfirmationRequest,
+    ConfirmationResponse,
     ErrorResponse,
     ExecutionView,
     HaltView,
@@ -47,6 +55,8 @@ from server.api.models import (
     OrderEventView,
     OrderList,
     OrderView,
+    RevokeRequest,
+    RevokeResponse,
     StatusView,
     StreamAuth,
     StreamError,
@@ -55,7 +65,15 @@ from server.api.models import (
     StreamStatus,
     WhoAmI,
 )
+from server.api.security import (
+    Audit,
+    ConfirmationBook,
+    ConfirmationError,
+    FailureLimiter,
+    TokenAdmin,
+)
 from server.domain.orders import Execution, OrderIntent
+from server.storage.apidb import ApiDbError, TokenNotFoundError
 from server.storage.ledger import LedgerRepository, OrderEventRow, OrderSummary
 from server.storage.logs import log_event
 
@@ -73,6 +91,10 @@ class ApiDeps:
     authenticator: Authenticator
     ledger: Callable[[], LedgerRepository]  # 只读账本；打开失败抛出（按 503 处理）
     gateway: CommandGateway
+    audit: Audit  # 生产用 api.db；必须显式给出（不默认落到内存里）
+    tokens: TokenAdmin | None = None  # 在线吊销；None 表示不提供
+    limiter: FailureLimiter = field(default_factory=FailureLimiter)
+    confirmations: ConfirmationBook = field(default_factory=ConfirmationBook)
     stream_interval: float = 1.0  # 事件流轮询账本的间隔（秒）
     auth_timeout: float = 5.0  # WebSocket 连上后必须在这段时间内认证
     expose_docs: bool = False
@@ -93,7 +115,7 @@ def _error(status: int, error: str, *, retry_same: bool = False) -> JSONResponse
 
 
 ERRORS: dict[int | str, dict[str, Any]] = {
-    code: {"model": ErrorResponse} for code in (401, 403, 404, 409, 422, 503, 504)
+    code: {"model": ErrorResponse} for code in (401, 403, 404, 409, 422, 429, 503, 504)
 }
 
 
@@ -119,13 +141,8 @@ def create_app(deps: ApiDeps) -> FastAPI:  # noqa: PLR0915 - 路由集中在一�
         return _error(422, f"请求格式不合法：{', '.join(where)}")
 
     def principal(request: Request, _scheme: Annotated[Any, Depends(bearer)] = None) -> Principal:
-        token = bearer_token(request.headers.get("authorization"))
-        if token is None:
-            raise ApiError(401, "缺少令牌")
-        found = _authenticate(deps.authenticator, token)
-        if found is None:
-            raise ApiError(401, "令牌无效")
-        return found
+        source = request.client.host if request.client is not None else "unknown"
+        return _login(deps, source, bearer_token(request.headers.get("authorization")))
 
     def owner(who: Annotated[Principal, Depends(principal)]) -> Principal:
         if who.role is not Role.OWNER:
@@ -176,24 +193,70 @@ def create_app(deps: ApiDeps) -> FastAPI:  # noqa: PLR0915 - 路由集中在一�
             ]
         )
 
-    @app.post(f"{API_PREFIX}/commands", responses=ERRORS)
-    async def command(
-        body: CommandRequest, who: Annotated[Principal, Depends(owner)]
-    ) -> CommandResponse:
+    Owner = Annotated[Principal, Depends(owner)]  # noqa: N806
+
+    @app.post(f"{API_PREFIX}/commands/confirmations", responses=ERRORS)
+    def confirm(body: ConfirmationRequest, who: Owner) -> ConfirmationResponse:
+        """高危命令的二次确认：返回短时有效的确认号，绑定使用者、命令名与参数。"""
+        spec = _checked(body.name, body.params)
+        if spec.tier is not Tier.HIGH:
+            raise ApiError(422, "只有高危命令需要二次确认")
         try:
-            check_command(body.name, body.params)
-        except CommandError as exc:
-            raise ApiError(422, str(exc)) from exc
+            confirmation_id, expires = deps.confirmations.issue(who, body.name, body.params)
+        except ConfirmationError as exc:
+            raise ApiError(429, str(exc)) from exc
+        _audit_required(deps.audit, "confirmation_issued", who.name, {"name": body.name})
+        return ConfirmationResponse(
+            confirmation_id=confirmation_id, name=body.name, expires_at=expires.isoformat()
+        )
+
+    @app.post(f"{API_PREFIX}/tokens/{{token_id}}/revoke", responses=ERRORS)
+    def revoke(
+        body: RevokeRequest,
+        who: Owner,
+        token_id: Annotated[str, Path(pattern=r"^[0-9a-f]{16}$")],
+    ) -> RevokeResponse:
+        """在线吊销令牌（owner）：立即生效，可以吊销自己的令牌。"""
+        if deps.tokens is None:
+            raise ApiError(404, "未启用在线吊销")
+        try:
+            deps.tokens.revoke(token_id, actor=who.name, reason=body.reason)
+        except TokenNotFoundError as exc:
+            raise ApiError(404, "没有这个令牌") from exc
+        except ApiDbError as exc:
+            log_event(log, logging.ERROR, "在线吊销失败", error=type(exc).__name__)
+            raise ApiError(503, "吊销未完成：api.db 写入失败，请重试") from exc
+        return RevokeResponse(token_id=token_id, revoked=True)
+
+    @app.post(f"{API_PREFIX}/commands", responses=ERRORS)
+    async def command(body: CommandRequest, who: Owner) -> CommandResponse:
+        spec = _checked(body.name, body.params)
+        if spec.tier is Tier.HIGH:
+            await asyncio.to_thread(_confirmed, deps, body, who)
+        elif body.confirmation_id is not None:
+            raise ApiError(422, "这条命令不需要二次确认")
+        summary = {"request_id": body.request_id, "name": body.name,
+                   "param_keys": ",".join(sorted(body.params))}  # fmt: skip
+        await asyncio.to_thread(_audit_required, deps.audit, "command_submitted", who.name, summary)
+        outcome = "error"
         try:
             answer = await deps.gateway.send(
                 body.request_id, body.name, body.params, actor=who.name
             )
+            outcome = _outcome(answer.executed, answer.ok, answer.refused)
         except NotDeliveredError as exc:
+            outcome = "not_delivered"
             raise ApiError(503, "tradingd 不可用，命令未发出，可以重试") from exc
         except OutcomeUnknownError as exc:
+            outcome = "unknown"
             raise ApiError(
                 504, "命令已发出但结果未知：请用同一 request_id 重试查询原结果", retry_same=True
             ) from exc
+        finally:
+            await asyncio.to_thread(
+                _audit_best_effort, deps.audit, "command_outcome", who.name,
+                {**summary, "outcome": outcome},
+            )  # fmt: skip
         if not answer.executed:
             if answer.refused:
                 raise ApiError(409, answer.error or "命令被 tradingd 拒绝")
@@ -220,6 +283,69 @@ def create_app(deps: ApiDeps) -> FastAPI:  # noqa: PLR0915 - 路由集中在一�
             await _close_with_error(ws, "事件流出错", 1011)
 
     return app
+
+
+def _checked(name: str, params: dict[str, str]) -> CommandSpec:
+    try:
+        return check_command(name, params)
+    except CommandError as exc:
+        raise ApiError(422, str(exc)) from exc
+
+
+def _confirmed(deps: ApiDeps, body: CommandRequest, who: Principal) -> None:
+    if body.confirmation_id is None:
+        _audit_best_effort(
+            deps.audit, "confirmation_refused", who.name,
+            {"request_id": body.request_id, "name": body.name, "reason": "缺少二次确认"},
+        )  # fmt: skip
+        raise ApiError(403, "高危命令须先申请二次确认（/v1/commands/confirmations）")
+    try:
+        deps.confirmations.use(body.confirmation_id, who, body.name, body.params, body.request_id)
+    except ConfirmationError as exc:
+        _audit_best_effort(
+            deps.audit, "confirmation_refused", who.name,
+            {"request_id": body.request_id, "name": body.name, "reason": str(exc)},
+        )  # fmt: skip
+        raise ApiError(403, str(exc)) from exc
+
+
+def _outcome(executed: bool, ok: bool, refused: bool) -> str:
+    if executed:
+        return "executed_ok" if ok else "executed_refused_by_rules"
+    return "refused" if refused else "temporary_failure"
+
+
+def _audit_required(audit: Audit, action: str, actor: str, detail: dict[str, str]) -> None:
+    """必须落盘的审计：写不进去即拒绝（503）。"""
+    try:
+        audit.audit(action, actor, detail)
+    except Exception as exc:
+        log_event(log, logging.ERROR, "审计写入失败，拒绝操作", action=action,
+                  error=type(exc).__name__)  # fmt: skip
+        raise ApiError(503, "审计不可用，操作未执行") from exc
+
+
+def _audit_best_effort(audit: Audit, action: str, actor: str, detail: dict[str, str]) -> None:
+    """事后的审计（命令已发出、认证已拒绝）：写不进去只记日志，不改变结果。"""
+    try:
+        audit.audit(action, actor, detail)
+    except Exception as exc:
+        log_event(log, logging.ERROR, "审计写入失败", action=action, error=type(exc).__name__)
+
+
+def _login(deps: ApiDeps, source: str, token: str | None) -> Principal:
+    """认证一次请求：限流 → 令牌 → 失败计数与审计。令牌本身不进日志与审计。"""
+    if deps.limiter.blocked(source):
+        raise ApiError(429, "认证失败次数过多，请稍后再试")
+    found = None if token is None else _authenticate(deps.authenticator, token)
+    if found is not None:
+        return found
+    reason = "缺少令牌" if token is None else "令牌无效"
+    throttled = deps.limiter.fail(source)
+    _audit_best_effort(deps.audit, "auth_failed", "anonymous", {"source": source, "reason": reason})
+    if throttled:
+        _audit_best_effort(deps.audit, "auth_throttled", "anonymous", {"source": source})
+    raise ApiError(401, reason)
 
 
 def _authenticate(authenticator: Authenticator, token: str) -> Principal | None:
@@ -397,12 +523,11 @@ async def _stream_auth(ws: WebSocket, deps: ApiDeps) -> tuple[str, Principal, in
     except (ValueError, ValidationError):  # JSONDecodeError 是 ValueError
         await _close_with_error(ws, "第一条消息必须是认证消息", WS_BAD_MESSAGE)
         return None
+    source = ws.client.host if ws.client is not None else "unknown"
     try:
-        who = await asyncio.to_thread(_authenticate, deps.authenticator, message.token)
-    except ApiError:
-        who = None
-    if who is None:
-        await _close_with_error(ws, "令牌无效", WS_UNAUTHORIZED)
+        who = await asyncio.to_thread(_login, deps, source, message.token)
+    except ApiError as exc:
+        await _close_with_error(ws, exc.error, WS_UNAUTHORIZED)
         return None
     return message.token, who, message.after
 

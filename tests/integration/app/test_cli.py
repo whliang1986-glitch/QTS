@@ -382,7 +382,9 @@ def test_children_receive_the_same_validated_paths(tmp_path: Path) -> None:
 
     args = child_arguments(Path("c.toml"), Path("."), Path("s.toml"), tmp_path / "o.toml")
     pairs = dict(zip(args[::2], args[1::2], strict=True))
-    assert set(pairs) == {"--config", "--root", "--schedule", "--calendar-overrides"}
+    assert set(pairs) == {
+        "--config", "--root", "--schedule", "--calendar-overrides", "--apid-config"
+    }  # fmt: skip
     assert all(Path(v).is_absolute() for v in pairs.values())
     assert pairs["--calendar-overrides"] == str((tmp_path / "o.toml").resolve())
 

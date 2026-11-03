@@ -20,6 +20,7 @@ from server.api.commands import (
     OutcomeUnknownError,
     Tier,
 )
+from server.api.security import MemoryAudit
 from server.domain.enums import Mode, OrderClass, OrderType, Side, TimeInForce
 from server.domain.modes import HaltState
 from server.domain.order_state import EventKind, OrderEvent, OrderStatus
@@ -114,7 +115,7 @@ def make_api(ledger: Path, **kw: Any) -> Api:
             raise StorageError("磁盘坏了")
         return LedgerRepository(open_ledger(ledger, read_only=True))
 
-    deps = ApiDeps(authenticator=tokens, ledger=repo, gateway=gateway, **kw)
+    deps = ApiDeps(authenticator=tokens, ledger=repo, gateway=gateway, audit=MemoryAudit(), **kw)
     return Api(TestClient(create_app(deps)), tokens, gateway, ok)
 
 

@@ -169,11 +169,61 @@ def _broker_window(raw: Any) -> BrokerWindow:
     return BrokerWindow(zone, time(hour, minute), timedelta(minutes=length))
 
 
+# ---------- apid（S-03） ----------
+
+_APID_KEYS = {"host", "port", "api_db", "tls_cert", "tls_key", "confirmation_seconds"}
+MAX_CONFIRMATION_SECONDS = 300  # 二次确认的有效期只能调短，不能长于 5 分钟
+
+
+@dataclass(frozen=True)
+class ApidConfig:
+    host: str
+    port: int
+    api_db: Path
+    tls_cert: Path | None
+    tls_key: Path | None
+    confirmation_ttl: timedelta
+
+
+def parse_apid_config(loaded: LoadedConfig, *, base: Path) -> ApidConfig:
+    """config/runtime/apid.toml：监听地址、api.db、TLS 文件。TLS 文件留空字符串表示不用 TLS。
+
+    是否允许不用 TLS（只有回环地址可以）在 apid 启动时检查（server.app.apid.check_listen）。
+    """
+    table = loaded.only_table("apid")
+    if set(table) != _APID_KEYS:
+        raise ConfigError(f"[apid] 的键必须恰好是：{sorted(_APID_KEYS)}")
+    host = table["host"]
+    if not isinstance(host, str) or not host.strip():
+        raise ConfigError("host 必须是非空字符串")
+    port = _positive_int(table["port"], "port")
+    if port > 65535:
+        raise ConfigError("port 必须在 1 到 65535 之间")
+    ttl = _positive_int(table["confirmation_seconds"], "confirmation_seconds")
+    if ttl > MAX_CONFIRMATION_SECONDS:
+        raise ConfigError(f"confirmation_seconds 不得超过 {MAX_CONFIRMATION_SECONDS}")
+    return ApidConfig(
+        host=host, port=port, api_db=_path(table["api_db"], "api_db", base),
+        tls_cert=_optional_path(table["tls_cert"], "tls_cert", base),
+        tls_key=_optional_path(table["tls_key"], "tls_key", base),
+        confirmation_ttl=timedelta(seconds=ttl),
+    )  # fmt: skip
+
+
+def _optional_path(value: Any, key: str, base: Path) -> Path | None:
+    if value == "":
+        return None
+    return _path(value, key, base)
+
+
 __all__ = (
+    "MAX_CONFIRMATION_SECONDS",
     "MAX_GUARD_TIMEOUT",
     "MAX_INTENT_AGE",
     "SELF",
+    "ApidConfig",
     "ProcessSettings",
+    "parse_apid_config",
     "parse_process_settings",
     "parse_schedule_settings",
 )

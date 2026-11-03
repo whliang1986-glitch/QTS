@@ -17,6 +17,7 @@ import pytest_asyncio
 from server.api.app import ApiDeps, create_app
 from server.api.auth import Principal, Role
 from server.api.commands import CommandClient, IpcCommandGateway
+from server.api.security import MemoryAudit
 from server.ipc.protocol import IpcServer
 from server.ipc.protocol import Role as IpcRole
 from server.ipc.transport import Endpoints, connect_role, serve_role
@@ -92,6 +93,7 @@ async def stack(tmp_path: Path) -> AsyncIterator[Stack]:
     ledger = tmp_path / "ledger.db"
     deps = ApiDeps(
         authenticator=Tokens(),
+        audit=MemoryAudit(),
         ledger=lambda: LedgerRepository(open_ledger(ledger, read_only=True)),
         gateway=IpcCommandGateway(connect, timeout=10),
     )
@@ -143,8 +145,11 @@ async def test_lost_answer_is_504_and_same_id_retry_returns_original(stack: Stac
 
 @pytest.mark.asyncio
 async def test_rule_refusal_is_recorded_and_replayed(stack: Stack) -> None:
-    body = {"request_id": "api-req-004", "name": "adopt_baseline",
-            "params": {"confirmation": "错误的短语"}}  # fmt: skip
+    body: dict[str, Any] = {"request_id": "api-req-004", "name": "adopt_baseline",
+                            "params": {"confirmation": "错误的短语"}}  # fmt: skip
+    ask = {"name": body["name"], "params": body["params"]}
+    confirm = await stack.client.post("/v1/commands/confirmations", json=ask, headers=OWNER)
+    body["confirmation_id"] = confirm.json()["confirmation_id"]
     first = (await stack.client.post("/v1/commands", json=body, headers=OWNER)).json()
     assert first["ok"] is False and "error" in first["detail"]
     again = (await stack.client.post("/v1/commands", json=body, headers=OWNER)).json()
@@ -160,6 +165,7 @@ async def test_tradingd_down_is_503_not_sent(stack: Stack, tmp_path: Path) -> No
 
     deps = ApiDeps(
         authenticator=Tokens(),
+        audit=MemoryAudit(),
         ledger=lambda: LedgerRepository(open_ledger(tmp_path / "ledger.db", read_only=True)),
         gateway=IpcCommandGateway(connect, connect_timeout=2),
     )
