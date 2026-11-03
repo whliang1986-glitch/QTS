@@ -16,6 +16,7 @@ export interface CommandRequest {
   request_id: string;
   name: string;
   params?: Record<string, string>;
+  confirmation_id?: string | null;
 }
 
 export interface CommandResponse {
@@ -23,6 +24,17 @@ export interface CommandResponse {
   ok: boolean;
   replayed: boolean;
   detail: Record<string, unknown>;
+}
+
+export interface ConfirmationRequest {
+  name: string;
+  params?: Record<string, string>;
+}
+
+export interface ConfirmationResponse {
+  confirmation_id: string;
+  name: string;
+  expires_at: string;
 }
 
 export interface ErrorResponse {
@@ -97,6 +109,15 @@ export interface OrderView {
   expires_at: string | null;
   status: OrderStatus | null;
   updated_at: string | null;
+}
+
+export interface RevokeRequest {
+  reason: string;
+}
+
+export interface RevokeResponse {
+  token_id: string;
+  revoked: boolean;
 }
 
 export type Side = "BUY" | "SELL";

@@ -1,13 +1,14 @@
 """命令行入口（S-01c）。
 
-python -m server.app {supervise,tradingd,workerd,guardd} [--config 路径] [--root 目录]；
+python -m server.app {supervise,tradingd,apid,workerd,guardd} [--config 路径] [--root 目录]
+python -m server.app token {issue,revoke,list}（令牌管理，见 server.app.tokens）；
 --root 是配置里相对路径的基准目录，默认是仓库根目录（测试与多份部署时指定）。
 
 - supervise：守护进程，拉起 tradingd、apid、workerd、guardd 并在崩溃后退避重启。
   由操作系统的服务机制在开机 / 登录时启动它（docs/runbooks/S-01c-services.md）。
 - 其余子命令运行单个进程，退出码供守护进程判断是否重启（0 正常、78 拒绝启动、其他为崩溃）。
 - B-03（IBKR 适配器）与行情、账户同步数据源接入之前，tradingd 与 guardd 的生产入口
-  一律拒绝启动（78），守护进程不会反复拉起它们；apid 在令牌认证（S-03）接入之前同样拒绝启动。
+  一律拒绝启动（78），守护进程不会反复拉起它们。
 """
 
 from __future__ import annotations
@@ -26,8 +27,15 @@ from server.app.apid import ApidSettings, run_apid
 from server.app.common import AdapterNotAvailableError
 from server.app.guardd import GuarddDeps, GuarddSettings, run_guardd
 from server.app.scheduler import Scheduler, ScheduleSettings
-from server.app.settings import ProcessSettings, parse_process_settings, parse_schedule_settings
+from server.app.settings import (
+    ApidConfig,
+    ProcessSettings,
+    parse_apid_config,
+    parse_process_settings,
+    parse_schedule_settings,
+)
 from server.app.supervisor import EXIT_REFUSED, ChildSpec, Supervisor
+from server.app.tokens import token_main
 from server.app.tradingd import (
     TradingdDeps,
     TradingdSettings,
@@ -43,6 +51,7 @@ from server.storage.config import ConfigError, load_toml
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "config" / "runtime" / "processes.toml"
 DEFAULT_SCHEDULE = ROOT / "config" / "runtime" / "schedule.toml"
+DEFAULT_APID = ROOT / "config" / "runtime" / "apid.toml"
 DEFAULT_CALENDAR_OVERRIDES = ROOT / "config" / "runtime" / "calendar_overrides.toml"
 CHILDREN = ("tradingd", "apid", "workerd", "guardd")
 CHILD_ARGV = (sys.executable, "-m", "server.app")
@@ -119,11 +128,14 @@ def production_time(
     return TimeWiring(calendar, schedule)
 
 
-def child_arguments(config: Path, root: Path, schedule: Path, overrides: Path) -> tuple[str, ...]:
+def child_arguments(
+    config: Path, root: Path, schedule: Path, overrides: Path, apid: Path = DEFAULT_APID
+) -> tuple[str, ...]:
     """守护进程拉起子进程时透传的参数（绝对路径）：子进程用的配置与守护进程校验过的完全一致。"""
     return (
         "--config", str(config.resolve()), "--root", str(root.resolve()),
         "--schedule", str(schedule.resolve()), "--calendar-overrides", str(overrides.resolve()),
+        "--apid-config", str(apid.resolve()),
     )  # fmt: skip
 
 
@@ -133,13 +145,14 @@ def load(config: Path, channel: LocalChannel, root: Path = ROOT) -> ProcessSetti
     )
 
 
-async def _run(
+async def _run(  # noqa: PLR0913 - 各进程的配置显式传入
     command: str,
     *,
     settings: ProcessSettings,
     time: TimeWiring,
     channel: LocalChannel,
     child_args: tuple[str, ...],
+    apid: ApidConfig | None = None,
 ) -> int:
     stop = asyncio.Event()
     if command == "tradingd":
@@ -151,9 +164,13 @@ async def _run(
         deps = TradingdDeps(channel, time.inputs, scheduler=time.scheduler)
         return await run_tradingd(trading, deps, stop)
     if command == "apid":
+        if apid is None:
+            raise ConfigError("缺少 apid 配置")
         api = ApidSettings(
-            runtime_dir=settings.runtime_dir, ledger_path=settings.ledger,
-            tradingd_account=settings.accounts["tradingd"], instance=settings.instance,
+            runtime_dir=settings.runtime_dir, ledger_path=settings.ledger, api_db=apid.api_db,
+            tradingd_account=settings.accounts["tradingd"], host=apid.host, port=apid.port,
+            tls_cert=apid.tls_cert, tls_key=apid.tls_key, confirmation_ttl=apid.confirmation_ttl,
+            instance=settings.instance,
         )  # fmt: skip
         return await run_apid(api, channel, stop)
     if command == "workerd":
@@ -176,12 +193,16 @@ async def _run(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["token"]:  # 令牌管理（S-03）：不启动任何进程
+        return token_main(argv[1:], default_config=DEFAULT_APID, root=ROOT)
     parser = argparse.ArgumentParser(prog="python -m server.app")
     parser.add_argument("command", choices=("supervise", *CHILDREN))
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--schedule", type=Path, default=DEFAULT_SCHEDULE)
     parser.add_argument("--calendar-overrides", type=Path, default=None)
+    parser.add_argument("--apid-config", type=Path, default=DEFAULT_APID)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     try:
@@ -190,6 +211,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         schedule = parse_schedule_settings(load_toml(args.schedule, name="schedule"))
         overrides = args.calendar_overrides or DEFAULT_CALENDAR_OVERRIDES
         today = datetime.now(UTC).date()
+        apid = (
+            parse_apid_config(load_toml(args.apid_config, name="apid"), base=args.root)
+            if args.command in {"apid", "supervise"}
+            else None
+        )
         time = production_time(
             schedule, today, overrides, required=args.calendar_overrides is not None
         )
@@ -198,7 +224,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_REFUSED
     return asyncio.run(
         _run(args.command, settings=settings, time=time, channel=channel,
-             child_args=child_arguments(args.config, args.root, args.schedule, overrides))
+             child_args=child_arguments(args.config, args.root, args.schedule, overrides,
+                                   args.apid_config), apid=apid)
     )  # fmt: skip
 
 

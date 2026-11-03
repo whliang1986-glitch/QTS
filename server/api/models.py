@@ -32,6 +32,31 @@ class CommandRequest(Strict):
     params: dict[Annotated[str, StringConstraints(max_length=64)], ParamValue] = Field(
         default_factory=dict, max_length=8
     )
+    confirmation_id: str | None = Field(default=None, max_length=64)  # 高危命令必填（S-03）
+
+
+class ConfirmationRequest(Strict):
+    """高危命令的二次确认申请：命令名与参数必须与随后提交的命令完全一致。"""
+
+    name: str = Field(max_length=64)
+    params: dict[Annotated[str, StringConstraints(max_length=64)], ParamValue] = Field(
+        default_factory=dict, max_length=8
+    )
+
+
+class ConfirmationResponse(Strict):
+    confirmation_id: str
+    name: str
+    expires_at: str
+
+
+class RevokeRequest(Strict):
+    reason: str = Field(min_length=1, max_length=500, pattern=r"\S")  # 不能只有空白
+
+
+class RevokeResponse(Strict):
+    token_id: str
+    revoked: bool
 
 
 class CommandResponse(Strict):
