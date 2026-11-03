@@ -23,19 +23,20 @@ from typing import Any
 from urllib.parse import quote
 
 from pydantic import ValidationError
-from sqlalchemy import Connection, Engine, Row, Table, create_engine, select
+from sqlalchemy import Connection, Engine, Row, Table, create_engine, func, select
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.pool import NullPool
 
 from server.domain.enums import Mode
 from server.domain.modes import AuditEvent, HaltState
-from server.domain.order_state import OrderEvent, OrderStatus
+from server.domain.order_state import EventKind, OrderEvent, OrderStatus
 from server.domain.orders import BrokerOrder, Execution, OrderIntent, RiskDecision
 from server.storage import schema
 from server.storage.errors import ConflictError, StorageError
 from server.storage.migrate import head_revision
 
 LEDGER_TABLES = schema.LEDGER_TABLES
+MAX_VIEW_ROWS = 500  # 只读视图一次最多返回的行数
 
 
 def open_ledger(path: Path, *, read_only: bool = False, busy_timeout_ms: int = 5000) -> Engine:
@@ -123,6 +124,26 @@ class PositionAdjustment:
     reference: str
     actor: str
     recorded_at: datetime
+
+
+@dataclass(frozen=True)
+class OrderSummary:
+    """一个意图及其最新状态（S-02 只读视图）。还没有任何订单事件时 status 为空。"""
+
+    intent: OrderIntent
+    status: OrderStatus | None
+    updated_at: str | None
+
+
+@dataclass(frozen=True)
+class OrderEventRow:
+    """一条订单事件的摘要（S-02 事件流）。seq 是写入顺序，可作游标。"""
+
+    seq: int
+    intent_id: str
+    kind: EventKind
+    status: OrderStatus
+    occurred_at: str
 
 
 @dataclass(frozen=True)
@@ -299,6 +320,61 @@ class LedgerRepository:
     def latest_status(self, intent_id: str) -> OrderStatus | None:
         history = self.order_history(intent_id)
         return history[-1][1] if history else None
+
+    # ---------- 只读视图（S-02：apid 查询与事件流） ----------
+
+    def recent_orders(self, limit: int) -> list[OrderSummary]:
+        """最近的意图（按生成时间从新到旧）及各自最新状态；单条查询，读到同一时刻的状态。"""
+        if not 1 <= limit <= MAX_VIEW_ROWS:
+            raise StorageError(f"limit 必须在 1 到 {MAX_VIEW_ROWS} 之间")
+        o, ev = schema.orders, schema.order_events
+        inner = ev.alias("inner_events")
+        latest = (
+            select(func.max(inner.c.seq))
+            .where(inner.c.intent_id == o.c.intent_id)
+            .correlate(o)
+            .scalar_subquery()
+        )
+        stmt = (
+            select(o.c.payload, ev.c.status, ev.c.occurred_at)
+            .select_from(o)
+            .outerjoin(ev, ev.c.seq == latest)
+            .order_by(o.c.created_at.desc(), o.c.intent_id.desc())
+            .limit(limit)
+        )
+        with self._reading("orders") as conn:
+            return [
+                OrderSummary(
+                    OrderIntent.model_validate_json(payload),
+                    None if status is None else OrderStatus(status),
+                    at,
+                )
+                for payload, status, at in conn.execute(stmt)
+            ]
+
+    def order_events_after(self, seq: int, limit: int) -> list[OrderEventRow]:
+        """seq 之后写入的订单事件（按写入顺序），供事件流按游标续读。"""
+        if not 1 <= limit <= MAX_VIEW_ROWS:
+            raise StorageError(f"limit 必须在 1 到 {MAX_VIEW_ROWS} 之间")
+        t = schema.order_events
+        stmt = (
+            select(t.c.seq, t.c.intent_id, t.c.kind, t.c.status, t.c.occurred_at)
+            .where(t.c.seq > seq)
+            .order_by(t.c.seq)
+            .limit(limit)
+        )
+        with self._reading("order_events") as conn:
+            return [
+                OrderEventRow(int(s), i, EventKind(k), OrderStatus(st), at)
+                for s, i, k, st, at in conn.execute(stmt)
+            ]
+
+    def last_order_event_seq(self) -> int:
+        """最新一条订单事件的 seq；没有事件为 0。"""
+        t = schema.order_events
+        with self._reading("order_events") as conn:
+            value = conn.execute(select(func.max(t.c.seq))).scalar()
+        return 0 if value is None else int(value)
 
     # ---------- 成交 ----------
 

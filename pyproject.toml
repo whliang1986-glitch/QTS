@@ -7,6 +7,7 @@ dependencies = [
     "alembic>=1.14,<2",
     "duckdb>=1.3,<2",
     "exchange-calendars>=4.13,<5",
+    "fastapi>=0.115,<1",
     "keyring>=25,<26",
     "pandas>=3.0,<4",
     "pyarrow>=21,<23",
@@ -14,6 +15,8 @@ dependencies = [
     "sqlalchemy>=2.0.36,<2.1",
     # zoneinfo 在 Windows 上没有系统时区库，全靠 tzdata（S-01e：显式声明，不依赖 pandas 的传递依赖）
     "tzdata>=2024.1",
+    "uvicorn>=0.32,<1",
+    "websockets>=13,<16",
 ]
 
 [dependency-groups]
@@ -27,6 +30,7 @@ dev = [
     "import-linter>=2.5",
     "pandas-stubs>=3.0.5.260914",
     "pyarrow-stubs>=20",
+    "httpx>=0.27,<1",
 ]
 
 [build-system]
@@ -200,6 +204,8 @@ filterwarnings = [
     "error",
     # exchange_calendars 内部使用了 pandas 即将弃用的 Series.values（第三方，非本项目代码）
     "ignore:Series.values returning an ndarray:pandas.errors.Pandas4Warning",
+    # starlette 的测试客户端建议改用 httpx2；httpx 仍可用，只影响测试（S-02）
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
 ]
 
 [tool.coverage.run]
