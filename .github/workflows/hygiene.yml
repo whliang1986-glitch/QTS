@@ -72,7 +72,5 @@ jobs:
         continue-on-error: true
         run: npm audit --audit-level=high
 
-      # S-05a 合并之前 useLang 还没有用处，先只提醒；合并后去掉 continue-on-error
-      - name: knip 无效文件、导出与依赖（暂时只提醒）
-        continue-on-error: true
+      - name: knip 无效文件、导出与依赖（已清理，新增即失败）
         run: npx knip --no-progress

@@ -68,3 +68,9 @@ S-05a 新增的三个接口（alerts、ack、audit）在 S-05a 合并后补进�
 - 字体：见 `docs/licenses/FONTS.md`。现状是不打包、不外链，用系统字体。
 - 依赖许可证：见 `docs/licenses/THIRD_PARTY.md`。强传染许可 0 个，需确认 0 个；
   MPL-2.0 有 3 个（certifi、hypothesis、pathspec），不改它们的源码就可以使用。
+
+## 合并 main（S-05a 之后）补充
+
+- vulture：S-05a 的 `AckResponse.requested`、`already` 是接口返回字段，按数据契约字段登记忽略。
+- 接口清单补上 `GET /v1/alerts`、`POST /v1/alerts/{alert_id}/ack`、`GET /v1/audit`。
+- knip：`useLang` 已被告警页使用，现在 0 条，CI 改为必过。

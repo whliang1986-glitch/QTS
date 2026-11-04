@@ -15,4 +15,7 @@
 | POST | /v1/commands/confirmations | 高危命令二次确认 | 网页急停 | tests/unit/api/test_app.py | 是 | S-03 |
 | POST | /v1/tokens/{token_id}/revoke | 在线吊销令牌 | 紧急吊销（curl）；网页设置页 | tests/integration/app/test_apid.py | 否 | S-05（设置页） |
 | POST | /v1/commands | 急停、撤单、对账、恢复等命令 | 网页急停 | tests/unit/api/test_app.py | 是 | S-02 |
+| GET | /v1/alerts | 告警列表：全部未解除的加最近 limit 条 | 网页告警页 | tests/unit/api/test_alerts_api.py | 是 | S-05a |
+| POST | /v1/alerts/{alert_id}/ack | 确认告警（只停止重复提醒，仅 owner） | 网页告警页 | tests/unit/api/test_alerts_api.py | 是 | S-05a |
+| GET | /v1/audit | apid 审计记录（仅 owner，可翻页） | 网页审计日志页 | tests/unit/api/test_alerts_api.py | 是 | S-05a |
 | WS | /v1/stream | 状态与订单事件推送 | 网页从轮询改为推送 | tests/unit/api/test_app.py | 否 | S-05（实时推送） |
