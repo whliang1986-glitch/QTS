@@ -30,6 +30,8 @@ REQUIRED_PACKAGES = [
 ]
 SOURCE_DIRS = ["server", "tests", "scripts", "docs", "config", "web", ".claude", ".github"]
 CACHE_PARTS = {"__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache", ".hypothesis"}
+# 前端的依赖、构建产物与测试报告（S-04）：只认 web/ 下这几个目录，源码目录里别处出现同名目录仍会报错
+WEB_ARTIFACTS = ("web/node_modules/", "web/dist/", "web/test-results/", "web/playwright-report/")
 
 pytestmark = pytest.mark.skipif(
     shutil.which("git") is None or not (ROOT / ".git").exists(), reason="需要 git 工作副本"
@@ -51,5 +53,11 @@ def test_package_init_is_tracked(package: str) -> None:
 
 def test_no_source_file_is_ignored() -> None:
     ignored = _git("ls-files", "--others", "--ignored", "--exclude-standard", "--", *SOURCE_DIRS)
-    real = [p for p in ignored if not CACHE_PARTS.intersection(p.split("/"))]
+    real = [
+        p
+        for p in ignored
+        if not CACHE_PARTS.intersection(p.split("/"))
+        and not p.startswith(WEB_ARTIFACTS)
+        and not (p.startswith("web/") and p.endswith(".tsbuildinfo"))
+    ]
     assert real == [], f"这些源码目录下的文件被 .gitignore 忽略了：{real}"

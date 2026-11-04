@@ -1,0 +1,46 @@
+:root {
+  --bg: #f6f7f9;
+  --fg: #1d2330;
+  --muted: #5d6677;
+  --card: #ffffff;
+  --line: #d9dde5;
+  --paper: #1f6feb;
+  --halt: #c62828;
+  --unknown: #6b7280;
+  --warn: #b45309;
+  --ok: #15803d;
+  font-family: system-ui, "Microsoft YaHei", sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111418; --fg: #e6e9ef; --muted: #9aa3b2; --card: #1a1f26; --line: #2c333d; }
+}
+body { margin: 0; background: var(--bg); }
+.modebar { display: flex; gap: 16px; align-items: center; padding: 10px 16px; color: #fff; }
+.modebar.paper { background: var(--paper); }
+.modebar.halt { background: var(--halt); }
+.modebar.unknown { background: var(--unknown); }
+.modebar .mode { font-weight: 700; font-size: 18px; letter-spacing: 1px; }
+.modebar button { margin-left: auto; }
+.banner { background: #fde68a; color: #422006; padding: 8px 16px; font-weight: 600; }
+nav { display: flex; gap: 4px; padding: 8px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+nav button.active { font-weight: 700; border-bottom: 2px solid var(--paper); }
+main { padding: 16px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+.card-title { color: var(--muted); font-size: 13px; }
+.card-value { font-size: 16px; margin-top: 6px; }
+table { border-collapse: collapse; width: 100%; background: var(--card); }
+th, td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; font-size: 13px; }
+.controls { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.control { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+.control.danger { border-color: var(--halt); }
+.control label { display: block; margin: 8px 0; }
+.control input { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; }
+button { padding: 6px 12px; margin: 4px 4px 4px 0; cursor: pointer; }
+.warn { color: var(--warn); }
+.ok { color: var(--ok); }
+.note { color: var(--muted); }
+.login { max-width: 360px; margin: 80px auto; padding: 0 16px; }
+.login input { display: block; width: 100%; box-sizing: border-box; margin: 8px 0; }
