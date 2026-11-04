@@ -28,7 +28,7 @@ dev = [
     "pytest-cov>=7.0",
     "hypothesis>=6.140",
     "import-linter>=2.5",
-    "pandas-stubs>=3.0.5.260914",
+    "pandas-stubs>=3.1.0.261029",
     "pyarrow-stubs>=20",
     "httpx>=0.27,<1",
     # H-01 工程卫生：无效代码扫描、依赖漏洞扫描
