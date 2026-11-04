@@ -72,6 +72,10 @@ export async function call<T>(
     ok: false,
     status: response.status,
     error: typeof err?.error === "string" ? err.error : `请求失败（${response.status}）`,
-    retrySame: err?.retry_same_request_id === true || response.status === 504,
+    // 5xx 且回答里没有明确的 retry_same_request_id（未捕获的 500、代理 502 等）：结果不确定，按未知处理
+    retrySame:
+      err?.retry_same_request_id === true ||
+      response.status === 504 ||
+      (response.status >= 500 && typeof err?.retry_same_request_id !== "boolean"),
   };
 }

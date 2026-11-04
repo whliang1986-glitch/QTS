@@ -1,47 +1,56 @@
-// 总览、订单、持仓、风险（S-04）。没有可信数据的地方一律显示“未知”或“暂无数据”，不显示旧值。
+// 总览、订单、持仓、风险（S-04 / S-13）。没有可信数据的地方一律显示“未知”或“暂无数据”，不显示旧值。
 import { useEffect, useState } from "react";
 import { call } from "../api/client";
 import type { OrderList } from "../api/types.gen";
 import type { StatusState } from "../status";
 import { modeLabel } from "../status";
+import { Empty, Notice, Sparkline, StatCard, Tag, statusTone } from "../ui";
 
-const NO_SNAPSHOT = "暂无数据（等待 tradingd 发布账户快照）";
-
-export function Overview({ state }: { state: StatusState }) {
-  const halt = state.connection === "ok" ? state.status?.halt ?? null : null;
-  return (
-    <div className="grid">
-      <Card title="模式" value={modeLabel(state)} testId="overview-mode" />
-      <Card title="服务器连接" value={connectionText(state)} testId="overview-connection" />
-      <Card title="急停" value={halt === null ? "未知" : halt.halted ? `已停止：${halt.reason ?? ""}` : "未停止"} testId="overview-halt" />
-      <Card title="净值" value={NO_SNAPSHOT} />
-      <Card title="现金（已结算 / 未结算）" value={NO_SNAPSHOT} />
-      <Card title="当日盈亏" value={NO_SNAPSHOT} />
-      <Card title="券商连接与数据健康" value={NO_SNAPSHOT} />
-    </div>
-  );
-}
-
-function Card({ title, value, testId }: { title: string; value: string; testId?: string }) {
-  return (
-    <div className="card">
-      <div className="card-title">{title}</div>
-      <div className="card-value" data-testid={testId}>{value}</div>
-    </div>
-  );
-}
+const NO_SNAPSHOT = "等待 tradingd 发布账户快照";
 
 export function connectionText(state: StatusState): string {
   switch (state.connection) {
     case "ok":
-      return "正常";
+      return "连接正常";
     case "stale":
       return "数据过期";
     case "unauthorized":
       return "令牌无效";
     default:
-      return "断开";
+      return "连接断开";
   }
+}
+
+function haltText(state: StatusState): string {
+  const halt = state.connection === "ok" ? state.status?.halt ?? null : null;
+  if (halt === null) return "未知";
+  return halt.halted ? `已停止：${halt.reason ?? ""}` : "未停止";
+}
+
+export function Overview({ state }: { state: StatusState }) {
+  const mode = modeLabel(state);
+  return (
+    <>
+      <div className="page-title"><h2>总览</h2><span className="hint">每 3 秒刷新</span></div>
+      <div className="cards">
+        <StatCard label="模式" icon="check" value={mode} testId="overview-mode" />
+        <StatCard label="服务器连接" icon="wifi" value={connectionText(state)} testId="overview-connection" />
+        <StatCard label="急停" icon="stop" value={haltText(state)} testId="overview-halt" />
+        <StatCard label="券商与数据健康" icon="info" value="未知" sub={<span className="hint">{NO_SNAPSHOT}</span>} />
+      </div>
+      <div className="cards section">
+        <StatCard label="净值（USD）" value={null} />
+        <StatCard label="现金（已结算 / 未结算）" value={null} />
+        <StatCard label="当日盈亏" value={null} />
+        <StatCard label="持仓数" value={null} />
+      </div>
+      <div className="section card">
+        <div className="page-title"><h2>净值曲线</h2></div>
+        <Sparkline points={[]} label="净值曲线" />
+      </div>
+      <p className="hint section">净值、现金、盈亏、持仓：{NO_SNAPSHOT}。</p>
+    </>
+  );
 }
 
 export function Orders() {
@@ -67,44 +76,83 @@ export function Orders() {
       window.clearInterval(timer);
     };
   }, []);
-  if (orders === null) {
-    return <p className="warn" data-testid="orders-unknown">订单状态未知{error ? `：${error}` : ""}</p>;
-  }
-  if (orders.orders.length === 0) return <p data-testid="orders-empty">还没有订单</p>;
   return (
-    <table data-testid="orders-table">
-      <thead>
-        <tr><th>意图</th><th>标的</th><th>方向</th><th>数量</th><th>限价</th><th>类别</th><th>状态</th><th>更新时间</th></tr>
-      </thead>
-      <tbody>
-        {orders.orders.map((o) => (
-          <tr key={o.intent_id}>
-            <td>{o.intent_id}</td><td>{o.symbol}</td><td>{o.side}</td><td>{o.quantity}</td>
-            <td>{o.limit_price ?? o.stop_price ?? ""}</td><td>{o.order_class}</td>
-            <td>{o.status ?? "未提交"}</td><td>{o.updated_at ?? ""}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <>
+      <div className="page-title"><h2>订单</h2><span className="hint">最近 100 笔，每 5 秒刷新</span></div>
+      {orders === null ? (
+        <div data-testid="orders-unknown">
+          <Notice tone="warn" title="订单状态未知">
+            {error ? `${error}。` : ""}服务器恢复后会自动刷新；在此之前请以券商端为准。
+          </Notice>
+        </div>
+      ) : orders.orders.length === 0 ? (
+        <div className="card"><Empty title="还没有订单" testId="orders-empty">策略或急停产生的订单会出现在这里</Empty></div>
+      ) : (
+        <div className="table-wrap">
+          <table data-testid="orders-table">
+            <thead>
+              <tr>
+                <th scope="col">意图</th><th scope="col">标的</th><th scope="col">方向</th>
+                <th scope="col" className="num">数量</th><th scope="col" className="num">价格</th>
+                <th scope="col">类别</th><th scope="col">状态</th><th scope="col">更新时间（UTC）</th>
+              </tr>
+            </thead>
+            <tbody>
+              {orders.orders.map((o) => (
+                <tr key={o.intent_id}>
+                  <td><code>{o.intent_id}</code></td>
+                  <td>{o.symbol}</td>
+                  <td>{o.side === "BUY" ? "买入" : "卖出"}</td>
+                  <td className="num">{o.quantity}</td>
+                  <td className="num">{o.limit_price ?? o.stop_price ?? "—"}</td>
+                  <td>{o.order_class}</td>
+                  <td><Tag tone={statusTone(o.status)}>{o.status ?? "未提交"}</Tag></td>
+                  <td className="num">{o.updated_at?.replace("T", " ").slice(0, 19) ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
   );
 }
 
 export function Positions() {
-  return <p className="note" data-testid="positions-empty">{NO_SNAPSHOT}</p>;
+  return (
+    <>
+      <div className="page-title"><h2>持仓</h2></div>
+      <div className="card"><Empty icon="positions" title="暂无持仓数据" testId="positions-empty">{NO_SNAPSHOT}</Empty></div>
+    </>
+  );
 }
 
 export function Risk({ state }: { state: StatusState }) {
   const status = state.connection === "ok" ? state.status : null;
-  if (status === null || status.halt === null) {
-    return <p className="warn" data-testid="risk-unknown">风险状态未知</p>;
-  }
   return (
-    <dl data-testid="risk-view">
-      <dt>HALT</dt><dd>{status.halt.halted ? "是" : "否"}</dd>
-      <dt>原因</dt><dd>{status.halt.reason ?? "—"}</dd>
-      <dt>时间</dt><dd>{status.halt.since ?? "—"}</dd>
-      <dt>操作者</dt><dd>{status.halt.set_by ?? "—"}</dd>
-      <dt>敞口、集中度、保护性止损覆盖</dt><dd>{NO_SNAPSHOT}</dd>
-    </dl>
+    <>
+      <div className="page-title"><h2>风险</h2></div>
+      {status === null || status.halt === null ? (
+        <div data-testid="risk-unknown">
+          <Notice tone="warn" title="风险状态未知">连不上服务器或账本暂不可读。此时不要依据界面做决定，请以券商端为准。</Notice>
+        </div>
+      ) : (
+        <div className="grid-2">
+          <div className="card">
+            <h3 style={{ marginBottom: "var(--s3)" }}>急停状态</h3>
+            <dl className="kv" data-testid="risk-view">
+              <dt>HALT</dt><dd>{status.halt.halted ? <Tag tone="danger">是</Tag> : <Tag tone="ok">否</Tag>}</dd>
+              <dt>原因</dt><dd>{status.halt.reason ?? "—"}</dd>
+              <dt>时间</dt><dd className="num" style={{ textAlign: "left" }}>{status.halt.since ?? "—"}</dd>
+              <dt>操作者</dt><dd>{status.halt.set_by ?? "—"}</dd>
+            </dl>
+          </div>
+          <div className="card">
+            <h3 style={{ marginBottom: "var(--s3)" }}>敞口与保护性止损</h3>
+            <Empty icon="risk" title="暂无数据">{NO_SNAPSHOT}</Empty>
+          </div>
+        </div>
+      )}
+    </>
   );
 }

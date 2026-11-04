@@ -107,7 +107,7 @@ test("断网时显示断开提示，不显示旧模式", async ({ page }) => {
   await expect(page.getByTestId("mode-badge")).toHaveText("PAPER");
   await page.unroute("**/v1/**");
   await page.route("**/v1/**", (route) => route.abort("connectionrefused"));
-  await expect(page.getByTestId("connection")).toHaveText("断开", { timeout: 10_000 });
+  await expect(page.getByTestId("connection")).toHaveText("连接断开", { timeout: 10_000 });
   await expect(page.getByTestId("mode-badge")).toHaveText("未知");
   await expect(page.getByTestId("stale-banner")).toBeVisible();
 });
@@ -342,7 +342,8 @@ test("令牌中途失效：回到登录页并清除令牌，不进 localStorage"
     ? json(route, 200, PAPER)
     : json(route, 401, { error: "令牌无效", retry_same_request_id: false })));
   await login(page);
-  expect(await page.evaluate(() => localStorage.length)).toBe(0);
+  // localStorage 只放界面偏好（S-13），不放令牌
+  expect(await page.evaluate(() => JSON.stringify({ ...localStorage }))).not.toContain("test-token");
   valid = false;
   await expect(page.getByTestId("token-input")).toBeVisible({ timeout: 10_000 });
   expect(await page.evaluate(() => sessionStorage.getItem("qts.token"))).toBeNull();
@@ -366,4 +367,66 @@ test("令牌失效重新登录后，结果未知的编号仍在", async ({ page 
   await page.getByTestId("retry-same").click();
   await expect(page.getByTestId("command-result")).toBeVisible();
   expect(mock.commands[0]?.request_id).toBe(mock.commands[1]?.request_id);
+});
+
+test("撤销开仓单的说明写明会撤减仓单（与服务端一致）", async ({ page }) => {
+  await mockApi(page);
+  await login(page);
+  await page.getByTestId("nav-emergency").click();
+  await expect(page.getByTestId("control-cancel-open")).toContainText("开仓单与减仓单");
+  await expect(page.getByTestId("control-cancel-open")).toContainText("保护性止损不受影响");
+  await expect(page.getByTestId("control-flatten")).toContainText("须先撤止损");
+});
+
+test("打开陈列室再回来，结果未知的编号仍在", async ({ page }) => {
+  const mock = await mockApi(page, {
+    commandReply: (_b, n) => n === 1
+      ? { code: 504, body: { error: "结果未知", retry_same_request_id: true } }
+      : { code: 200, body: { request_id: "x", ok: true, replayed: true, detail: {} } },
+  });
+  await login(page);
+  await page.getByTestId("nav-emergency").click();
+  await page.getByTestId("open-cancel-open").click();
+  await page.getByTestId("confirm-cancel-open").click();
+  await expect(page.getByTestId("retry-same")).toBeVisible();
+  await page.evaluate(() => { window.location.hash = "#showroom"; });
+  await expect(page.getByTestId("showroom")).toBeVisible();
+  await page.evaluate(() => { window.location.hash = ""; });
+  await page.getByTestId("nav-emergency").click();
+  await expect(page.getByTestId("confirm-cancel-open")).toBeDisabled();
+  await page.getByTestId("retry-same").click();
+  await expect(page.getByTestId("command-result")).toBeVisible();
+  expect(mock.commands[0]?.request_id).toBe(mock.commands[1]?.request_id);
+});
+
+test("未捕获的 500 按结果未知处理", async ({ page }) => {
+  await mockApi(page, {
+    commandReply: () => ({ code: 500, body: { detail: "Internal Server Error" } }),
+  });
+  await login(page);
+  await page.getByTestId("nav-emergency").click();
+  await page.getByTestId("open-cancel-open").click();
+  await page.getByTestId("confirm-cancel-open").click();
+  await expect(page.getByTestId("retry-same")).toBeVisible(); // 500：结果不确定
+  await expect(page.getByTestId("command-error")).toContainText("结果未知");
+});
+
+test("409 明确是没有执行：不给同号重试，可以取消", async ({ page }) => {
+  await mockApi(page, {
+    commandReply: () => ({ code: 409, body: { error: "同一 request_id 的命令内容不同", retry_same_request_id: false } }),
+  });
+  await login(page);
+  await page.getByTestId("nav-emergency").click();
+  await page.getByTestId("open-cancel-open").click();
+  await page.getByTestId("confirm-cancel-open").click();
+  await expect(page.getByTestId("command-error")).toContainText("命令没有执行（服务端明确答复）");
+  await expect(page.getByTestId("retry-same")).toHaveCount(0);
+  await expect(page.getByTestId("cancel-cancel-open")).toBeVisible();
+});
+
+test("连接正常但状态无法识别时给出横幅", async ({ page }) => {
+  await mockApi(page, { status: () => ({ code: 200, body: { ...PAPER, halt: null } }) });
+  await login(page);
+  await expect(page.getByTestId("mode-badge")).toHaveText("未知");
+  await expect(page.getByTestId("untrusted-banner")).toBeVisible();
 });

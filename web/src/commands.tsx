@@ -9,6 +9,7 @@
 import { createContext, useContext, useState, type ReactNode } from "react";
 import { call, newRequestId, type Result } from "./api/client";
 import type { CommandResponse, ConfirmationResponse } from "./api/types.gen";
+import { Button, Notice } from "./ui";
 
 export type Params = Record<string, string>;
 
@@ -110,31 +111,40 @@ export function useCommand(key: string, high: boolean) {
 export function OutcomeView({ command }: { command: ReturnType<typeof useCommand> }) {
   const { outcome, attempt } = command;
   if (outcome.kind === "idle") return null;
-  if (outcome.kind === "running") return <p className="note" data-testid="command-running">执行中……</p>;
+  if (outcome.kind === "running") {
+    return <div data-testid="command-running"><Notice tone="info" title="执行中……">正在等待 tradingd 回答。</Notice></div>;
+  }
   if (outcome.kind === "done") {
     const r = outcome.response;
+    const reason = !r.ok && typeof r.detail.error === "string" ? r.detail.error : null;
     return (
-      <p className={r.ok ? "ok" : "warn"} data-testid="command-result">
-        {r.ok ? "已执行" : "tradingd 拒绝执行"}
-        {r.replayed ? "（这是同一编号之前那次的结果）" : ""}
-        {!r.ok && typeof r.detail.error === "string" ? `：${r.detail.error}` : ""}
-      </p>
+      <div data-testid="command-result">
+        <Notice tone={r.ok ? "ok" : "warn"} title={`${r.ok ? "已执行" : "tradingd 拒绝执行"}${r.replayed ? "（这是同一编号之前那次的结果）" : ""}`}>
+          {reason ? `原因：${reason}` : null}
+        </Notice>
+      </div>
     );
   }
   return (
-    <div className="warn" data-testid="command-error">
-      <p>{outcome.error}</p>
-      {outcome.retrySame ? (
-        <>
-          <p>结果未知：命令可能已经执行。请用同一编号重试，tradingd 会返回原结果，不会执行两次。</p>
-          <button type="button" onClick={command.retry} data-testid="retry-same">
-            用同一编号重试（{attempt?.requestId}）
-          </button>
-          <button type="button" onClick={command.abandon} data-testid="abandon">
-            放弃这次操作（我已查看状态，知道它可能已执行）
-          </button>
-        </>
-      ) : null}
+    <div data-testid="command-error">
+      <Notice
+        tone={outcome.retrySame ? "warn" : "danger"}
+        title={outcome.error}
+        action={outcome.retrySame ? (
+          <>
+            <Button kind="primary" small onClick={command.retry} data-testid="retry-same">
+              用同一编号重试（{attempt?.requestId}）
+            </Button>
+            <Button kind="ghost" small onClick={command.abandon} data-testid="abandon">
+              放弃这次操作（我已查看状态，知道它可能已执行）
+            </Button>
+          </>
+        ) : null}
+      >
+        {outcome.retrySame
+          ? "结果未知：命令可能已经执行。请用同一编号重试，tradingd 会返回原结果，不会执行两次。"
+          : "命令没有执行（服务端明确答复）。请按提示修正后，取消并重新操作。"}
+      </Notice>
     </div>
   );
 }
