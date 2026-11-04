@@ -99,10 +99,6 @@ def identity_of(strategy: Strategy) -> Identity:
     return Identity(sid, version, universe)
 
 
-def check_identity(strategy: Strategy) -> None:
-    identity_of(strategy)
-
-
 def intent_id(identity: Identity, session_day: date, proposal: Proposal) -> str:
     return ":".join(
         (
