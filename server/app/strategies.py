@@ -18,13 +18,15 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from typing import Protocol
 
 from server.data.calendar import CalendarRangeError, TradingCalendar
 from server.data.lake import DataLake, LakeError
 from server.data.quality import bar_available_at
 from server.domain.market import MarketBar, Quote
+from server.domain.orders import OrderIntent
 from server.domain.values import to_utc
-from server.ipc.outbox import Outbox, OutboxConflictError, OutboxError
+from server.ipc.outbox import OutboxConflictError, OutboxError
 from server.strategy.base import Strategy, StrategyContext, StrategyError, evaluate
 
 
@@ -50,6 +52,12 @@ class StrategySchedule:
             raise ScheduleError(f"运行窗口必须为正且不超过 {MAX_RUN_WINDOW}（tradingd 的意图限龄）")
         if self.lookback_days <= 0 or self.publish_lag < timedelta(0):
             raise ScheduleError("回看天数必须为正，发布延迟不能为负")
+
+
+class IntentSink(Protocol):
+    """意图的去处：生产是 outbox；workerd 的调度先在线程里收集，再回到事件循环线程入队。"""
+
+    def enqueue(self, intent: OrderIntent) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -128,7 +136,7 @@ def run_strategies(  # noqa: PLR0912, PLR0913, PLR0915 - 调度的全部输入�
     *,
     lake: DataLake,
     calendar: TradingCalendar,
-    outbox: Outbox,
+    outbox: IntentSink,
     schedule: StrategySchedule,
     now: datetime,
     account_id: str,
