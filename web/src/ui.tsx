@@ -1,5 +1,6 @@
 // 通用界面组件（S-13）。颜色、间距只来自 styles.css 的变量；状态除了颜色都带文字或符号。
 import type { ReactNode } from "react";
+import { LANGS, type Lang, useT } from "./i18n";
 import type { Theme } from "./prefs";
 
 // ---------- 线性图标（24 网格，currentColor，1.75 线宽） ----------
@@ -36,17 +37,25 @@ export function Icon({ name, size = 18, label }: { name: IconName; size?: number
 
 // ---------- 模式标识（三态，颜色之外必有文字） ----------
 
-export type ModeText = "PAPER" | "HALT" | "未知";
+export type ModeText = "PAPER" | "HALT" | "UNKNOWN";
+
+/** 模式标识的文字：PAPER、HALT 两种语言都原样显示；UNKNOWN 按语言显示（未知 / UNKNOWN）。 */
+export function useModeText(): (mode: ModeText) => string {
+  const t = useT();
+  return (mode) => (mode === "UNKNOWN" ? t("mode.UNKNOWN") : mode);
+}
 
 export function ModeBadge({ mode, sample }: { mode: ModeText; sample?: boolean }) {
-  const kind = mode === "HALT" ? "halt" : mode === "未知" ? "unknown" : "paper";
-  const icon: IconName = mode === "HALT" ? "stop" : mode === "未知" ? "alert" : "check";
-  const note = mode === "PAPER" ? "模拟盘" : mode === "HALT" ? "已停止新增风险" : "状态不可信";
+  const t = useT();
+  const text = useModeText()(mode);
+  const kind = mode === "HALT" ? "halt" : mode === "UNKNOWN" ? "unknown" : "paper";
+  const icon: IconName = mode === "HALT" ? "stop" : mode === "UNKNOWN" ? "alert" : "check";
+  const note = t(`mode.note.${mode}`);
   return (
     <span className={`mode ${kind}`} role={sample ? undefined : "status"}
-      aria-label={`${sample ? "示例" : "当前模式"}：${mode}，${note}`}>
+      aria-label={t(sample ? "mode.ariaSample" : "mode.aria", { mode: text, note })}>
       <Icon name={icon} size={16} />
-      <span data-testid={sample ? undefined : "mode-badge"}>{mode}</span>
+      <span data-testid={sample ? undefined : "mode-badge"}>{text}</span>
       <span className="mode-note">{note}</span>
     </span>
   );
@@ -113,13 +122,14 @@ export function StatCard({ label, icon, value, sub, testId }: {
   sub?: ReactNode;
   testId?: string;
 }) {
+  const t = useT();
   return (
     <div className="card">
       <div className="stat-label">{icon ? <Icon name={icon} size={16} /> : null}{label}</div>
       {value === null ? (
         <>
           <span className="skeleton" aria-hidden />
-          <div className="stat-sub hint" data-testid={testId}>暂无数据</div>
+          <div className="stat-sub hint" data-testid={testId}>{t("common.noData")}</div>
         </>
       ) : (
         <>
@@ -133,8 +143,9 @@ export function StatCard({ label, icon, value, sub, testId }: {
 
 /** 盈亏：颜色 + 符号 + 箭头，三重信号（色弱友好）。value 是十进制字符串。 */
 export function PnL({ value }: { value: string }) {
+  const t = useT();
   const text = value.trim();
-  if (!/^[+-]?\d+(\.\d+)?$/.test(text)) return <span className="hint">暂无数据</span>; // 空值或非法值不显示成 0
+  if (!/^[+-]?\d+(\.\d+)?$/.test(text)) return <span className="hint">{t("common.noData")}</span>; // 空值或非法值不显示成 0
   const negative = text.startsWith("-");
   if (/^[+-]?0+(\.0+)?$/.test(text)) return <span className="num">0.00</span>;
   const abs = text.replace(/^[+-]/, "");
@@ -189,20 +200,39 @@ export function Empty({ icon = "inbox", title, children, testId }: {
 
 // ---------- 主题切换 ----------
 
-const THEMES: { id: Theme; icon: IconName; label: string }[] = [
-  { id: "dark", icon: "moon", label: "深色" },
-  { id: "light", icon: "sun", label: "浅色" },
-  { id: "system", icon: "monitor", label: "跟随系统" },
+const THEMES: { id: Theme; icon: IconName }[] = [
+  { id: "dark", icon: "moon" },
+  { id: "light", icon: "sun" },
+  { id: "system", icon: "monitor" },
 ];
 
 export function ThemeToggle({ theme, onChange }: { theme: Theme; onChange: (t: Theme) => void }) {
+  const t = useT();
   return (
-    <div className="row" role="radiogroup" aria-label="主题" style={{ gap: "var(--s1)" }}>
-      {THEMES.map((t) => (
-        <button key={t.id} type="button" role="radio" aria-checked={theme === t.id}
-          className={`btn small ${theme === t.id ? "" : "ghost"}`} title={t.label}
-          onClick={() => onChange(t.id)} data-testid={`theme-${t.id}`}>
-          <Icon name={t.icon} size={16} label={t.label} />
+    <div className="row" role="radiogroup" aria-label={t("theme.label")} style={{ gap: "var(--s1)" }}>
+      {THEMES.map((th) => (
+        <button key={th.id} type="button" role="radio" aria-checked={theme === th.id}
+          className={`btn small ${theme === th.id ? "" : "ghost"}`} title={t(`theme.${th.id}`)}
+          onClick={() => onChange(th.id)} data-testid={`theme-${th.id}`}>
+          <Icon name={th.icon} size={16} label={t(`theme.${th.id}`)} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---------- 语言切换（S-12） ----------
+
+const LANG_NAMES: Record<Lang, string> = { zh: "中文", en: "English" }; // 用各自语言写自己的名字
+
+export function LangToggle({ lang, onChange }: { lang: Lang; onChange: (l: Lang) => void }) {
+  const t = useT();
+  return (
+    <div className="row" role="radiogroup" aria-label={t("app.lang")} style={{ gap: "var(--s1)" }}>
+      {LANGS.map((l) => (
+        <button key={l} type="button" role="radio" aria-checked={lang === l} lang={l === "zh" ? "zh-CN" : "en"}
+          className={`btn small ${lang === l ? "" : "ghost"}`} onClick={() => onChange(l)} data-testid={`lang-${l}`}>
+          {LANG_NAMES[l]}
         </button>
       ))}
     </div>
@@ -212,8 +242,9 @@ export function ThemeToggle({ theme, onChange }: { theme: Theme; onChange: (t: T
 // ---------- 净值曲线（无依赖的简洁 SVG） ----------
 
 export function Sparkline({ points, label }: { points: number[]; label: string }) {
+  const t = useT();
   if (points.length < 2) {
-    return <Empty icon="chart" title="暂无净值数据" testId="nav-curve-empty">等待 tradingd 发布账户快照</Empty>;
+    return <Empty icon="chart" title={t("overview.curveEmpty")} testId="nav-curve-empty">{t("common.noSnapshot")}</Empty>;
   }
   const min = Math.min(...points);
   const max = Math.max(...points);

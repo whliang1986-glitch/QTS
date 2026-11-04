@@ -43,7 +43,8 @@ CATALOG: dict[str, CommandSpec] = {
     for spec in (
         CommandSpec("stop_new_orders", Tier.CONTROL, frozenset({"reason"}),
                     "停止新增风险（持久化 HALT，不撤保护性止损）"),
-        CommandSpec("cancel_open_orders", Tier.CONTROL, frozenset(), "逐单撤销开仓单"),
+        CommandSpec("cancel_open_orders", Tier.CONTROL, frozenset(),
+                    "逐单撤销开仓单与减仓单（含紧急平仓单），不撤保护性止损"),
         CommandSpec("preview_flatten", Tier.CONTROL, frozenset(),
                     "生成紧急平仓预览与确认短语（不下单）"),
         CommandSpec("reconcile", Tier.CONTROL, frozenset(), "立即与券商对账"),

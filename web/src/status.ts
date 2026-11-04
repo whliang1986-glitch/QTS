@@ -6,6 +6,8 @@
 import { useEffect, useRef, useState } from "react";
 import { call } from "./api/client";
 import type { StatusView } from "./api/types.gen";
+import { translate } from "./i18n";
+import { currentLang } from "./prefs";
 
 export const POLL_MS = 3000;
 export const STALE_MS = 10000;
@@ -58,7 +60,7 @@ export function useStatus(onUnauthorized: () => void): StatusState {
       const last = lastOk.current;
       if (last !== null && Date.now() - last > STALE_MS) {
         setState((s) => (s.connection === "ok"
-          ? { ...s, status: null, connection: "stale", error: "超过 10 秒没有刷新" }
+          ? { ...s, status: null, connection: "stale", error: translate(currentLang(), "status.staleWatchdog") }
           : s));
       }
     }, 1000);
@@ -73,10 +75,10 @@ export function useStatus(onUnauthorized: () => void): StatusState {
 }
 
 /** 模式标识只有三种：PAPER、HALT、未知。不可信或不认识的一律“未知”。 */
-export function modeLabel(state: StatusState): "PAPER" | "HALT" | "未知" {
+export function modeLabel(state: StatusState): "PAPER" | "HALT" | "UNKNOWN" {
   const status = state.status;
-  if (state.connection !== "ok" || status === null) return "未知";
+  if (state.connection !== "ok" || status === null) return "UNKNOWN";
   if (status.mode === "HALT" || status.halt?.halted === true) return "HALT";
   if (status.mode === "PAPER" && status.halt !== null && status.halt.halted === false) return "PAPER";
-  return "未知";
+  return "UNKNOWN";
 }

@@ -30,11 +30,11 @@ function json(route: Route, body: Json): Promise<void> {
   return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
 }
 
-async function prepare(page: Page, theme: Theme, loggedIn = true): Promise<void> {
-  await page.addInitScript(([t, li]) => {
-    localStorage.setItem("qts.prefs", JSON.stringify({ theme: t }));
+async function prepare(page: Page, theme: Theme, loggedIn = true, lang: "zh" | "en" = "zh"): Promise<void> {
+  await page.addInitScript(([t, li, l]) => {
+    localStorage.setItem("qts.prefs", JSON.stringify({ theme: t, lang: l }));
     if (li) sessionStorage.setItem("qts.token", "test-token");
-  }, [theme, loggedIn] as const);
+  }, [theme, loggedIn, lang] as const);
   await page.route("**/v1/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/v1/whoami") return json(route, { name: "dylan", role: "owner" });
@@ -47,8 +47,8 @@ async function prepare(page: Page, theme: Theme, loggedIn = true): Promise<void>
 const PAGES = ["showroom", "login", "overview", "orders", "positions", "risk", "emergency"] as const;
 type PageName = (typeof PAGES)[number];
 
-async function open(page: Page, name: PageName, theme: Theme): Promise<void> {
-  await prepare(page, theme, name !== "login");
+async function open(page: Page, name: PageName, theme: Theme, lang: "zh" | "en" = "zh"): Promise<void> {
+  await prepare(page, theme, name !== "login", lang);
   await page.goto(name === "showroom" ? "/#showroom" : "/");
   if (name === "showroom") {
     await expect(page.getByTestId("showroom")).toBeVisible();
@@ -81,6 +81,34 @@ test.describe("截图（SHOTS=1）", () => {
         });
       }
     }
+  }
+});
+
+test.describe("英文截图（SHOTS=1，S-12：英文更长，检查布局不被撑坏）", () => {
+  test.skip(!process.env.SHOTS, "只在需要更新设计截图时运行");
+  for (const size of ["desktop", "mobile"] as const) {
+    for (const name of ["login", "overview", "orders", "risk", "emergency"] as const) {
+      test(`en-${name}-dark-${size}`, async ({ page }) => {
+        const [width, height] = WIDTHS[size];
+        await page.setViewportSize({ width, height });
+        await open(page, name, "dark", "en");
+        await page.screenshot({
+          path: `../docs/design/screenshots/en-${name}-dark-${size}.png`, fullPage: true, animations: "disabled",
+        });
+      });
+    }
+  }
+});
+
+test.describe("无障碍：英文", () => {
+  for (const name of ["overview", "emergency"] as const) {
+    test(`axe en-${name}`, async ({ page }) => {
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await open(page, name, "light", "en");
+      const result = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa"]).analyze();
+      const serious = result.violations.filter((v) => v.impact === "serious" || v.impact === "critical").map((v) => v.id);
+      expect(serious).toEqual([]);
+    });
   }
 });
 
