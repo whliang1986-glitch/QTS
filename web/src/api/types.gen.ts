@@ -1,6 +1,40 @@
 // 由 scripts/gen_api_types.py 生成，不要手改（S-02）。
 // 金额与数量是十进制字符串；时间是带时区的 UTC ISO 字符串。
 
+export interface AckResponse {
+  alert_id: number;
+  requested: boolean;
+  already: boolean;
+}
+
+export interface AlertList {
+  alerts: AlertView[];
+}
+
+export interface AlertView {
+  alert_id: number;
+  key: string;
+  level: "P0" | "P1" | "P2" | "P3";
+  code: string;
+  text: Record<string, string>;
+  raised_at: string;
+  acked_by: string | null;
+  acked_at: string | null;
+  resolved_at: string | null;
+}
+
+export interface AuditEntry {
+  seq: number;
+  at: string;
+  action: string;
+  actor: string;
+  detail: Record<string, string>;
+}
+
+export interface AuditList {
+  entries: AuditEntry[];
+}
+
 export interface CommandCatalog {
   commands: CommandInfo[];
 }

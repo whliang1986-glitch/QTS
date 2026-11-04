@@ -46,6 +46,7 @@ from server.data.calendar import TradingCalendar
 from server.data.calendar_config import parse_calendar_overrides
 from server.platforms import LocalChannel, PlatformError, local_channel
 from server.risk.assembly import CoreInputs
+from server.storage.alertsdb import alerts_db_path
 from server.storage.config import ConfigError, load_toml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -170,7 +171,7 @@ async def _run(  # noqa: PLR0913 - 各进程的配置显式传入
             runtime_dir=settings.runtime_dir, ledger_path=settings.ledger, api_db=apid.api_db,
             tradingd_account=settings.accounts["tradingd"], host=apid.host, port=apid.port,
             tls_cert=apid.tls_cert, tls_key=apid.tls_key, confirmation_ttl=apid.confirmation_ttl,
-            instance=settings.instance,
+            instance=settings.instance, alerts_db=alerts_db_path(apid.api_db),
         )  # fmt: skip
         return await run_apid(api, channel, stop)
     if command == "workerd":
@@ -184,12 +185,27 @@ async def _run(  # noqa: PLR0913 - 各进程的配置显式传入
         guard = GuarddSettings(
             runtime_dir=settings.runtime_dir, ledger_path=settings.ledger,
             check_seconds=settings.guard_check_seconds, timeout=settings.guard_timeout,
+            alerts_db=None if apid is None else alerts_db_path(apid.api_db),
+            api_db=None if apid is None else apid.api_db,
+            store_expected=True,
         )  # fmt: skip
         return await run_guardd(guard, GuarddDeps(), stop)
     specs = [ChildSpec(name, (*CHILD_ARGV, name, *child_args)) for name in CHILDREN]
     outcomes = await Supervisor(specs).run()
     logging.getLogger(__name__).warning("守护进程结束：%s", outcomes)
     return 0
+
+
+def _guardd_apid_config(path: Path, root: Path) -> ApidConfig | None:
+    """guardd 只需要 api.db 与 alerts.db 的路径（S-05a 评审 P1-4）：apid 配置读不了也照常看门，
+    只是告警改为只在内存里保留（并报 P1），不接受网页确认。"""
+    try:
+        return parse_apid_config(load_toml(path, name="apid"), base=root)
+    except (ConfigError, OSError, ValueError) as exc:
+        logging.getLogger(__name__).error(
+            "guardd 读不了 apid 配置，告警只在内存里保留、不接受网页确认：%s", exc
+        )
+        return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -214,6 +230,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         apid = (
             parse_apid_config(load_toml(args.apid_config, name="apid"), base=args.root)
             if args.command in {"apid", "supervise"}
+            else _guardd_apid_config(args.apid_config, args.root)
+            if args.command == "guardd"
             else None
         )
         time = production_time(
