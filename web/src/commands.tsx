@@ -9,6 +9,7 @@
 import { createContext, useContext, useState, type ReactNode } from "react";
 import { call, newRequestId, type Result } from "./api/client";
 import type { CommandResponse, ConfirmationResponse } from "./api/types.gen";
+import { useT } from "./i18n";
 import { Button, Notice } from "./ui";
 
 export type Params = Record<string, string>;
@@ -25,7 +26,7 @@ export type Outcome =
   | { kind: "idle" }
   | { kind: "running" }
   | { kind: "done"; response: CommandResponse }
-  | { kind: "failed"; error: string; retrySame: boolean };
+  | { kind: "failed"; error: string; retrySame: boolean; notSent?: boolean };
 
 interface Entry {
   attempt: Attempt | null;
@@ -63,9 +64,9 @@ export function useCommand(key: string, high: boolean) {
   const [entries, put] = store;
   const entry = entries[key] ?? EMPTY;
 
-  const fail = (attempt: Attempt, error: string, retrySame: boolean) => {
+  const fail = (attempt: Attempt, error: string, retrySame: boolean, notSent = false) => {
     const unknown = attempt.unknown || retrySame;
-    put(key, { attempt: { ...attempt, unknown }, outcome: { kind: "failed", error, retrySame: unknown } });
+    put(key, { attempt: { ...attempt, unknown }, outcome: { kind: "failed", error, retrySame: unknown, notSent } });
   };
 
   const run = async (current: Attempt) => {
@@ -74,7 +75,7 @@ export function useCommand(key: string, high: boolean) {
     if (high && next.confirmationId === null) {
       const confirm = await confirmation(next.name, next.params);
       if (!confirm.ok) {
-        fail(next, confirm.error, next.unknown); // 申请确认号失败：命令没有发出
+        fail(next, confirm.error, next.unknown, true); // 申请确认号失败：命令没有发出
         return;
       }
       next = { ...next, confirmationId: confirm.data.confirmation_id };
@@ -109,18 +110,19 @@ export function useCommand(key: string, high: boolean) {
 }
 
 export function OutcomeView({ command }: { command: ReturnType<typeof useCommand> }) {
+  const t = useT();
   const { outcome, attempt } = command;
   if (outcome.kind === "idle") return null;
   if (outcome.kind === "running") {
-    return <div data-testid="command-running"><Notice tone="info" title="执行中……">正在等待 tradingd 回答。</Notice></div>;
+    return <div data-testid="command-running"><Notice tone="info" title={t("cmd.running")}>{t("cmd.runningHint")}</Notice></div>;
   }
   if (outcome.kind === "done") {
     const r = outcome.response;
     const reason = !r.ok && typeof r.detail.error === "string" ? r.detail.error : null;
     return (
       <div data-testid="command-result">
-        <Notice tone={r.ok ? "ok" : "warn"} title={`${r.ok ? "已执行" : "tradingd 拒绝执行"}${r.replayed ? "（这是同一编号之前那次的结果）" : ""}`}>
-          {reason ? `原因：${reason}` : null}
+        <Notice tone={r.ok ? "ok" : "warn"} title={`${r.ok ? t("cmd.done") : t("cmd.refusedByRules")}${r.replayed ? t("cmd.replayed") : ""}`}>
+          {reason ? t("cmd.reason", { reason }) : null}
         </Notice>
       </div>
     );
@@ -133,17 +135,17 @@ export function OutcomeView({ command }: { command: ReturnType<typeof useCommand
         action={outcome.retrySame ? (
           <>
             <Button kind="primary" small onClick={command.retry} data-testid="retry-same">
-              用同一编号重试（{attempt?.requestId}）
+              {t("cmd.retrySame", { id: attempt?.requestId ?? "" })}
             </Button>
             <Button kind="ghost" small onClick={command.abandon} data-testid="abandon">
-              放弃这次操作（我已查看状态，知道它可能已执行）
+              {t("cmd.abandon")}
             </Button>
           </>
         ) : null}
       >
         {outcome.retrySame
-          ? "结果未知：命令可能已经执行。请用同一编号重试，tradingd 会返回原结果，不会执行两次。"
-          : "命令没有执行（服务端明确答复）。请按提示修正后，取消并重新操作。"}
+          ? t("cmd.unknownHint")
+          : outcome.notSent ? t("cmd.notSentHint") : t("cmd.notExecutedHint")}
       </Notice>
     </div>
   );

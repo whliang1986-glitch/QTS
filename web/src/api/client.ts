@@ -4,6 +4,8 @@
 // - 每次调用返回成功或失败两种结果，调用方必须处理失败；不抛异常，不吞错误。
 // - 每个请求都有超时：挂起的请求按失败处理（不让旧状态一直显示为“正常”）。
 // - 失败里的 retrySame 为真时，只能用同一个 request_id 重试（服务端去重），界面不得换号。
+import { translate } from "../i18n";
+import { currentLang } from "../prefs";
 import type { ErrorResponse } from "./types.gen";
 
 const TOKEN_KEY = "qts.token";
@@ -57,7 +59,7 @@ export async function call<T>(
     });
   } catch {
     // 网络断开或超时：没有拿到回答。对命令而言结果未知，只能同号重试。
-    return { ok: false, status: 0, error: "连不上服务器或超时，结果未知", retrySame: true };
+    return { ok: false, status: 0, error: translate(currentLang(), "status.unreachable"), retrySame: true };
   }
   let payload: unknown = null;
   try {
@@ -71,7 +73,7 @@ export async function call<T>(
   return {
     ok: false,
     status: response.status,
-    error: typeof err?.error === "string" ? err.error : `请求失败（${response.status}）`,
+    error: typeof err?.error === "string" ? err.error : translate(currentLang(), "status.requestFailed", { status: response.status }),
     // 5xx 且回答里没有明确的 retry_same_request_id（未捕获的 500、代理 502 等）：结果不确定，按未知处理
     retrySame:
       err?.retry_same_request_id === true ||

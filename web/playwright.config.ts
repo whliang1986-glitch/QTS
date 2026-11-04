@@ -10,6 +10,7 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:5173",
     channel: process.env.PW_CHANNEL ?? "msedge",
+    locale: "zh-CN", // 默认语言跟随浏览器（S-12）：测试默认按中文；i18n.spec.ts 另测英文与回退
     trace: "off",
   },
   webServer: {

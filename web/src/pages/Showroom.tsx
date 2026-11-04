@@ -6,7 +6,7 @@ import {
 } from "../ui";
 
 const SAMPLE_CURVE = [100, 101.2, 100.6, 102.4, 103.1, 102.2, 104.8, 105.3, 104.9, 106.7, 107.2, 106.1, 108.4];
-const LONG_EN = "Stop new orders (persistent HALT; protective stops stay in place)";
+const LONG_EN = "Stop new risk (persistent HALT; protective stops stay in place)";
 
 export function Showroom({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => void }) {
   return (
@@ -20,7 +20,7 @@ export function Showroom({ theme, setTheme }: { theme: Theme; setTheme: (t: Them
       <main className="showroom" data-testid="showroom">
         <section>
           <h2>模式标识（三态，颜色之外必有文字）</h2>
-          <div className="row section"><ModeBadge mode="PAPER" sample /><ModeBadge mode="HALT" sample /><ModeBadge mode="未知" sample /></div>
+          <div className="row section"><ModeBadge mode="PAPER" sample /><ModeBadge mode="HALT" sample /><ModeBadge mode="UNKNOWN" sample /></div>
           <div className="section halt-band" role="presentation"><Icon name="stop" />已停止新增风险（HALT）：人工急停。恢复须走恢复流程。</div>
           <div className="stale"><Icon name="clock" />数据可能已过期，服务器仍在运行。（超过 10 秒没有刷新）</div>
         </section>
@@ -73,7 +73,7 @@ export function Showroom({ theme, setTheme }: { theme: Theme; setTheme: (t: Them
           <h2>提示条</h2>
           <div className="stack section">
             <Notice tone="info" title="执行中……">正在等待 tradingd 回答。</Notice>
-            <Notice tone="ok" title="已执行">撤销开仓单完成：3 笔已撤。</Notice>
+            <Notice tone="ok" title="已执行">撤销开仓与减仓单完成：3 笔已撤。</Notice>
             <Notice tone="warn" title="命令已发出但结果未知" action={<Button kind="primary" small>用同一编号重试（web-…）</Button>}>
               结果未知：命令可能已经执行。请用同一编号重试，tradingd 会返回原结果，不会执行两次。
             </Notice>
@@ -101,9 +101,9 @@ export function Showroom({ theme, setTheme }: { theme: Theme; setTheme: (t: Them
           <h2>急停控件（静态外观）</h2>
           <div className="danger-zone section">
             <div className="controls">
-              <div className="control"><h3><Icon name="stop" />停止新增</h3>
+              <div className="control"><h3><Icon name="stop" />停止新增风险（HALT）</h3>
                 <p className="what">持久化 HALT：拒绝一切新增风险。不撤已有订单，也不撤保护性止损。</p>
-                <div className="actions"><Button>停止新增……</Button></div></div>
+                <div className="actions"><Button>停止新增风险（HALT）……</Button></div></div>
               <div className="control high"><h3><Icon name="alert" />撤销保护性止损<span className="tag danger">高危</span></h3>
                 <p className="what">撤掉全部保护性止损：之后持仓没有止损保护。</p>
                 <div className="actions"><Button kind="danger-outline">撤销保护性止损……</Button></div></div>

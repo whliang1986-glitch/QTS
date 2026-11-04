@@ -9,7 +9,7 @@
   状态由锁保护；发送本身在锁外，单次 pump 最多发 max_per_pump 条。
 - 发送失败按退避重试；全局限速防止告警风暴打爆渠道（顺延，不丢，P0 优先）。
 - 渠道不可用（没有配置、缺凭据）：告警照常写日志，stats.channel_ok=False 供面板与健康检查显示。
-- 消息是“代码 + 参数”，渲染成文字在 render() 里（多语言在 S-12 接入）。
+- 消息是“代码 + 参数”，按 AlertHub 的语言渲染（S-12：zh / en；不认识的语言用中文）。
 """
 
 from __future__ import annotations
@@ -39,20 +39,47 @@ PUSHED = frozenset({Level.P0, Level.P1})
 _LOG_LEVEL = {Level.P0: logging.CRITICAL, Level.P1: logging.ERROR,
               Level.P2: logging.WARNING, Level.P3: logging.INFO}  # fmt: skip
 
-# 告警代码 → 中文模板（S-12 换成语言包）
-MESSAGES: dict[str, str] = {
-    "tradingd_heartbeat_lost": "tradingd 心跳丢失超过 {seconds} 秒，guardd 已开始逐单撤销开仓单",
-    "guard_check_failing": "guardd 连续 {count} 轮检查出错（{error}），看门狗可能失效",
-    "duplicate_order_risk": "疑似重复下单：{detail}",
-    "account_unknown": "账户状态未知：{detail}",
-    "live_mode_switch": "检测到实盘模式切换：{detail}",
-    "emergency_failed": "急停执行失败：{detail}",
-    "protective_stop_missing": "保护性止损缺失：{symbol}",
-    "broker_disconnected": "券商连接断开：{detail}",
-    "quotes_stale": "行情严重陈旧：{detail}",
-    "reconcile_mismatch": "对账不一致：{detail}",
-    "alert_test": "告警通路测试：{detail}",
+# 告警代码 → 各语言模板（S-12）。两种语言的代码与占位符必须一致（单元测试核对）；
+# 风险相关的含义必须一致：改一处就要同时改另一处。
+LANGS = ("zh", "en")
+MESSAGES: dict[str, dict[str, str]] = {
+    "zh": {
+        "tradingd_heartbeat_lost": (
+            "tradingd 心跳丢失超过 {seconds} 秒，guardd 已开始逐单撤销开仓单"
+        ),
+        "guard_check_failing": "guardd 连续 {count} 轮检查出错（{error}），看门狗可能失效",
+        "duplicate_order_risk": "疑似重复下单：{detail}",
+        "account_unknown": "账户状态未知：{detail}",
+        "live_mode_switch": "检测到实盘模式切换：{detail}",
+        "emergency_failed": "急停执行失败：{detail}",
+        "protective_stop_missing": "保护性止损缺失：{symbol}",
+        "broker_disconnected": "券商连接断开：{detail}",
+        "quotes_stale": "行情严重陈旧：{detail}",
+        "reconcile_mismatch": "对账不一致：{detail}",
+        "alert_test": "告警通路测试：{detail}",
+        "_repeat": "（第 {n} 次提醒，确认前会继续提醒）",
+    },
+    "en": {
+        "tradingd_heartbeat_lost": (
+            "tradingd heartbeat lost for over {seconds} s; "
+            "guardd is cancelling opening orders one by one"
+        ),
+        "guard_check_failing": (
+            "guardd check failed {count} rounds in a row ({error}); the watchdog may not be working"
+        ),
+        "duplicate_order_risk": "Possible duplicate order: {detail}",
+        "account_unknown": "Account state unknown: {detail}",
+        "live_mode_switch": "Live mode switch detected: {detail}",
+        "emergency_failed": "Emergency control failed: {detail}",
+        "protective_stop_missing": "Protective stop missing: {symbol}",
+        "broker_disconnected": "Broker disconnected: {detail}",
+        "quotes_stale": "Quotes badly stale: {detail}",
+        "reconcile_mismatch": "Reconciliation mismatch: {detail}",
+        "alert_test": "Alert channel test: {detail}",
+        "_repeat": " (reminder {n}; reminders continue until acknowledged)",
+    },
 }
+CODES = frozenset(k for k in MESSAGES["zh"] if not k.startswith("_"))
 
 
 class AlertChannel(Protocol):
@@ -71,15 +98,16 @@ class Alert:
     key: str  # 去重键：同一问题用同一 key
 
     def __post_init__(self) -> None:
-        if self.code not in MESSAGES:
+        if self.code not in CODES:
             raise ValueError(f"未登记的告警代码：{self.code}")
         if not self.key.strip():
             raise ValueError("告警 key 不能为空")
 
 
-def render(alert: Alert) -> str:
+def render(alert: Alert, lang: str = "zh") -> str:
+    table = MESSAGES.get(lang, MESSAGES["zh"])
     try:
-        body = MESSAGES[alert.code].format(**alert.params)
+        body = table[alert.code].format(**alert.params)
     except (KeyError, IndexError):  # 参数不全也要发出去：宁可难看，不能丢
         body = f"{alert.code} {dict(alert.params)}"
     return f"[{alert.level.name}] {body}"
@@ -115,10 +143,14 @@ class AlertHub:
         retry_max: timedelta = timedelta(minutes=2),
         max_sends_per_minute: int = 20,
         max_per_pump: int = 5,
+        lang: str = "zh",
     ) -> None:
         if repeat_every <= timedelta(0) or retry_base <= timedelta(0):
             raise ValueError("间隔必须为正")
         self._channel = channel
+        self._lang = lang if lang in MESSAGES else "zh"
+        if lang not in MESSAGES:  # 配置写错不静默：记一条警告再回退中文
+            log_event(log, logging.WARNING, "告警语言不认识，改用中文", lang=lang)
         self._clock = clock
         self._repeat = repeat_every
         self._retry_base = retry_base
@@ -142,7 +174,7 @@ class AlertHub:
             now = self._clock()
             self._open[alert.key] = _Open(alert, now, now if alert.level in PUSHED else None)
         log_event(log, _LOG_LEVEL[alert.level], "告警", level=alert.level.name, code=alert.code,
-                  key=alert.key, text=render(alert))  # fmt: skip
+                  key=alert.key, text=render(alert, self._lang))  # fmt: skip
         return True
 
     def acknowledge(self, key: str, *, actor: str) -> bool:
@@ -208,9 +240,9 @@ class AlertHub:
 
     def _send(self, item: _Open) -> None:
         assert self._channel is not None  # noqa: S101 - pump 已检查
-        text = render(item.alert)
+        text = render(item.alert, self._lang)
         if item.sent > 0:
-            text += f"（第 {item.sent + 1} 次提醒，确认前会继续提醒）"
+            text += MESSAGES[self._lang]["_repeat"].format(n=item.sent + 1)
         error: str | None = None
         try:
             self._channel.send(text)
@@ -240,4 +272,14 @@ class AlertHub:
             )  # fmt: skip
 
 
-__all__ = ("MESSAGES", "Alert", "AlertChannel", "AlertHub", "HubStats", "Level", "render")
+__all__ = (
+    "CODES",
+    "LANGS",
+    "MESSAGES",
+    "Alert",
+    "AlertChannel",
+    "AlertHub",
+    "HubStats",
+    "Level",
+    "render",
+)

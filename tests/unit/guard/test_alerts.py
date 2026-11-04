@@ -359,3 +359,43 @@ def test_heartbeat_does_not_follow_redirects() -> None:
 
     base = urllib.request.HTTPRedirectHandler.redirect_request
     assert heartbeat_ping._NoRedirect.redirect_request is not base  # 覆盖了跟随重定向的默认行为
+
+
+# ---------- 多语言（S-12） ----------
+
+
+def test_alert_languages_have_the_same_codes_and_placeholders() -> None:
+    import string  # noqa: PLC0415
+
+    from server.guard.alerts import LANGS, MESSAGES  # noqa: PLC0415
+
+    def holes(text: str) -> set[str]:
+        return {name for _, name, _, _ in string.Formatter().parse(text) if name}
+
+    assert set(MESSAGES) == set(LANGS)
+    assert set(MESSAGES["en"]) == set(MESSAGES["zh"])
+    for code, zh_text in MESSAGES["zh"].items():
+        assert holes(MESSAGES["en"][code]) == holes(zh_text), code
+        assert MESSAGES["en"][code].strip(), code
+
+
+def test_english_hub_sends_english_and_unknown_language_falls_back() -> None:
+    clock, channel = Clock(), FakeChannel()
+    alerts = AlertHub(channel, clock=clock, lang="en")
+    alerts.raise_alert(p0())
+    alerts.pump()
+    clock.advance(300)
+    alerts.pump()
+    expected = (
+        "tradingd heartbeat lost for over 90 s; guardd is cancelling opening orders one by one"
+    )
+    assert channel.sent[0] == f"[P0] {expected}"
+    assert "reminder 2" in channel.sent[1]
+    assert render(p0(), "fr").startswith("[P0] tradingd 心跳丢失")
+    assert AlertHub(FakeChannel(), lang="fr")._lang == "zh"
+
+
+def test_unknown_alert_language_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING)
+    AlertHub(FakeChannel(), lang="en-US")
+    assert any(r.getMessage() == "告警语言不认识，改用中文" for r in caplog.records)

@@ -7,19 +7,29 @@ import { CommandStore } from "./commands";
 import { Emergency } from "./pages/Emergency";
 import { Showroom } from "./pages/Showroom";
 import { Orders, Overview, Positions, Risk, connectionText } from "./pages/Views";
-import { type Theme, useTheme } from "./prefs";
+import { LangProvider, type MessageKey, useT } from "./i18n";
+import { type Theme, useLangPref, useTheme } from "./prefs";
 import { modeLabel, useStatus } from "./status";
-import { Button, Icon, type IconName, ModeBadge, Notice, Tag, ThemeToggle } from "./ui";
+import { Button, Icon, type IconName, LangToggle, ModeBadge, Notice, Tag, ThemeToggle } from "./ui";
+import type { Lang } from "./i18n";
 
-const PAGES: readonly [string, string, IconName][] = [
-  ["overview", "总览", "overview"],
-  ["orders", "订单", "orders"],
-  ["positions", "持仓", "positions"],
-  ["risk", "风险", "risk"],
-  ["emergency", "急停", "stop"],
+const PAGES: readonly [string, MessageKey, IconName][] = [
+  ["overview", "nav.overview", "overview"],
+  ["orders", "nav.orders", "orders"],
+  ["positions", "nav.positions", "positions"],
+  ["risk", "nav.risk", "risk"],
+  ["emergency", "nav.emergency", "stop"],
 ];
 
-function Login({ onLogin }: { onLogin: () => void }) {
+interface Prefs {
+  theme: Theme;
+  setTheme: (t: Theme) => void;
+  lang: Lang;
+  setLang: (l: Lang) => void;
+}
+
+function Login({ onLogin, prefs }: { onLogin: () => void; prefs: Prefs }) {
+  const t = useT();
   const [token, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
   const submit = async () => {
@@ -34,28 +44,28 @@ function Login({ onLogin }: { onLogin: () => void }) {
   };
   return (
     <form className="login card" onSubmit={(e) => { e.preventDefault(); void submit(); }}>
-      <h1>QTS</h1>
-      <p className="hint">量化交易控制台 · 令牌只保存在当前标签页</p>
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <h1>QTS</h1>
+        <LangToggle lang={prefs.lang} onChange={prefs.setLang} />
+      </div>
+      <p className="hint">{t("app.tagline")}</p>
       <label className="field">
-        访问令牌
+        {t("login.token")}
         <input className="input" type="password" autoComplete="off" value={token} autoFocus
           onChange={(e) => setValue(e.target.value)} data-testid="token-input" />
       </label>
-      <Button kind="primary" type="submit" disabled={token.trim() === ""} data-testid="login">登录</Button>
+      <Button kind="primary" type="submit" disabled={token.trim() === ""} data-testid="login">{t("login.submit")}</Button>
       {error ? (
         <div style={{ marginTop: "var(--s3)" }}>
-          <Notice tone="danger" title="登录失败" testId="login-error">{error}。令牌错误或过期时请换一个；服务器繁忙时请稍后再试。</Notice>
+          <Notice tone="danger" title={t("login.failed")} testId="login-error">{t("login.failedHint", { error })}</Notice>
         </div>
       ) : null}
     </form>
   );
 }
 
-function Shell({ onLogout, theme, setTheme }: {
-  onLogout: () => void;
-  theme: Theme;
-  setTheme: (t: Theme) => void;
-}) {
+function Shell({ onLogout, prefs }: { onLogout: () => void; prefs: Prefs }) {
+  const t = useT();
   const [page, setPage] = useState("overview");
   const [who, setWho] = useState<WhoAmI | null>(null);
   const [whoError, setWhoError] = useState<string | null>(null);
@@ -92,34 +102,35 @@ function Shell({ onLogout, theme, setTheme }: {
       <header className="topbar">
         <span className="brand">QTS</span>
         <ModeBadge mode={mode} />
-        <Tag tone={connTone}><Icon name="wifi" size={14} /><span data-testid="connection">{connectionText(state)}</span></Tag>
+        <Tag tone={connTone}><Icon name="wifi" size={14} /><span data-testid="connection">{t(connectionText(state))}</span></Tag>
         <span className="spacer" />
         <span className="who" data-testid="who">
-          {who ? `${who.name} · ${who.role}` : whoError ? `身份未确认：${whoError}` : ""}
+          {who ? `${who.name} · ${who.role}` : whoError ? t("top.whoUnconfirmed", { error: whoError }) : ""}
         </span>
-        <ThemeToggle theme={theme} onChange={setTheme} />
-        <Button kind="ghost" small icon="logout" onClick={() => { setToken(null); onLogout(); }}>退出</Button>
+        <LangToggle lang={prefs.lang} onChange={prefs.setLang} />
+        <ThemeToggle theme={prefs.theme} onChange={prefs.setTheme} />
+        <Button kind="ghost" small icon="logout" onClick={() => { setToken(null); onLogout(); }}>{t("top.logout")}</Button>
       </header>
       {mode === "HALT" ? (
         <div className="halt-band" role="alert">
-          <Icon name="stop" />已停止新增风险（HALT）：{state.status?.halt?.reason ?? ""}。恢复须走恢复流程。
+          <Icon name="stop" />{t("banner.halt", { reason: state.status?.halt?.reason ?? "" })}
         </div>
       ) : null}
-      {state.connection === "ok" && mode === "未知" ? (
+      {state.connection === "ok" && mode === "UNKNOWN" ? (
         <div className="stale" role="alert" data-testid="untrusted-banner">
-          <Icon name="alert" />服务器返回的运行状态不完整或无法识别，界面按“未知”处理。请以券商端为准。
+          <Icon name="alert" />{t("banner.untrusted")}
         </div>
       ) : null}
       {state.connection !== "ok" ? (
         <div className="stale" role="alert" data-testid="stale-banner">
-          <Icon name="clock" />数据可能已过期，服务器仍在运行。{state.error ? `（${state.error}）` : ""}
+          <Icon name="clock" />{t("banner.stale")}{state.error ? ` · ${state.error}` : ""}
         </div>
       ) : null}
-      <nav className="tabs" aria-label="页面">
+      <nav className="tabs" aria-label={t("nav.label")}>
         {PAGES.map(([id, title, icon]) => (
           <button type="button" key={id} className={page === id ? "active" : ""} aria-current={page === id ? "page" : undefined}
             onClick={() => setPage(id)} data-testid={`nav-${id}`}>
-            <Icon name={icon} size={16} />{title}
+            <Icon name={icon} size={16} />{t(title)}
           </button>
         ))}
       </nav>
@@ -148,19 +159,23 @@ export function App() {
   const [loggedIn, setLoggedIn] = useState(getToken() !== null);
   const logout = useCallback(() => setLoggedIn(false), []);
   const hash = useHash();
-  const [theme, setTheme] = useTheme(); // 主题只在这里持有：登录页、陈列室、外壳共用
+  const [theme, setTheme] = useTheme(); // 主题与语言只在这里持有：登录页、陈列室、外壳共用
+  const [lang, setLang] = useLangPref();
+  const prefs: Prefs = { theme, setTheme, lang, setLang };
   // CommandStore 在最外层：退出、令牌失效、打开陈列室再回来，结果未知的编号都还在（只在内存里）
   // 陈列室只在开发与测试构建里提供（正式构建不含示例页面）
   const showroom = import.meta.env.DEV && hash === "#showroom";
   return (
-    <CommandStore>
-      {showroom ? (
-        <Showroom theme={theme} setTheme={setTheme} />
-      ) : loggedIn ? (
-        <Shell onLogout={logout} theme={theme} setTheme={setTheme} />
-      ) : (
-        <Login onLogin={() => setLoggedIn(true)} />
-      )}
-    </CommandStore>
+    <LangProvider lang={lang}>
+      <CommandStore>
+        {showroom ? (
+          <Showroom theme={theme} setTheme={setTheme} />
+        ) : loggedIn ? (
+          <Shell onLogout={logout} prefs={prefs} />
+        ) : (
+          <Login onLogin={() => setLoggedIn(true)} prefs={prefs} />
+        )}
+      </CommandStore>
+    </LangProvider>
   );
 }
