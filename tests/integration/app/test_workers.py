@@ -225,3 +225,81 @@ async def test_guardd_contract_disconnect_is_a_crash(tmp_path: Path, how: str) -
     else:
         env.server.drop_client(97)
     assert await asyncio.wait_for(guardd, 10) == EXIT_CRASH
+
+
+class Phone:
+    name = "fake"
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.sent: list[str] = []
+        self.delay = delay
+
+    def send(self, text: str) -> None:
+        import time  # noqa: PLC0415
+
+        time.sleep(self.delay)
+        self.sent.append(text)
+
+
+async def wait_for(condition: Any, rounds: int = 200) -> bool:
+    for _ in range(rounds):
+        if condition():
+            return True
+        await asyncio.sleep(0.05)
+    return bool(condition())
+
+
+@pytest.mark.asyncio
+async def test_guardd_alert_lifecycle_lost_ack_restored_lost(tmp_path: Path) -> None:
+    """S-07：心跳丢失 → P0 推送；确认后每轮重复上报也不再推送；心跳恢复即解除；再丢失重新推送。"""
+    from server.guard.alerts import AlertHub  # noqa: PLC0415
+    from server.guard.heartbeat import HeartbeatFile  # noqa: PLC0415
+
+    env = Env(tmp_path, cross_client_cancel=True)
+    await env.broker.connect()
+    phone = Phone()
+    alerts = AlertHub(phone, clock=env.clock)
+    beat = HeartbeatFile(tmp_path / "run" / "tradingd.heartbeat")
+    stop = asyncio.Event()
+    deps = GuarddDeps(broker=lambda: FakeBroker(env.server, client_id=99), clock=env.clock,
+                      alerts=alerts)  # fmt: skip
+    guardd = asyncio.create_task(run_guardd(guard_settings(tmp_path), deps, stop))
+    assert await wait_for(lambda: len(phone.sent) == 1)
+    assert phone.sent[0].startswith("[P0]") and "心跳丢失" in phone.sent[0]
+    alerts.acknowledge("tradingd_heartbeat_lost", actor="dylan")
+    await asyncio.sleep(0.6)  # guardd 又跑了很多轮，仍在上报心跳丢失
+    assert len(phone.sent) == 1
+    beat.beat(env.clock())  # tradingd 恢复
+    assert await wait_for(lambda: alerts.unresolved() == [])
+    env.clock.advance(120)  # 心跳又过期
+    assert await wait_for(lambda: len(phone.sent) == 2)
+    stop.set()
+    assert await asyncio.wait_for(guardd, 10) == EXIT_OK
+
+
+@pytest.mark.asyncio
+async def test_slow_phone_channel_does_not_block_the_watchdog(tmp_path: Path) -> None:
+    """S-07：推送在线程里：渠道每次发送卡 3 秒，guardd 照样按时检查、及时退出。"""
+    from server.guard.alerts import AlertHub  # noqa: PLC0415
+
+    env = Env(tmp_path, cross_client_cancel=True)
+    await env.broker.connect()
+    await env.submit("o-slow")
+    await env.pump()
+    phone = Phone(delay=3.0)
+    deps = GuarddDeps(broker=lambda: FakeBroker(env.server, client_id=99), clock=env.clock,
+                      alerts=AlertHub(phone, clock=env.clock))  # fmt: skip
+    stop = asyncio.Event()
+    guardd = asyncio.create_task(run_guardd(guard_settings(tmp_path), deps, stop))
+
+    async def cancelled() -> bool:
+        await env.pump()
+        return env.om.status("o-slow") is OrderStatus.CANCELLED
+
+    for _ in range(40):  # 2 秒内就撤掉，不等 3 秒的推送
+        if await cancelled():
+            break
+        await asyncio.sleep(0.05)
+    assert env.om.status("o-slow") is OrderStatus.CANCELLED
+    stop.set()
+    assert await asyncio.wait_for(guardd, 2) == EXIT_OK  # 退出不被推送拖住
