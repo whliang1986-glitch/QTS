@@ -16,7 +16,7 @@ dependencies = [
     # zoneinfo 在 Windows 上没有系统时区库，全靠 tzdata（S-01e：显式声明，不依赖 pandas 的传递依赖）
     "tzdata>=2024.1",
     "uvicorn>=0.32,<1",
-    "websockets>=13,<16",
+    "websockets>=17.4,<18",
 ]
 
 [dependency-groups]
