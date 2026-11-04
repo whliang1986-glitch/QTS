@@ -5,6 +5,9 @@
   所以在开盘后运行，而不是前一晚。
 - 输入：从数据湖读每个标的的日线，只保留在决策时刻之前收盘并过了发布延迟的；
   质量门禁阻断的标的（D-05 / D-02 的 blocked）或缺数据的标的所在的策略整个跳过（失败即关闭）。
+- T-02 补充输入（inputs，可选）：报价、净值、已结算现金、止损记录、运行模式；
+  交易日序列由交易日历算出。
+  inputs 出错时整轮按“读不到输入”跳过（失败即关闭）；缺了哪一项由需要它的策略自己拒绝。
 - 输出：意图逐条放进 outbox（幂等键见 server/strategy/base.py）；同键同内容重复入队无副作用，
   同键不同内容拒绝。策略出错只影响它自己，不影响其他策略。
 """
@@ -19,7 +22,7 @@ from decimal import Decimal
 from server.data.calendar import CalendarRangeError, TradingCalendar
 from server.data.lake import DataLake, LakeError
 from server.data.quality import bar_available_at
-from server.domain.market import MarketBar
+from server.domain.market import MarketBar, Quote
 from server.domain.values import to_utc
 from server.ipc.outbox import Outbox, OutboxConflictError, OutboxError
 from server.strategy.base import Strategy, StrategyContext, StrategyError, evaluate
@@ -47,6 +50,30 @@ class StrategySchedule:
             raise ScheduleError(f"运行窗口必须为正且不超过 {MAX_RUN_WINDOW}（tradingd 的意图限龄）")
         if self.lookback_days <= 0 or self.publish_lag < timedelta(0):
             raise ScheduleError("回看天数必须为正，发布延迟不能为负")
+
+
+@dataclass(frozen=True)
+class StrategyInputs:
+    """一轮运行的账户与行情输入（T-02）。
+
+    由 workerd 装配：报价来自行情订阅，账户来自账本只读连接。
+    """
+
+    quotes: Mapping[str, Quote] = field(default_factory=dict)
+    nav: Decimal | None = None
+    settled_cash: Decimal | None = None
+    stopped_out: Mapping[str, date] | None = None  # None：没有提供（需要它的策略拒绝运行）
+    mode: str | None = None
+
+
+def trading_sessions(calendar: TradingCalendar, start: date, end: date) -> list[date]:
+    """start 到 end（含）之间的交易日，升序。"""
+    days, d = [], start
+    while d <= end:
+        if calendar.is_trading_day(d):
+            days.append(d)
+        d += timedelta(days=1)
+    return days
 
 
 def decision_time(
@@ -96,7 +123,7 @@ def _label(strategy: Strategy, index: int) -> str:
         return f"#{index}"
 
 
-def run_strategies(  # noqa: PLR0912, PLR0913 - 调度的全部输入与跳过原因逐项列出
+def run_strategies(  # noqa: PLR0912, PLR0913, PLR0915 - 调度的全部输入与跳过原因逐项列出
     strategies: Sequence[Strategy],
     *,
     lake: DataLake,
@@ -107,6 +134,7 @@ def run_strategies(  # noqa: PLR0912, PLR0913 - 调度的全部输入与跳过�
     account_id: str,
     positions: Callable[[], Mapping[str, Decimal]],
     blocked: Collection[str],
+    inputs: Callable[[], StrategyInputs] | None = None,
 ) -> RunReport:
     """在决策时刻之后的运行窗口内运行一次全部策略。同一天重复调用是安全的：
     意图的生成时间与行情输入都按决策时刻固定，重跑得到相同的意图（outbox 去重）；
@@ -130,6 +158,13 @@ def run_strategies(  # noqa: PLR0912, PLR0913 - 调度的全部输入与跳过�
     held = dict(positions())
     expected = _previous_session(calendar, day)  # 最新日线必须是上一交易日（数据新鲜）
     start = day - timedelta(days=schedule.lookback_days)
+    try:
+        extra = StrategyInputs() if inputs is None else inputs()
+        sessions = trading_sessions(calendar, start, day)
+    except Exception as exc:  # 输入读不到：整轮跳过，不拿缺省值硬跑
+        return RunReport(
+            skipped=dict.fromkeys(labels, f"读不到账户或行情输入：{type(exc).__name__}")
+        )
     enqueued: list[str] = []
     duplicates: list[str] = []
     skipped: dict[str, str] = {}
@@ -158,6 +193,11 @@ def run_strategies(  # noqa: PLR0912, PLR0913 - 调度的全部输入与跳过�
             context = StrategyContext(
                 decision_at=at, session_day=day, account_id=account_id, bars=bars,
                 positions={s: q for s, q in held.items() if s in universe},
+                quotes={s: q for s, q in extra.quotes.items() if s in universe},
+                nav=extra.nav, settled_cash=extra.settled_cash, sessions=sessions,
+                stopped_out=None if extra.stopped_out is None
+                else {s: d for s, d in extra.stopped_out.items() if s in universe},
+                mode=extra.mode,
             )  # fmt: skip
             try:
                 intents = evaluate(strategy, context)

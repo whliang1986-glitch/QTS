@@ -29,8 +29,13 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from server.domain.account import Account
-from server.domain.enums import OrderClass, TimeInForce
-from server.domain.orders import EMERGENCY_FLATTEN_SOURCE, PROTECTIVE_STOP_SOURCE, OrderIntent
+from server.domain.enums import Mode, OrderClass, TimeInForce
+from server.domain.orders import (
+    EMERGENCY_FLATTEN_SOURCE,
+    PAPER_ONLY_STRATEGIES,
+    PROTECTIVE_STOP_SOURCE,
+    OrderIntent,
+)
 from server.oms.manager import OrderManager
 from server.risk.context import LedgerContextProvider
 from server.risk.emergency import EmergencyControls, EmergencyError
@@ -162,6 +167,12 @@ class TradingCore:
         account = self._modes.verified_account()
         if account is None or intent.account_id != account.account_id:
             raise IntakeError("意图账户不是本进程已校验的账户")
+        # 冒烟策略只能在模拟盘（T-02）：策略自己查过一次，这里按配置的运行模式再拒一次
+        if (
+            intent.strategy_id in PAPER_ONLY_STRATEGIES
+            and self._modes.configured_mode() is not Mode.PAPER
+        ):
+            raise IntakeError("冒烟策略只能在模拟盘运行")
         async with self._lock:
             # 已签发（交给过券商）的意图是重投：跳过过期检查，由风控按 intent_id 返回原决定，
             # 否则“已下单”会被回答成“已拒绝”（S-01c 第二轮评审 P1-A）。

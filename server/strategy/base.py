@@ -9,6 +9,9 @@
   - 输入数据不得包含决策时刻之后才收盘的日线（前视；发布延迟由调度层另行过滤）。
 - 运行器在调用策略前固定它的标识与标的池，交给策略的输入是只读副本，校验一律对照运行器自己的副本：
   有缺陷的策略改写输入或属性，也绕不过校验。
+- T-02 补充的输入（都可选，缺了就由需要它的策略自行拒绝，失败即关闭）：
+  报价 quotes、账户净值 nav、已结算现金 settled_cash、交易日序列 sessions（升序，截至当日）、
+  最近一次保护性止损成交日 stopped_out、运行模式 mode。运行器同样做只读副本。
 - 幂等：intent_id = 策略、版本、交易日、标的、方向、类别 的确定性组合，created_at 是当日的决策时刻
   （由调度层固定，不是调用时刻）。行情输入与 created_at 固定，同一天重跑得到相同的意图；
   内容变了（例如持仓变化后数量不同）则同键不同内容，由 outbox 拒绝，绝不会多下一单。
@@ -16,6 +19,7 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -25,7 +29,7 @@ from types import MappingProxyType
 from typing import Protocol
 
 from server.domain.enums import OrderClass, OrderType, Side, TimeInForce
-from server.domain.market import MarketBar
+from server.domain.market import MarketBar, Quote
 from server.domain.orders import OrderIntent
 from server.domain.values import Identifier, Price, ShareQuantity, ValueModel, to_utc
 
@@ -57,6 +61,14 @@ class StrategyContext:
     account_id: str
     bars: Mapping[str, Sequence[MarketBar]]  # 每个标的按时间升序，决策时刻之前已发布
     positions: Mapping[str, Decimal] = field(default_factory=dict)
+    # ---- T-02 补充（可选） ----
+    quotes: Mapping[str, Quote] = field(default_factory=dict)  # 决策时刻的实时报价
+    nav: Decimal | None = None  # 账户净值（美元）
+    settled_cash: Decimal | None = None  # 已结算现金（现金账户只能用它买入，ADR-15）
+    sessions: Sequence[date] = ()  # 交易日序列，升序，最后一个是 session_day
+    # 最近一次保护性止损成交的交易日；None 表示没有提供（和“没有止损”不同，需要它的策略拒绝运行）
+    stopped_out: Mapping[str, date] | None = None
+    mode: str | None = None  # 运行模式（PAPER / HALT 等）；None 表示未知
 
 
 class Strategy(Protocol):
@@ -118,11 +130,39 @@ def freeze(identity: Identity, context: StrategyContext) -> StrategyContext:
         decision_at = to_utc(context.decision_at)
     except ValueError as exc:
         raise StrategyError(f"决策时刻不合法：{exc}") from exc
+    bars = _frozen_bars(identity, context, decision_at)
+    positions = _frozen_positions(context)
+    quotes = _frozen_quotes(identity, context, decision_at)
+    sessions = tuple(context.sessions)
+    if sessions and (
+        list(sessions) != sorted(set(sessions)) or sessions[-1] != context.session_day
+    ):
+        raise StrategyError("交易日序列必须严格升序，且最后一个是当日")
+    for name, amount in (("nav", context.nav), ("settled_cash", context.settled_cash)):
+        if amount is not None and (not isinstance(amount, Decimal) or not amount.is_finite()):
+            raise StrategyError(f"{name} 必须是有限的 Decimal")
+    return StrategyContext(
+        decision_at=decision_at, session_day=context.session_day,
+        account_id=context.account_id, bars=MappingProxyType(bars),
+        positions=MappingProxyType(positions), quotes=MappingProxyType(quotes),
+        nav=context.nav, settled_cash=context.settled_cash, sessions=sessions,
+        stopped_out=None if context.stopped_out is None
+        else MappingProxyType(dict(context.stopped_out)),
+        mode=context.mode,
+    )  # fmt: skip
+
+
+def _frozen_bars(
+    identity: Identity, context: StrategyContext, decision_at: datetime
+) -> dict[str, tuple[MarketBar, ...]]:
     bars: dict[str, tuple[MarketBar, ...]] = {}
     for symbol, series in context.bars.items():
         if symbol not in identity.universe:
             raise StrategyError(f"输入里有标的池以外的 {symbol}")
         frozen = tuple(series)
+        for earlier, later in itertools.pairwise(frozen):
+            if later.start <= earlier.start:  # 动量与均线按根数计算：顺序错、重复都会算错
+                raise StrategyError(f"{symbol} 的日线不是严格按时间升序（{later.start.date()}）")
         for bar in frozen:
             if bar.symbol != symbol:
                 raise StrategyError(f"{symbol} 的序列里混入了 {bar.symbol}")
@@ -130,17 +170,33 @@ def freeze(identity: Identity, context: StrategyContext) -> StrategyContext:
                 day = bar.start.date()
                 raise StrategyError(f"{symbol} {day} 的日线在决策时刻之后才收盘（前视）")
         bars[symbol] = frozen
+    return bars
+
+
+def _frozen_positions(context: StrategyContext) -> dict[str, Decimal]:
     positions: dict[str, Decimal] = {}
     for symbol, quantity in context.positions.items():
         value: object = quantity  # 来源是外部输入：按 object 检查
         if isinstance(value, bool) or not isinstance(value, Decimal | int):
             raise StrategyError(f"{symbol} 的持仓必须是 Decimal 或 int")
-        positions[symbol] = Decimal(value)
-    return StrategyContext(
-        decision_at=decision_at, session_day=context.session_day,
-        account_id=context.account_id, bars=MappingProxyType(bars),
-        positions=MappingProxyType(positions),
-    )  # fmt: skip
+        amount = Decimal(value)
+        if not amount.is_finite() or amount < 0:
+            raise StrategyError(f"{symbol} 的持仓不合法（{value}）：首期只做多，持仓不能为负")
+        positions[symbol] = amount
+    return positions
+
+
+def _frozen_quotes(
+    identity: Identity, context: StrategyContext, decision_at: datetime
+) -> dict[str, Quote]:
+    quotes: dict[str, Quote] = {}
+    for symbol, quote in context.quotes.items():
+        if symbol not in identity.universe or quote.symbol != symbol:
+            raise StrategyError(f"报价里有标的池以外或对不上的 {symbol}")
+        if quote.ts > decision_at:
+            raise StrategyError(f"{symbol} 的报价时间晚于决策时刻（前视）")
+        quotes[symbol] = quote
+    return quotes
 
 
 def _check_proposal(identity: Identity, context: StrategyContext, proposal: Proposal) -> None:
