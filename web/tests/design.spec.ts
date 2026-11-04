@@ -26,6 +26,28 @@ const ORDERS: Json = {
   })),
 };
 
+const ALERTS: Json = {
+  alerts: [
+    [7, "P0", "tradingd 心跳丢失超过 90 秒，guardd 已开始逐单撤销开仓单",
+     "tradingd heartbeat lost for over 90 s; guardd is cancelling opening orders one by one", null, null],
+    [6, "P1", "券商连接断开：guardd 的券商连接中断", "Broker disconnected: guardd broker link dropped", "dylan", null],
+    [5, "P1", "行情严重陈旧：SPY 报价 5 分钟未更新", "Quotes badly stale: SPY quote not updated for 5 min", "dylan",
+     "2026-11-03T14:20:00+00:00"],
+  ].map(([id, level, zh, en, acked, resolved]) => ({
+    alert_id: id, key: `k${id}`, level, code: "alert_test", text: { zh: `[${level}] ${zh}`, en: `[${level}] ${en}` },
+    raised_at: "2026-11-03T14:10:00.000000+00:00", acked_by: acked,
+    acked_at: acked ? "2026-11-03T14:12:00+00:00" : null, resolved_at: resolved,
+  })),
+};
+const AUDIT: Json = {
+  entries: [
+    [12, "alert_ack_requested", "dylan", { alert_id: "6", alert_key: "k6" }],
+    [11, "command_outcome", "dylan", { name: "stop_new_orders", outcome: "executed_ok", request_id: "web-1" }],
+    [10, "command_submitted", "dylan", { name: "stop_new_orders", param_keys: "reason", request_id: "web-1" }],
+    [9, "auth_failed", "anonymous", { reason: "令牌无效", source: "127.0.0.1" }],
+  ].map(([seq, action, actor, detail]) => ({ seq, at: "2026-11-03T14:15:00.000000+00:00", action, actor, detail })),
+};
+
 function json(route: Route, body: Json): Promise<void> {
   return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
 }
@@ -40,11 +62,15 @@ async function prepare(page: Page, theme: Theme, loggedIn = true, lang: "zh" | "
     if (path === "/v1/whoami") return json(route, { name: "dylan", role: "owner" });
     if (path === "/v1/status") return json(route, STATUS);
     if (path === "/v1/orders") return json(route, ORDERS);
+    if (path === "/v1/alerts") return json(route, ALERTS);
+    if (path === "/v1/audit") return json(route, AUDIT);
     return route.fulfill({ status: 404, body: "{}" });
   });
 }
 
-const PAGES = ["showroom", "login", "overview", "orders", "positions", "risk", "emergency"] as const;
+const PAGES = [
+  "showroom", "login", "overview", "orders", "positions", "risk", "alerts", "audit", "emergency",
+] as const;
 type PageName = (typeof PAGES)[number];
 
 async function open(page: Page, name: PageName, theme: Theme, lang: "zh" | "en" = "zh"): Promise<void> {
@@ -59,6 +85,8 @@ async function open(page: Page, name: PageName, theme: Theme, lang: "zh" | "en" 
     if (name !== "overview") await page.getByTestId(`nav-${name}`).click();
     if (name === "orders") await expect(page.getByTestId("orders-table")).toBeVisible();
     if (name === "emergency") await expect(page.getByTestId("emergency-controls")).toBeVisible();
+    if (name === "alerts") await expect(page.getByTestId("alerts-table")).toBeVisible();
+    if (name === "audit") await expect(page.getByTestId("audit-table")).toBeVisible();
   }
   await page.evaluate(() => document.fonts.ready);
 }
@@ -87,7 +115,7 @@ test.describe("截图（SHOTS=1）", () => {
 test.describe("英文截图（SHOTS=1，S-12：英文更长，检查布局不被撑坏）", () => {
   test.skip(!process.env.SHOTS, "只在需要更新设计截图时运行");
   for (const size of ["desktop", "mobile"] as const) {
-    for (const name of ["login", "overview", "orders", "risk", "emergency"] as const) {
+    for (const name of ["login", "overview", "orders", "risk", "alerts", "emergency"] as const) {
       test(`en-${name}-dark-${size}`, async ({ page }) => {
         const [width, height] = WIDTHS[size];
         await page.setViewportSize({ width, height });
@@ -101,7 +129,7 @@ test.describe("英文截图（SHOTS=1，S-12：英文更长，检查布局不被
 });
 
 test.describe("无障碍：英文", () => {
-  for (const name of ["overview", "emergency"] as const) {
+  for (const name of ["overview", "alerts", "emergency"] as const) {
     test(`axe en-${name}`, async ({ page }) => {
       await page.setViewportSize({ width: 1440, height: 900 });
       await open(page, name, "light", "en");

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2（S-05a）：告警确认请求 alert_acks
 MAX_TOKEN_DAYS = 365
 TOKEN_PREFIX = "qts"  # noqa: S105 - 令牌格式前缀，不是密钥
 ROLES = frozenset({"owner", "viewer"})
@@ -52,7 +52,19 @@ CREATE TABLE api_audit (
     detail TEXT NOT NULL
 );
 """
-_TABLES = ("token_events", "api_audit")
+# v2：告警确认请求（S-05a）。apid 写；guardd 只用 SQL 只读，按 seq 续读后执行确认。
+# alert_id 是 alerts.db 里那次告警发生的编号：确认只对那一次发生有效，旧请求不会误确认新告警。
+_SCHEMA_V2 = """
+CREATE TABLE alert_acks (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    alert_id INTEGER NOT NULL,
+    alert_key TEXT NOT NULL,
+    store_id TEXT NOT NULL,
+    actor TEXT NOT NULL
+);
+"""
+_TABLES = ("token_events", "api_audit", "alert_acks")
 
 
 class ApiDbError(Exception):
@@ -121,7 +133,13 @@ class ApiDb:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if version == 0:
             self._conn.executescript(
-                "BEGIN;" + _SCHEMA + _append_only_triggers()
+                "BEGIN;" + _SCHEMA + _SCHEMA_V2 + _append_only_triggers(_TABLES)
+                + f"PRAGMA user_version = {SCHEMA_VERSION};COMMIT;"
+            )  # fmt: skip
+        elif version == 1:  # 升级：先留一份 v1 备份（回滚用），再只新增表与触发器，不动已有数据
+            self._backup_before_upgrade(1)
+            self._conn.executescript(
+                "BEGIN;" + _SCHEMA_V2 + _append_only_triggers(("alert_acks",))
                 + f"PRAGMA user_version = {SCHEMA_VERSION};COMMIT;"
             )  # fmt: skip
         elif version != SCHEMA_VERSION:
@@ -133,6 +151,17 @@ class ApiDb:
         missing = {f"{t}_no_{op}" for t in _TABLES for op in ("update", "delete")} - triggers
         if missing:
             raise ApiDbError(f"api.db 只追加触发器缺失：{sorted(missing)}")
+
+    def _backup_before_upgrade(self, version: int) -> None:
+        main = self._conn.execute("PRAGMA database_list").fetchone()[2]
+        target = Path(main).with_name(Path(main).name + f".v{version}.bak")
+        if target.exists():
+            return  # 已有备份：不覆盖（第一次升级前的那份最有用）
+        backup = sqlite3.connect(target)
+        try:
+            self._conn.backup(backup)
+        finally:
+            backup.close()
 
     # ---------- 令牌 ----------
 
@@ -215,7 +244,50 @@ class ApiDb:
             return None
         return Identity(token_id, issued[1], issued[2])
 
+    # ---------- 告警确认请求（S-05a） ----------
+
+    def request_ack(self, alert_id: int, alert_key: str, store_id: str, *, actor: str) -> None:
+        """记录一条确认请求，同一事务写审计。重复确认无害：guardd 只确认仍未确认的那次发生。
+
+        store_id 是 alerts.db 的库编号：库被重建后，旧请求不会作用于新库里同编号的告警。
+        """
+        if type(alert_id) is not int or alert_id <= 0 or not alert_key.strip():
+            raise ApiDbError("告警编号或键不合法")
+        if not store_id.strip():
+            raise ApiDbError("告警库编号不能为空")
+        now = _iso(self._clock())
+        self._write(
+            (
+                "INSERT INTO alert_acks (at, alert_id, alert_key, store_id, actor)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (now, alert_id, alert_key, store_id, actor),
+            ),
+            self._audit_row("alert_ack_requested", actor,
+                            {"alert_id": str(alert_id), "alert_key": alert_key}),
+        )  # fmt: skip
+
+    def ack_requested(self, alert_id: int, store_id: str) -> bool:
+        """这次发生是否已有确认请求（guardd 还没执行时再点确认，不重复记录）。"""
+        rows = self._read(
+            "SELECT 1 FROM alert_acks WHERE alert_id = ? AND store_id = ? LIMIT 1",
+            (alert_id, store_id),
+        )
+        return bool(rows)
+
     # ---------- 审计 ----------
+
+    def recent_audits(
+        self, limit: int, before: int | None = None
+    ) -> list[tuple[int, str, str, str, dict[str, str]]]:
+        """最新的审计记录（从新到旧）：(seq, 时间, 动作, 操作者, 详情)。before 用于翻页。"""
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ApiDbError("limit 必须是 1 到 500 的整数")
+        sql = "SELECT seq, at, action, actor, detail FROM api_audit"
+        args: tuple[object, ...] = (limit,)
+        if before is not None:
+            sql, args = sql + " WHERE seq < ?", (before, limit)
+        rows = self._read(sql + " ORDER BY seq DESC LIMIT ?", args)
+        return [(int(s), a, b, c, json.loads(d)) for s, a, b, c, d in rows]
 
     def audit(self, action: str, actor: str, detail: Mapping[str, str]) -> None:
         self._write(self._audit_row(action, actor, detail))
@@ -261,11 +333,11 @@ class ApiDb:
             raise ApiDbError(f"读取 api.db 失败：{exc}") from exc
 
 
-def _append_only_triggers() -> str:
+def _append_only_triggers(tables: tuple[str, ...]) -> str:
     return "".join(
         f"CREATE TRIGGER {table}_no_{verb.lower()} BEFORE {verb} ON {table} "
         f"BEGIN SELECT RAISE(ABORT, '{table} is append-only'); END;"
-        for table in _TABLES
+        for table in tables
         for verb in ("UPDATE", "DELETE")
     )
 

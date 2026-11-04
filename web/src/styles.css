@@ -255,6 +255,16 @@ input.input::placeholder { color: var(--fg-3); }
 
 /* ---------- 陈列室 ---------- */
 .showroom section { margin-bottom: var(--s5); }
+/* 告警卡片（S-05a）：左侧色条按级别；文字之外还有级别标签，不只靠颜色 */
+.alert-card { display: flex; flex-direction: column; gap: var(--s2); border-left-width: 4px; }
+.alert-card.alert-P0 { border-left-color: var(--danger); }
+.alert-card.alert-P1 { border-left-color: var(--warn); }
+.alert-card.alert-P2 { border-left-color: var(--info); }
+.alert-head { gap: var(--s2); }
+.alert-head .spacer { flex: 1; }
+.alert-text { margin: 0; overflow-wrap: anywhere; }
+.alert-card .btn { align-self: flex-start; }
+
 .row { display: flex; gap: var(--s3); flex-wrap: wrap; align-items: center; }
 .stack { display: flex; flex-direction: column; gap: var(--s3); }
 

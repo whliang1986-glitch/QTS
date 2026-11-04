@@ -8,6 +8,9 @@
 - 每轮检查的判断与撤单规则见 server.guard.watchdog；单轮出错只记日志，下一轮再查。
 - 告警（S-07）：心跳丢失、撤单失败按 P0，券商连接中断按 P1，交给 AlertHub；每轮驱动推送与重复提醒。
   手机渠道（Telegram）配置之前 AlertHub 只写日志（channel_ok=False）；外部心跳配置后每轮 tick。
+- 告警落盘与网页确认（S-05a）：告警写 alerts.db（guardd 是唯一写者），
+  打不开就报 P1 并只在内存里保留；每秒只读查一次 api.db 的确认请求
+  （只用 SQL，不依赖 server.api），按“同一次发生”确认。
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from server.guard.heartbeat import HeartbeatFile
 from server.guard.heartbeat_ping import HeartbeatPinger
 from server.guard.watchdog import HEARTBEAT_TIMEOUT, GuardReport, GuardWatchdog
 from server.platforms import PlatformError
+from server.storage.alertsdb import AlertsDbError, AlertStore, read_ack_requests, write_status
 from server.storage.errors import StorageError
 from server.storage.ledger import LedgerRepository, open_ledger
 from server.storage.logs import log_event
@@ -41,6 +45,7 @@ LOCK_FILE = "guardd.lock"
 HEARTBEAT_LOST = "tradingd_heartbeat_lost"
 CANCEL_FAILED = "guardd_cancel_failed"
 CHECK_FAILING = "guardd_check_failing"
+BROKER_DISCONNECTED = "guardd_broker_disconnected"
 CHECK_FAILURES_ALERT = 3  # 连续这么多轮检查出错即报 P0
 DRIVE_SECONDS = 1.0
 DRIVE_STEP_TIMEOUT = 30.0
@@ -57,6 +62,9 @@ class GuarddSettings:
     check_seconds: float = 15.0
     timeout: timedelta = HEARTBEAT_TIMEOUT
     lock_wait_seconds: float = LOCK_WAIT_SECONDS
+    alerts_db: Path | None = None  # None：告警只在内存里（测试或未配置 apid）
+    api_db: Path | None = None  # 读网页确认请求；None：不接受网页确认
+    store_expected: bool = False  # 生产为真：没有 alerts_db（apid 配置读不了）要报 P1，不能静默
 
 
 @dataclass(frozen=True)
@@ -94,12 +102,18 @@ async def _run(settings: GuarddSettings, deps: GuarddDeps, stop: asyncio.Event) 
         log_event(log, logging.ERROR, "guardd 装配失败，拒绝启动", error=type(exc).__name__,
                   reason=str(exc))  # fmt: skip
         return EXIT_REFUSED
-    alerts = deps.alerts or AlertHub(None, clock=deps.clock)
+    alerts = deps.alerts or _hub(settings, deps)
+    acks = None if settings.api_db is None else AckPoller(alerts, settings.api_db)
+    status = (
+        None if settings.alerts_db is None else StatusWriter(alerts, settings.alerts_db, deps.clock)
+    )
     if deps.pinger is not None:  # 先报一次平安再连券商：断线崩溃循环里外部服务也能收到 ping
         with contextlib.suppress(Exception):
             loop = asyncio.get_running_loop()
             await asyncio.wait_for(loop.run_in_executor(_IO, deps.pinger.tick), DRIVE_STEP_TIMEOUT)
-    driver = asyncio.ensure_future(_drive(alerts, deps.pinger, stop))  # 连券商之前就开始外部心跳
+    driver = asyncio.ensure_future(
+        _drive(alerts, deps.pinger, stop, acks, status)
+    )  # 连券商之前就开始外部心跳
     try:
         return await _watch(settings, broker, watchdog, alerts, stop)
     finally:
@@ -131,6 +145,9 @@ async def _watch(
                 report = await watchdog.check()
                 errors = 0
                 alerts.resolve(CHECK_FAILING)
+                # 券商确实连着、检查也成功了：解除断线告警（评审 P1-2，否则落盘后永远挂着，
+                # 之后再断线会被当成重复上报，不再推送）
+                alerts.resolve(BROKER_DISCONNECTED)
                 _report_alerts(alerts, report, settings.timeout)
             except (BrokerUnavailableError, ConnectionError) as exc:
                 log_event(log, logging.ERROR, "guardd 券商连接中断，按崩溃退出", reason=str(exc))
@@ -156,6 +173,74 @@ async def _watch(
             await broker.disconnect()
 
 
+def _hub(settings: GuarddSettings, deps: GuarddDeps) -> AlertHub:
+    store: AlertStore | None = None
+    failure: Exception | None = None
+    if settings.alerts_db is not None:
+        try:
+            store = AlertStore(settings.alerts_db, clock=deps.clock)
+        except Exception as exc:  # 库坏了、目录建不出来也要照常看门：降级到内存并报 P1
+            failure = exc
+    elif settings.store_expected:
+        failure = FileNotFoundError("apid 配置不可用，不知道 alerts.db 在哪里")
+    hub = AlertHub(None, clock=deps.clock, store=store)
+    if failure is not None:
+        hub.store_unavailable(failure)
+    return hub
+
+
+class AckPoller:
+    """网页确认（S-05a）：按 seq 续读 api.db 的确认请求，交给 AlertHub。在专用线程里调用。
+
+    重启后从头读：已确认、已解除或编号不符的请求不会动作（确认是幂等的）。
+    """
+
+    def __init__(self, alerts: AlertHub, api_db: Path) -> None:
+        self._alerts = alerts
+        self._api_db = api_db
+        self._cursor = 0
+        self._failing = False
+
+    def __call__(self) -> None:
+        try:
+            rows = read_ack_requests(self._api_db, self._cursor)
+        except AlertsDbError as exc:  # apid 还没建库等：只在开始失败时记一次
+            if not self._failing:
+                log_event(log, logging.WARNING, "读不到网页确认请求", error=str(exc))
+            self._failing = True
+            return
+        self._failing = False
+        for row in rows:
+            done = self._alerts.acknowledge(
+                row.alert_key, actor=row.actor, alert_id=row.alert_id,
+                store_id=row.store_id, requested_at=row.at,
+            )  # fmt: skip
+            if done:
+                log_event(log, logging.WARNING, "网页确认告警", alert_id=row.alert_id,
+                          actor=row.actor)  # fmt: skip
+            self._cursor = row.seq
+
+
+class StatusWriter:
+    """定期写告警库健康标记（S-05a 评审 P2-2）：apid 据此判断告警记录是否可信。在专用线程里调用。"""
+
+    def __init__(
+        self, alerts: AlertHub, alerts_db: Path, clock: Callable[[], datetime], every: float = 5.0
+    ) -> None:
+        self._alerts = alerts
+        self._path = alerts_db
+        self._clock = clock
+        self._every = timedelta(seconds=every)
+        self._last: datetime | None = None
+
+    def __call__(self) -> None:
+        now = self._clock()
+        if self._last is not None and now - self._last < self._every:
+            return
+        write_status(self._path, store_ok=self._alerts.stats.store_ok, at=now)
+        self._last = now
+
+
 def _report_alerts(alerts: AlertHub, report: GuardReport, timeout: timedelta) -> None:
     """心跳恢复即解除（确认只停止提醒，风险消失才关闭）；丢失期间每轮重复上报不会重复推送。"""
     if report.alive:
@@ -174,14 +259,20 @@ def _report_alerts(alerts: AlertHub, report: GuardReport, timeout: timedelta) ->
 def _broker_alert(alerts: AlertHub, detail: str) -> None:
     with contextlib.suppress(Exception):  # 告警本身出错不能掩盖原来的退出路径
         alerts.raise_alert(Alert(Level.P1, "broker_disconnected", {"detail": detail},
-                                 key="guardd_broker_disconnected"))  # fmt: skip
+                                 key=BROKER_DISCONNECTED))  # fmt: skip
 
 
 # 告警与外部心跳专用线程（不占用 asyncio 默认线程池：那个池还负责券商重连时的 DNS 解析）
-_IO = ThreadPoolExecutor(max_workers=2, thread_name_prefix="guardd-alerts")
+_IO = ThreadPoolExecutor(max_workers=4, thread_name_prefix="guardd-alerts")
 
 
-async def _drive(alerts: AlertHub, pinger: HeartbeatPinger | None, stop: asyncio.Event) -> None:
+async def _drive(
+    alerts: AlertHub,
+    pinger: HeartbeatPinger | None,
+    stop: asyncio.Event,
+    acks: Callable[[], None] | None = None,
+    status: Callable[[], None] | None = None,
+) -> None:
     """后台每秒驱动外部心跳与推送。网络 I/O 放在专用线程里并有总时限：慢网络不拖住看门狗。
 
     - 心跳先于推送：即使进程很快因断线退出，也尽量先报一次平安；
@@ -190,7 +281,10 @@ async def _drive(alerts: AlertHub, pinger: HeartbeatPinger | None, stop: asyncio
     """
     loop = asyncio.get_running_loop()
     running: dict[str, asyncio.Future[None]] = {}
-    steps = (("ping", None if pinger is None else pinger.tick), ("pump", alerts.pump))
+    steps = (  # 先读确认再推送：刚确认的告警不会再提醒一次
+        ("ping", None if pinger is None else pinger.tick), ("acks", acks), ("pump", alerts.pump),
+        ("status", status),
+    )  # fmt: skip
     while not stop.is_set():
         for name, step in steps:
             if step is None or (name in running and not running[name].done()):
@@ -212,4 +306,12 @@ async def _flush(alerts: AlertHub) -> None:
         await asyncio.wait_for(loop.run_in_executor(_IO, alerts.pump), DRIVE_STEP_TIMEOUT)
 
 
-__all__ = ("LOCK_FILE", "GuarddDeps", "GuarddSettings", "production_guard_broker", "run_guardd")
+__all__ = (
+    "LOCK_FILE",
+    "AckPoller",
+    "GuarddDeps",
+    "GuarddSettings",
+    "StatusWriter",
+    "production_guard_broker",
+    "run_guardd",
+)

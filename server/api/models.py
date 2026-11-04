@@ -153,6 +153,47 @@ class WhoAmI(Strict):
     role: str
 
 
+# ---------- 告警与审计（S-05a） ----------
+
+
+class AlertView(Strict):
+    """一次告警发生。text 按语言给出（zh / en），由服务端用同一份模板渲染。"""
+
+    alert_id: int
+    key: str
+    level: Literal["P0", "P1", "P2", "P3"]
+    code: str
+    text: dict[str, str]
+    raised_at: str
+    acked_by: str | None
+    acked_at: str | None
+    resolved_at: str | None
+
+
+class AlertList(Strict):
+    alerts: list[AlertView]  # 从新到旧
+
+
+class AckResponse(Strict):
+    """requested：已记下确认请求，guardd 约一秒内执行；already：这次发生早已确认，没有重复记录。"""
+
+    alert_id: int
+    requested: bool
+    already: bool
+
+
+class AuditEntry(Strict):
+    seq: int
+    at: str
+    action: str
+    actor: str
+    detail: dict[str, str]
+
+
+class AuditList(Strict):
+    entries: list[AuditEntry]  # 从新到旧
+
+
 # ---------- WebSocket 消息（/v1/stream） ----------
 
 
@@ -193,6 +234,11 @@ STREAM_MODELS = (StreamAuth, StreamHello, StreamStatus, StreamOrderEvent, Stream
 
 __all__ = (
     "STREAM_MODELS",
+    "AckResponse",
+    "AlertList",
+    "AlertView",
+    "AuditEntry",
+    "AuditList",
     "CommandCatalog",
     "CommandInfo",
     "CommandRequest",
