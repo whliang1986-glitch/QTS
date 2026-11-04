@@ -15,12 +15,13 @@
   },
   "devDependencies": {
     "@axe-core/playwright": "4.10.2",
-    "@playwright/test": "1.53.0",
+    "@playwright/test": "1.55.1",
     "@types/node": "22.15.30",
     "@types/react": "19.1.6",
     "@types/react-dom": "19.1.5",
     "@vitejs/plugin-react": "4.5.0",
+    "knip": "5.88.1",
     "typescript": "5.8.3",
-    "vite": "6.3.5"
+    "vite": "6.4.5"
   }
 }

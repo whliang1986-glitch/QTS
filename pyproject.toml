@@ -10,7 +10,7 @@ dependencies = [
     "fastapi>=0.115,<1",
     "keyring>=25,<26",
     "pandas>=3.0,<4",
-    "pyarrow>=21,<23",
+    "pyarrow>=23.0.1,<24",  # 23.0.1 修复 PYSEC-2026-113（H-01 pip-audit）
     "pydantic>=2.11,<3",
     "sqlalchemy>=2.0.36,<2.1",
     # zoneinfo 在 Windows 上没有系统时区库，全靠 tzdata（S-01e：显式声明，不依赖 pandas 的传递依赖）
@@ -31,6 +31,9 @@ dev = [
     "pandas-stubs>=3.0.5.260914",
     "pyarrow-stubs>=20",
     "httpx>=0.27,<1",
+    # H-01 工程卫生：无效代码扫描、依赖漏洞扫描
+    "vulture>=2.14",
+    "pip-audit>=2.9",
 ]
 
 [build-system]
@@ -69,6 +72,31 @@ ignore = [
 "tests/integration/storage/test_ledger.py" = ["E501", "S608"]
 "scripts/**" = ["T20", "S603", "S607"]
 ".claude/hooks/**" = ["T20", "S603", "S607"]
+
+# ---------- vulture（H-01：无效代码扫描）----------
+# 逐项核对过的结论见 docs/hygiene/H-01-report.md。新增忽略项要在报告里写明原因与归属任务。
+[tool.vulture]
+paths = ["server", "tests", "scripts"]
+exclude = ["server/storage/migrations/versions/"]  # alembic 按约定读取 revision 变量
+min_confidence = 60
+ignore_decorators = [
+    "@app.*",                 # FastAPI 路由与异常处理（由框架调用）
+    "@model_validator", "@field_validator",  # pydantic 校验器
+    "@event.listens_for",     # SQLAlchemy 事件
+    "@pytest.fixture", "@pytest_asyncio.fixture",
+]
+ignore_names = [
+    # 框架约定的名字
+    "model_config", "model_post_init", "__context", "prec", "should_exit", "visit_*",
+    "pytestmark", "tzname", "dt", "tb", "__class__",
+    # 数据契约字段：序列化输出或校验用，代码里不直接读取
+    "retry_same_request_id", "changed_by", "base_currency", "exchange", "broker_contract_id",
+    "bid_size", "ask_size", "account_ok", "risk_ok", "unit", "description",
+    # 预留给后续任务（见报告）
+    "OUTSIDE_TRADING_HOURS", "ORDER_PRECAUTION",  # B-05：IBKR 拒单原因映射
+    "StrategyVersion", "params_hash",              # T-09：策略版本注册表
+    "last_report",                                 # S-09：诊断包与日终报告
+]
 
 # ---------- mypy ----------
 [tool.mypy]
