@@ -31,6 +31,7 @@ from server.app.supervisor import EXIT_BUSY, EXIT_OK, EXIT_REFUSED
 from server.ipc.protocol import Role
 from server.ipc.transport import Endpoints, connect_role
 from server.platforms import LocalChannel, PlatformError
+from server.storage.alertsdb import AlertsReader
 from server.storage.apidb import ApiDb, ApiDbError
 from server.storage.ledger import LedgerRepository, open_ledger
 from server.storage.logs import log_event
@@ -51,6 +52,7 @@ class ApidSettings:
     confirmation_ttl: timedelta = timedelta(seconds=60)
     instance: str = "qts"
     lock_wait_seconds: float = LOCK_WAIT_SECONDS
+    alerts_db: Path | None = None  # guardd 写的告警库，apid 只读；None：告警页显示无法获取
 
 
 def api_db_lock(api_db: Path) -> Path:
@@ -101,12 +103,14 @@ def check_listen(settings: ApidSettings) -> str | None:
     return None
 
 
-def build_apid_app(
+def build_apid_app(  # noqa: PLR0913 - 装配入口，依赖显式传入
     settings: ApidSettings,
     channel: LocalChannel,
     authenticator: Authenticator,
     audit: Audit,
     tokens: TokenAdmin | None = None,
+    *,
+    db: ApiDb | None = None,  # 告警确认请求与审计查询（S-05a）
 ) -> FastAPI:
     endpoints = Endpoints(channel, settings.runtime_dir, settings.instance)
 
@@ -119,6 +123,9 @@ def build_apid_app(
         gateway=IpcCommandGateway(connect),
         audit=audit,
         tokens=tokens,
+        alerts=None if settings.alerts_db is None else AlertsReader(settings.alerts_db),
+        acks=db,
+        audit_log=db,
         confirmations=ConfirmationBook(ttl=settings.confirmation_ttl),
     )
     return create_app(deps)
@@ -164,7 +171,7 @@ def uvicorn_config(app: FastAPI, settings: ApidSettings) -> uvicorn.Config:
 async def _serve(
     settings: ApidSettings, channel: LocalChannel, stop: asyncio.Event, db: ApiDb
 ) -> int:
-    app = build_apid_app(settings, channel, TokenAuthenticator(db), db, db)
+    app = build_apid_app(settings, channel, TokenAuthenticator(db), db, db, db=db)
     server = uvicorn.Server(uvicorn_config(app, settings))
     serving = asyncio.ensure_future(server.serve())
     stopping = asyncio.ensure_future(stop.wait())

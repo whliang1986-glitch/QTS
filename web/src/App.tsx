@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { call, getToken, setToken } from "./api/client";
 import type { WhoAmI } from "./api/types.gen";
 import { CommandStore } from "./commands";
+import { Alerts, Audit } from "./pages/Alerts";
 import { Emergency } from "./pages/Emergency";
 import { Showroom } from "./pages/Showroom";
 import { Orders, Overview, Positions, Risk, connectionText } from "./pages/Views";
@@ -18,6 +19,8 @@ const PAGES: readonly [string, MessageKey, IconName][] = [
   ["orders", "nav.orders", "orders"],
   ["positions", "nav.positions", "positions"],
   ["risk", "nav.risk", "risk"],
+  ["alerts", "nav.alerts", "bell"],
+  ["audit", "nav.audit", "log"],
   ["emergency", "nav.emergency", "stop"],
 ];
 
@@ -139,6 +142,8 @@ function Shell({ onLogout, prefs }: { onLogout: () => void; prefs: Prefs }) {
         {page === "orders" ? <Orders /> : null}
         {page === "positions" ? <Positions /> : null}
         {page === "risk" ? <Risk state={state} /> : null}
+        {page === "alerts" ? <Alerts canAck={who?.role === "owner"} /> : null}
+        {page === "audit" ? <Audit /> : null}
         {page === "emergency" ? <Emergency canCommand={who?.role === "owner"} /> : null}
       </main>
     </div>

@@ -9,6 +9,9 @@
 - 高危命令须先申请二次确认（security.ConfirmationBook，S-03），tradingd 的确认短语另行核对。
 - 审计（S-03）：认证失败、限流、确认签发与拒绝、命令提交与结果写入 api.db；
   命令提交的审计写不进去就不转发（503，失败即关闭）。审计里不记参数值（可能含确认短语）。
+- 告警与审计（S-05a）：告警只读自 alerts.db（guardd 写），读不了 503（界面显示“无法获取告警”，
+  不显示“没有告警”）；确认只有 owner 能发，操作者取令牌身份，确认请求与审计同一事务写入 api.db，
+  由 guardd 执行；已确认的再确认不重复记录，已解除的返回 409。审计查询只给 owner。
 - 生产不开放 /docs 与 /openapi.json（expose_docs=False）；OpenAPI 由 scripts/gen_api_types.py 导出。
 """
 
@@ -20,7 +23,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Annotated, Any
+from typing import Annotated, Any, Protocol
 
 from fastapi import Depends, FastAPI, Path, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
@@ -41,6 +44,11 @@ from server.api.commands import (
     check_command,
 )
 from server.api.models import (
+    AckResponse,
+    AlertList,
+    AlertView,
+    AuditEntry,
+    AuditList,
     CommandCatalog,
     CommandInfo,
     CommandRequest,
@@ -73,6 +81,8 @@ from server.api.security import (
     TokenAdmin,
 )
 from server.domain.orders import Execution, OrderIntent
+from server.guard.alerts import CODES, LANGS, Alert, Level, render
+from server.storage.alertsdb import StoredAlert
 from server.storage.apidb import ApiDbError, TokenNotFoundError
 from server.storage.ledger import LedgerRepository, OrderEventRow, OrderSummary
 from server.storage.logs import log_event
@@ -86,6 +96,30 @@ WS_UNAUTHORIZED = 4401
 WS_BAD_MESSAGE = 4400
 
 
+class AckRequests(Protocol):
+    """记一条告警确认请求，同一事务写审计；写不进去必须抛出。"""
+
+    def request_ack(self, alert_id: int, alert_key: str, store_id: str, *, actor: str) -> None: ...
+
+    def ack_requested(self, alert_id: int, store_id: str) -> bool: ...
+
+
+class AlertSource(Protocol):
+    """只读告警记录（alerts.db）；读不了必须抛出。"""
+
+    def recent(self, limit: int) -> list[StoredAlert]: ...
+
+    def one(self, alert_id: int) -> tuple[str, StoredAlert | None]:
+        """(alerts.db 的库编号, 那次发生)。"""
+        ...
+
+
+class AuditLog(Protocol):
+    def recent_audits(
+        self, limit: int, before: int | None = None
+    ) -> list[tuple[int, str, str, str, dict[str, str]]]: ...
+
+
 @dataclass(frozen=True)
 class ApiDeps:
     authenticator: Authenticator
@@ -93,6 +127,9 @@ class ApiDeps:
     gateway: CommandGateway
     audit: Audit  # 生产用 api.db；必须显式给出（不默认落到内存里）
     tokens: TokenAdmin | None = None  # 在线吊销；None 表示不提供
+    alerts: AlertSource | None = None
+    acks: AckRequests | None = None
+    audit_log: AuditLog | None = None
     limiter: FailureLimiter = field(default_factory=FailureLimiter)
     confirmations: ConfirmationBook = field(default_factory=ConfirmationBook)
     stream_interval: float = 1.0  # 事件流轮询账本的间隔（秒）
@@ -271,6 +308,57 @@ def create_app(deps: ApiDeps) -> FastAPI:  # noqa: PLR0915 - 路由集中在一�
             detail=dict(answer.detail),
         )  # fmt: skip
 
+    def stored[T](query: Callable[[AlertSource], T]) -> T:
+        if deps.alerts is None:
+            raise ApiError(503, "无法获取告警")
+        try:
+            return query(deps.alerts)
+        except Exception as exc:  # 读不了就 503：不能拿空列表冒充“没有告警”
+            log_event(log, logging.ERROR, "读取告警失败", error=type(exc).__name__)
+            raise ApiError(503, "无法获取告警") from exc
+
+    @app.get(f"{API_PREFIX}/alerts", responses=ERRORS)
+    def alerts(_who: Who, limit: Annotated[int, Query(ge=1, le=500)] = 200) -> AlertList:
+        return AlertList(alerts=[alert_view(a) for a in stored(lambda s: s.recent(limit))])
+
+    @app.post(f"{API_PREFIX}/alerts/{{alert_id}}/ack", responses=ERRORS)
+    def ack(who: Owner, alert_id: Annotated[int, Path(ge=1)]) -> AckResponse:
+        """确认告警：只停止重复提醒，不解除风险（V4.1 10.3）。操作者取令牌身份。"""
+        if deps.acks is None:
+            raise ApiError(404, "未启用网页确认")
+        store_id, found = stored(lambda s: s.one(alert_id))
+        if found is None:
+            raise ApiError(404, "没有这条告警")
+        if found.resolved_at is not None:
+            raise ApiError(409, "告警已解除，无需确认")
+        if found.acked_by is not None:
+            return AckResponse(alert_id=alert_id, requested=False, already=True)
+        try:
+            if deps.acks.ack_requested(alert_id, store_id):  # 已提交、guardd 还没执行：不重复记录
+                return AckResponse(alert_id=alert_id, requested=True, already=False)
+            deps.acks.request_ack(alert_id, found.key, store_id, actor=who.name)
+        except Exception as exc:
+            log_event(log, logging.ERROR, "告警确认请求写入失败", error=type(exc).__name__)
+            raise ApiError(503, "确认未记录：api.db 写入失败，请重试") from exc
+        return AckResponse(alert_id=alert_id, requested=True, already=False)
+
+    @app.get(f"{API_PREFIX}/audit", responses=ERRORS)
+    def audit(
+        _who: Owner,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        before: Annotated[int | None, Query(ge=1)] = None,
+    ) -> AuditList:
+        if deps.audit_log is None:
+            raise ApiError(503, "审计记录不可用")
+        try:  # 记录损坏（详情不是字符串等）同样按 503，不返回部分结果
+            return AuditList(entries=[
+                AuditEntry(seq=s, at=at, action=a, actor=who, detail=d)
+                for s, at, a, who, d in deps.audit_log.recent_audits(limit, before)
+            ])  # fmt: skip
+        except Exception as exc:
+            log_event(log, logging.ERROR, "读取审计失败", error=type(exc).__name__)
+            raise ApiError(503, "无法获取审计记录") from exc
+
     @app.websocket(f"{API_PREFIX}/stream")
     async def stream(ws: WebSocket) -> None:
         await ws.accept()
@@ -283,6 +371,22 @@ def create_app(deps: ApiDeps) -> FastAPI:  # noqa: PLR0915 - 路由集中在一�
             await _close_with_error(ws, "事件流出错", 1011)
 
     return app
+
+
+def alert_view(item: StoredAlert) -> AlertView:
+    text = {lang: _text(item, lang) for lang in LANGS}
+    level = item.level if item.level in {"P0", "P1", "P2", "P3"} else "P0"
+    return AlertView(
+        alert_id=item.alert_id, key=item.key, level=level, code=item.code,  # type: ignore[arg-type]
+        text=text, raised_at=item.raised_at, acked_by=item.acked_by, acked_at=item.acked_at,
+        resolved_at=item.resolved_at,
+    )  # fmt: skip
+
+
+def _text(item: StoredAlert, lang: str) -> str:
+    if item.code not in CODES or item.level not in Level.__members__:
+        return f"[{item.level}] {item.code} {dict(item.params)}"  # 代码已下线：原样显示，不丢
+    return render(Alert(Level[item.level], item.code, item.params, key=item.key), lang)
 
 
 def _checked(name: str, params: dict[str, str]) -> CommandSpec:
@@ -549,4 +653,12 @@ async def _close_with_error(ws: WebSocket, error: str, code: int) -> None:
         await ws.close(code)
 
 
-__all__ = ("API_PREFIX", "ApiDeps", "create_app")
+__all__ = (
+    "API_PREFIX",
+    "AckRequests",
+    "AlertSource",
+    "ApiDeps",
+    "AuditLog",
+    "alert_view",
+    "create_app",
+)

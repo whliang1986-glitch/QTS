@@ -303,3 +303,104 @@ async def test_slow_phone_channel_does_not_block_the_watchdog(tmp_path: Path) ->
     assert env.om.status("o-slow") is OrderStatus.CANCELLED
     stop.set()
     assert await asyncio.wait_for(guardd, 2) == EXIT_OK  # 退出不被推送拖住
+
+
+# ---------- S-05a：告警落盘、网页确认、降级 ----------
+
+
+def stored_guard_settings(tmp_path: Path, **kw: Any) -> GuarddSettings:
+    base = {"alerts_db": tmp_path / "data" / "alerts.db", "api_db": tmp_path / "data" / "api.db"}
+    return GuarddSettings(runtime_dir=tmp_path / "run", ledger_path=tmp_path / "ledger.db",
+                          check_seconds=0.05, lock_wait_seconds=0.3, **{**base, **kw})  # fmt: skip
+
+
+class Down:
+    async def connect(self) -> None:
+        raise ConnectionError("TWS 没开")
+
+    async def disconnect(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_broker_alert_is_resolved_after_reconnect_and_raised_again(tmp_path: Path) -> None:
+    """评审 P1-2：断线告警落盘后，重连成功要解除；之后再断线是新告警（会再推送）。"""
+    from server.storage.alertsdb import read_alerts  # noqa: PLC0415
+
+    env = Env(tmp_path)
+    settings = stored_guard_settings(tmp_path)
+    assert settings.alerts_db is not None
+    assert await run_guardd(settings, GuarddDeps(broker=Down), asyncio.Event()) == EXIT_CRASH
+    [first] = read_alerts(settings.alerts_db)
+    assert first.key == "guardd_broker_disconnected" and first.resolved_at is None
+    stop = asyncio.Event()
+    deps = GuarddDeps(broker=lambda: env.broker, clock=env.clock)
+    guardd = asyncio.create_task(run_guardd(settings, deps, stop))
+    assert await wait_for(lambda: read_alerts(settings.alerts_db)[-1].resolved_at is not None)
+    stop.set()
+    assert await asyncio.wait_for(guardd, 10) == EXIT_OK
+    assert await run_guardd(settings, GuarddDeps(broker=Down), asyncio.Event()) == EXIT_CRASH
+    rows = [a for a in read_alerts(settings.alerts_db) if a.key == "guardd_broker_disconnected"]
+    assert len(rows) == 2 and rows[0].resolved_at is None  # 新的一次发生
+
+
+@pytest.mark.asyncio
+async def test_web_ack_reaches_guardd_and_status_marker_is_written(tmp_path: Path) -> None:
+    from server.storage.alertsdb import (  # noqa: PLC0415
+        StoredAlert,
+        check_status,
+        read_alert,
+        read_alerts,
+    )
+    from server.storage.apidb import ApiDb  # noqa: PLC0415
+
+    env = Env(tmp_path, cross_client_cancel=True)
+    await env.broker.connect()
+    settings = stored_guard_settings(tmp_path)
+    assert settings.alerts_db is not None and settings.api_db is not None
+    api = ApiDb(settings.api_db)
+    stop = asyncio.Event()
+    deps = GuarddDeps(broker=lambda: FakeBroker(env.server, client_id=99), clock=env.clock)
+    guardd = asyncio.create_task(run_guardd(settings, deps, stop))
+    db = settings.alerts_db
+
+    def lost() -> list[StoredAlert]:
+        return [a for a in read_alerts(db) if a.key == "tradingd_heartbeat_lost"]
+
+    assert await wait_for(lambda: settings.alerts_db.exists() and bool(lost()))
+    alert = lost()[0]
+    store_id, _ = read_alert(settings.alerts_db, alert.alert_id)
+    env.clock.advance(1)  # 请求晚于发生
+    api.request_ack(alert.alert_id, alert.key, store_id, actor="dylan")
+    assert await wait_for(lambda: lost()[0].acked_by == "dylan")
+    check_status(settings.alerts_db, env.clock())  # 健康标记存在且新鲜
+    stop.set()
+    assert await asyncio.wait_for(guardd, 10) == EXIT_OK
+    api.close()
+
+
+@pytest.mark.asyncio
+async def test_guardd_still_guards_when_alerts_dir_is_unusable(tmp_path: Path) -> None:
+    """评审 P1-3：告警库目录建不出来，guardd 照常撤单，告警改为只在内存里。"""
+    env = Env(tmp_path, cross_client_cancel=True)
+    await env.broker.connect()
+    await env.submit("o-nodb")
+    await env.pump()
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    settings = stored_guard_settings(tmp_path, alerts_db=blocker / "alerts.db", api_db=None)
+    stop = asyncio.Event()
+    deps = GuarddDeps(broker=lambda: FakeBroker(env.server, client_id=99), clock=env.clock)
+    guardd = asyncio.create_task(run_guardd(settings, deps, stop))
+
+    async def cancelled() -> bool:
+        await env.pump()
+        return env.om.status("o-nodb") is OrderStatus.CANCELLED
+
+    for _ in range(200):
+        if await cancelled():
+            break
+        await asyncio.sleep(0.05)
+    assert env.om.status("o-nodb") is OrderStatus.CANCELLED
+    stop.set()
+    assert await asyncio.wait_for(guardd, 10) == EXIT_OK
