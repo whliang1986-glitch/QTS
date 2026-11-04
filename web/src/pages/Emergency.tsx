@@ -2,26 +2,37 @@
 // 撤保护性止损与紧急平仓是高危命令：apid 二次确认 + 手工输入 tradingd 的确认短语。
 // 默认不撤保护性止损：只有第 3 个控件会撤止损。
 // 命令状态在 App 级保存（commands.CommandStore）：结果未知的操作在面板关闭、切页后仍然保留并自动展开。
+// 视觉（S-13）：急停区单独隔开；高危控件红色描边，展开后“确认执行”才是实心红；每步写清“这会做什么”。
 import { useState, type ReactNode } from "react";
 import { OutcomeView, useCommand, type Params } from "../commands";
+import { Button, Icon, Notice } from "../ui";
 
-function Panel({ id, title, danger, pending, children }: {
+function Panel({ id, title, what, high, pending, children }: {
   id: string;
   title: string;
-  danger?: boolean;
+  what: string; // 这会做什么（收起时也显示）
+  high?: boolean;
   pending: boolean; // 有进行中或结果未知的操作：保持展开
   children: (close: () => void) => ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  const shown = open || pending;
   return (
-    <section className={`control${danger ? " danger" : ""}`} data-testid={`control-${id}`}>
-      <h3>{title}</h3>
-      {open || pending ? (
+    <section className={`control${high ? " high" : ""}${shown ? " open" : ""}`} data-testid={`control-${id}`}
+      aria-labelledby={`title-${id}`}>
+      <h3 id={`title-${id}`}>
+        <Icon name={high ? "alert" : "stop"} />{title}
+        {high ? <span className="tag danger">高危</span> : null}
+      </h3>
+      <p className="what">{what}</p>
+      {shown ? (
         children(() => setOpen(false))
       ) : (
-        <button type="button" onClick={() => setOpen(true)} data-testid={`open-${id}`}>
-          {title}……
-        </button>
+        <div className="actions">
+          <Button kind={high ? "danger-outline" : "default"} onClick={() => setOpen(true)} data-testid={`open-${id}`}>
+            {title}……
+          </Button>
+        </div>
       )}
     </section>
   );
@@ -40,23 +51,25 @@ function CommandForm({ id, name, high, params, ready, children, onDone }: {
   const busy = command.outcome.kind === "running";
   const finished = command.outcome.kind === "done";
   return (
-    <div>
+    <div className="stack" style={{ gap: "var(--s2)" }}>
       {children}
-      {!finished ? (
-        <button
-          type="button"
-          disabled={!ready || busy || command.attempt !== null}
-          onClick={() => command.start(name, params)}
-          data-testid={`confirm-${id}`}
-        >
-          确认执行
-        </button>
-      ) : null}
-      {!command.unknown && !busy ? (
-        <button type="button" onClick={() => { command.reset(); onDone(); }} data-testid={`cancel-${id}`}>
-          {finished ? "关闭" : "取消"}
-        </button>
-      ) : null}
+      <div className="actions">
+        {!finished ? (
+          <Button
+            kind={high ? "danger" : "primary"}
+            disabled={!ready || busy || command.attempt !== null}
+            onClick={() => command.start(name, params)}
+            data-testid={`confirm-${id}`}
+          >
+            确认执行
+          </Button>
+        ) : null}
+        {!command.unknown && !busy ? (
+          <Button kind="ghost" onClick={() => { command.reset(); onDone(); }} data-testid={`cancel-${id}`}>
+            {finished ? "关闭" : "取消"}
+          </Button>
+        ) : null}
+      </div>
       <OutcomeView command={command} />
     </div>
   );
@@ -70,14 +83,14 @@ function usePending(id: string): boolean {
 function StopNewOrders() {
   const [reason, setReason] = useState("");
   return (
-    <Panel id="stop" title="停止新增" pending={usePending("stop")}>
+    <Panel id="stop" title="停止新增" pending={usePending("stop")}
+      what="持久化 HALT：拒绝一切新增风险。不撤已有订单，也不撤保护性止损。恢复须走恢复流程。">
       {(close) => (
         <CommandForm id="stop" name="stop_new_orders" high={false}
           params={{ reason: reason.trim() }} ready={reason.trim() !== ""} onDone={close}>
-          <p className="note">持久化 HALT：拒绝一切新增风险；不撤保护性止损。恢复须走恢复流程。</p>
-          <label>
-            原因（必填）
-            <input value={reason} onChange={(e) => setReason(e.target.value)} data-testid="stop-reason" />
+          <label className="field">
+            原因（必填，会写进审计）
+            <input className="input" value={reason} onChange={(e) => setReason(e.target.value)} data-testid="stop-reason" />
           </label>
         </CommandForm>
       )}
@@ -87,11 +100,10 @@ function StopNewOrders() {
 
 function CancelOpenOrders() {
   return (
-    <Panel id="cancel-open" title="撤销开仓单" pending={usePending("cancel-open")}>
+    <Panel id="cancel-open" title="撤销开仓单" pending={usePending("cancel-open")}
+      what="逐单撤销尚未成交的开仓单与减仓单（含紧急平仓单）。保护性止损不受影响。">
       {(close) => (
-        <CommandForm id="cancel-open" name="cancel_open_orders" high={false} params={{}} ready onDone={close}>
-          <p className="note">逐单撤销开仓单；减仓单与保护性止损不受影响。</p>
-        </CommandForm>
+        <CommandForm id="cancel-open" name="cancel_open_orders" high={false} params={{}} ready onDone={close} />
       )}
     </Panel>
   );
@@ -100,14 +112,15 @@ function CancelOpenOrders() {
 function CancelProtectiveStops() {
   const [phrase, setPhrase] = useState("");
   return (
-    <Panel id="cancel-stops" title="撤销保护性止损" danger pending={usePending("cancel-stops")}>
+    <Panel id="cancel-stops" title="撤销保护性止损" high pending={usePending("cancel-stops")}
+      what="撤掉全部保护性止损：之后持仓没有止损保护。需要二次确认，并逐字输入确认短语。">
       {(close) => (
         <CommandForm id="cancel-stops" name="cancel_protective_stops" high
           params={{ confirmation: phrase }} ready={phrase !== ""} onDone={close}>
-          <p className="warn">高危：撤掉后持仓失去止损保护。需要二次确认，并逐字输入确认短语（见运行手册）。</p>
-          <label>
+          <Notice tone="danger" title="这会让持仓失去止损保护">只在止损本身出错、需要人工接管时使用。确认短语见运行手册。</Notice>
+          <label className="field">
             确认短语
-            <input value={phrase} onChange={(e) => setPhrase(e.target.value)} data-testid="stops-phrase" />
+            <input className="input" value={phrase} onChange={(e) => setPhrase(e.target.value)} data-testid="stops-phrase" />
           </label>
         </CommandForm>
       )}
@@ -136,36 +149,43 @@ function EmergencyFlatten() {
   const preview = done !== null && done.ok ? asPreview(done.detail) : null;
   const pending = usePending("flatten") || previewCommand.unknown || preview !== null;
   return (
-    <Panel id="flatten" title="紧急平仓" danger pending={pending}>
+    <Panel id="flatten" title="紧急平仓" high pending={pending}
+      what="按预览逐笔限价卖出全部持仓（扣除已挂的减仓单）。仍挂着保护性止损的标的会被拒绝，须先撤止损。先生成预览（不下单），核对后再二次确认并输入确认短语。">
       {(close) => (
-        <div>
-          <p className="warn">高危：按预览逐笔限价卖出全部持仓。先生成预览，再二次确认并输入预览给出的确认短语。</p>
+        <div className="stack" style={{ gap: "var(--s2)" }}>
           {preview === null ? (
             <>
-              <button type="button" onClick={() => previewCommand.start("preview_flatten", {})}
-                disabled={previewCommand.attempt !== null} data-testid="flatten-preview">
-                生成平仓预览
-              </button>
-              {!previewCommand.unknown ? (
-                <button type="button" onClick={() => { previewCommand.reset(); close(); }}>取消</button>
-              ) : null}
+              <div className="actions">
+                <Button onClick={() => previewCommand.start("preview_flatten", {})}
+                  disabled={previewCommand.attempt !== null} data-testid="flatten-preview">
+                  生成平仓预览（不下单）
+                </Button>
+                {!previewCommand.unknown ? (
+                  <Button kind="ghost" onClick={() => { previewCommand.reset(); close(); }}>取消</Button>
+                ) : null}
+              </div>
               <OutcomeView command={previewCommand} />
             </>
           ) : (
             <CommandForm id="flatten" name="emergency_flatten" high
               params={{ preview_id: preview.preview_id, confirmation: phrase }}
               ready={phrase !== ""} onDone={() => { previewCommand.abandon(); setPhrase(""); close(); }}>
-              <table data-testid="flatten-lines">
-                <thead><tr><th>标的</th><th>数量</th><th>限价</th><th>最大滑点</th></tr></thead>
-                <tbody>
-                  {preview.lines.map((l) => (
-                    <tr key={l.symbol}><td>{l.symbol}</td><td>{l.quantity}</td><td>{l.limit_price}</td><td>{l.max_slippage}</td></tr>
-                  ))}
-                </tbody>
-              </table>
-              {preview.warnings.map((w) => <p className="warn" key={w}>{w}</p>)}
-              <p>请逐字输入确认短语：<code data-testid="flatten-expected">{preview.confirmation}</code></p>
-              <input value={phrase} onChange={(e) => setPhrase(e.target.value)} data-testid="flatten-phrase" />
+              <div className="table-wrap">
+                <table data-testid="flatten-lines">
+                  <thead><tr><th scope="col">标的</th><th scope="col" className="num">数量</th>
+                    <th scope="col" className="num">限价</th><th scope="col" className="num">最大滑点</th></tr></thead>
+                  <tbody>
+                    {preview.lines.map((l) => (
+                      <tr key={l.symbol}><td>{l.symbol}</td><td className="num">{l.quantity}</td>
+                        <td className="num">{l.limit_price}</td><td className="num">{l.max_slippage}</td></tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {preview.warnings.map((w) => <Notice tone="warn" title={w} key={w} />)}
+              <p className="muted">请逐字输入确认短语：<code data-testid="flatten-expected">{preview.confirmation}</code></p>
+              <input className="input" aria-label="平仓确认短语" value={phrase}
+                onChange={(e) => setPhrase(e.target.value)} data-testid="flatten-phrase" />
             </CommandForm>
           )}
         </div>
@@ -175,15 +195,24 @@ function EmergencyFlatten() {
 }
 
 export function Emergency({ canCommand }: { canCommand: boolean }) {
-  if (!canCommand) {
-    return <p className="note" data-testid="viewer-note">当前令牌只读（viewer），或身份未确认，不能执行急停操作。</p>;
-  }
   return (
-    <div className="controls" data-testid="emergency-controls">
-      <StopNewOrders />
-      <CancelOpenOrders />
-      <CancelProtectiveStops />
-      <EmergencyFlatten />
-    </div>
+    <>
+      <div className="page-title"><h2>急停</h2><span className="hint">四个控件相互独立；每个都要展开后再确认</span></div>
+      {!canCommand ? (
+        <div data-testid="viewer-note">
+          <Notice tone="info" title="当前令牌只读">viewer 令牌或身份尚未确认时，不能执行急停操作。</Notice>
+        </div>
+      ) : (
+        <div className="danger-zone">
+          <header><Icon name="stop" /><h2>急停区</h2></header>
+          <div className="controls" data-testid="emergency-controls">
+            <StopNewOrders />
+            <CancelOpenOrders />
+            <CancelProtectiveStops />
+            <EmergencyFlatten />
+          </div>
+        </div>
+      )}
+    </>
   );
 }
