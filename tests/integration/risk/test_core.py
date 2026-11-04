@@ -13,7 +13,7 @@ import pytest
 import pytest_asyncio
 from server.domain.enums import Mode, OrderClass, OrderType, RiskVerdict, Side, TimeInForce
 from server.domain.order_state import OrderStatus
-from server.domain.orders import EMERGENCY_FLATTEN_SOURCE, PROTECTIVE_STOP_SOURCE
+from server.domain.orders import EMERGENCY_FLATTEN_SOURCE, PROTECTIVE_STOP_SOURCE, SMOKE_STRATEGY_ID
 from server.risk.config import parse_health_config
 from server.risk.context import LedgerContextProvider
 from server.risk.core import RESERVED_INTENT_PREFIXES, IntakeError, TradingCore
@@ -170,6 +170,28 @@ async def test_persisted_halt_survives_restart(env: Env) -> None:
 
 
 # ---------- 意图入口 ----------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [None, "ASSISTED_LIVE", "LIMITED_AUTO_LIVE"])
+async def test_smoke_strategy_only_in_paper(
+    env: Env, monkeypatch: pytest.MonkeyPatch, mode: str | None
+) -> None:
+    """T-02：冒烟策略的意图只在模拟盘接受；运行模式不是 PAPER（含未知）一律在入口拒绝。"""
+    rig = Rig(env)
+    await rig.bring_up()
+    from server.domain.enums import Mode  # noqa: PLC0415
+
+    configured = None if mode is None else Mode(mode)
+    monkeypatch.setattr(rig.modes, "configured_mode", lambda: configured)
+    with pytest.raises(IntakeError, match="冒烟策略只能在模拟盘"):
+        await rig.core.submit_intent(reduce_intent(env, "smoke-x", strategy_id=SMOKE_STRATEGY_ID))
+    assert env.repo.submitted_intents() == []
+    monkeypatch.undo()
+    outcome = await rig.core.submit_intent(
+        reduce_intent(env, "smoke-y", strategy_id=SMOKE_STRATEGY_ID)
+    )
+    assert outcome.decision is not None  # 模拟盘下照常交给风控
 
 
 @pytest.mark.asyncio

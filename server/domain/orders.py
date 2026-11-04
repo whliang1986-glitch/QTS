@@ -24,6 +24,9 @@ PROTECTIVE_STOP_SOURCE = "oms.protective"
 # 只能由 server/risk 的急停入口在二次确认后使用；HALT 下风控按它放行降风险单，
 # 进程间通信入口（S-01）必须拒绝外部提交带此 strategy_id 的意图
 EMERGENCY_FLATTEN_SOURCE = "risk.emergency_flatten"
+# 链路冒烟策略（T-02）：只能在模拟盘运行。策略自己检查一次，交易核心入口按 strategy_id 再拒一次
+SMOKE_STRATEGY_ID = "smoke"
+PAPER_ONLY_STRATEGIES: frozenset[str] = frozenset({SMOKE_STRATEGY_ID})
 
 
 class OrderIntent(ValueModel):

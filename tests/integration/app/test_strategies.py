@@ -264,3 +264,69 @@ async def test_outbox_infrastructure_errors_propagate(tmp_path: Path) -> None:
     lake = await _lake(tmp_path)
     with pytest.raises(OutboxError, match="数据库损坏"):
         _run(lake, _BrokenOutbox(), [SellSome()])  # type: ignore[arg-type]
+
+
+# ---------- T-02：基准策略与冒烟策略经调度运行 ----------
+
+
+async def _lake_for(tmp_path: Path, symbols: Sequence[str], name: str = "t02") -> DataLake:
+    lake = DataLake(tmp_path / name)
+    for symbol in symbols:
+        bars = synthetic_daily_bars(symbol, CALENDAR, date(2026, 9, 1), date(2026, 12, 31),
+                                    source="fake")  # fmt: skip
+        provider = FakeDataProvider(bars={symbol: bars}, clock=lambda: NOW)
+        await ingest_bars(provider, lake, symbol, date(2026, 9, 1), date(2026, 10, 23),
+                          calendar=CALENDAR, publish_lag=timedelta(0),
+                          clock=lambda: NOW)  # fmt: skip
+    return lake
+
+
+def _quote(symbol: str) -> Any:
+    from server.domain.market import Quote  # noqa: PLC0415
+
+    return Quote(symbol=symbol, ts=DECIDED, bid=Decimal("500.00"), ask=Decimal("500.10"),
+                 last=None, source="test", delayed=False)  # fmt: skip
+
+
+@pytest.mark.asyncio
+async def test_smoke_strategy_runs_only_in_paper(tmp_path: Path) -> None:
+    from server.app.strategies import StrategyInputs  # noqa: PLC0415
+    from server.strategy.smoke import SmokeStrategy  # noqa: PLC0415
+
+    lake = await _lake_for(tmp_path, ["IVV", "VOO"])
+    outbox = Outbox(tmp_path / "meta.db", clock=lambda: NOW)
+
+    def inputs(mode: str | None) -> Any:
+        return lambda: StrategyInputs(quotes={s: _quote(s) for s in ("IVV", "VOO")},
+                                      nav=Decimal(1000000), mode=mode)  # fmt: skip
+
+    halted = _run(lake, outbox, [SmokeStrategy()], positions=dict, inputs=inputs("HALT"))
+    assert "只能在模拟盘" in halted.failed["smoke"]
+    assert outbox.pending() == []
+    paper = _run(lake, outbox, [SmokeStrategy()], positions=dict, inputs=inputs("PAPER"))
+    assert paper.enqueued == (
+        "smoke:v1:2026-10-23:IVV:BUY:OPEN",
+        "smoke:v1:2026-10-23:VOO:BUY:OPEN",
+    )
+    outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_benchmark_outside_its_window_and_broken_inputs(tmp_path: Path) -> None:
+    from server.app.strategies import StrategyInputs  # noqa: PLC0415
+    from server.strategy.benchmark import UNIVERSE, BenchmarkParams, BenchmarkStrategy  # noqa: PLC0415
+
+    lake = await _lake_for(tmp_path, UNIVERSE)
+    outbox = Outbox(tmp_path / "meta.db", clock=lambda: NOW)
+    strategy = BenchmarkStrategy(BenchmarkParams(cooldown_days=5))
+    # 10-23 不在月初调仓窗口内：不需要报价与净值，也不下单
+    quiet = _run(lake, outbox, [strategy], positions=dict, inputs=StrategyInputs)
+    assert quiet.failed == {} and quiet.enqueued == ()
+
+    def broken() -> StrategyInputs:
+        raise OSError("账本读不了")
+
+    skipped = _run(lake, outbox, [strategy], positions=dict, inputs=broken)
+    assert "读不到账户或行情输入" in skipped.skipped["benchmark"]
+    assert outbox.pending() == []
+    outbox.close()
