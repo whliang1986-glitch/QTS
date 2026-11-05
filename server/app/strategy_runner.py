@@ -130,7 +130,8 @@ class StrategyRunner:
         day = self._due_day(moment)
         if day is None:
             return None
-        if self._last_run() == day:
+        last = self._last_run()
+        if last is not None and last >= day:  # 含时钟回拨：记录里的日期比今天还晚也不跑
             return None
         self._mark(day)  # 先落盘再计算：写不进去就抛出，当天不运行
         try:
@@ -180,7 +181,10 @@ class StrategyRunner:
     def _mark(self, day: date) -> None:
         self._state.parent.mkdir(parents=True, exist_ok=True)
         temp = self._state.with_name(self._state.name + ".tmp")
-        temp.write_text(json.dumps({"last_run": day.isoformat()}), encoding="utf-8")
+        with temp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"last_run": day.isoformat()}))
+            handle.flush()
+            os.fsync(handle.fileno())  # 先落到磁盘再替换：断电后不会读到旧日期而重跑
         os.replace(temp, self._state)
 
     # ---------- 第二步：事件循环线程里入队 ----------
