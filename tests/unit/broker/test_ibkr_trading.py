@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -229,7 +229,10 @@ def test_protective_stop_maps_to_a_gtc_stop() -> None:
 
 def test_gtd_carries_the_expiry_in_utc() -> None:
     expiry = datetime(2026, 11, 5, 20, 30, tzinfo=UTC)
-    order = ib_order(ticket(time_in_force=TimeInForce.GTD, expires_at=expiry), ACCOUNT)
+    # 创建时间显式给出：写死的到期时间不能和真实时钟比（否则过了这个时刻测试就会失败）
+    created = expiry - timedelta(hours=1)
+    gtd = ticket(time_in_force=TimeInForce.GTD, expires_at=expiry, created_at=created)
+    order = ib_order(gtd, ACCOUNT)
     assert order.tif == "GTD" and order.goodTillDate == "20261105 20:30:00 UTC"
     assert good_till(expiry.astimezone(tz=None)) == "20261105 20:30:00 UTC"
 
