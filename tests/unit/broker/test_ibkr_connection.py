@@ -99,16 +99,23 @@ def _drain(supervisor: ConnectionSupervisor) -> list[ConnectionState]:
         ({"mode": Mode.LIMITED_AUTO_LIVE}, "实盘"),
         ({"mode": Mode.BACKTEST}, "不连接券商"),
         ({"mode": Mode.HALT}, "不连接券商"),
-        ({"readonly": False}, "只读"),
         ({"expected_account_id": "U1234567"}, "模拟账户"),  # 实盘账户号格式
         ({"client_id": -1}, "clientId"),
         ({"client_id": 0}, "clientId"),  # TWS 主客户端
-        ({"readonly": 1}, "只读"),  # 只认 True 本身
+        ({"readonly": 1}, "只读"),  # 只认 bool 本身
+        ({"readonly": False, "port": 7496}, "模拟盘端口"),  # 非只读也只能连模拟盘
     ],
 )
 def test_policy_refuses_unsafe_parameters(changes: dict[str, object], match: str) -> None:
     with pytest.raises(ConnectionPolicyError, match=match):
         replace(POLICY, **changes)  # type: ignore[arg-type]
+
+
+def test_policy_allows_non_read_only_only_for_paper() -> None:
+    """B-05：模拟盘可以非只读（下单）；实际放开还要客户端 allow_orders 与 TWS 侧设置。"""
+    assert replace(POLICY, readonly=False).readonly is False
+    with pytest.raises(ConnectionPolicyError, match="实盘"):
+        replace(POLICY, readonly=False, mode=Mode.LIMITED_AUTO_LIVE)
 
 
 # ---------- 账户核验 ----------
