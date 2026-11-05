@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import subprocess
 import sys
 
 import pytest
@@ -33,7 +34,15 @@ def test_layer_importable(name: str) -> None:
 
 
 def test_no_broker_sdk_loaded() -> None:
-    for name in LAYERS:
-        importlib.import_module(name)
-    assert "ib_async" not in sys.modules
-    assert "ib_insync" not in sys.modules
+    """导入各层包不会顺带加载券商 SDK（ib_async 只在用到 IBKR 适配器的模块时才加载，B-03b）。
+
+    在独立的进程里检查：同一次测试运行里别的测试（IBKR 适配器的测试）会合法地加载 ib_async。
+    """
+    code = (
+        "import importlib, sys\n"
+        f"for name in {LAYERS!r}:\n"
+        "    importlib.import_module(name)\n"
+        "print('ib_async' in sys.modules or 'ib_insync' in sys.modules)\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "False"

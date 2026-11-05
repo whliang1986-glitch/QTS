@@ -8,6 +8,7 @@ dependencies = [
     "duckdb>=1.3,<2",
     "exchange-calendars>=4.13,<5",
     "fastapi>=0.115,<1",
+    "ib-async>=2.0,<3",
     "keyring>=25,<26",
     "pandas>=3.0,<4",
     "pyarrow>=23.0.1,<24",  # 23.0.1 修复 PYSEC-2026-113（H-01 pip-audit）
@@ -45,6 +46,9 @@ packages = ["server"]
 
 [tool.uv]
 default-groups = ["dev"]
+# ib-async 2.1 声明 tzdata<2026，会把时区数据退回 2025 年版。ib-async 只通过 zoneinfo 读时区数据，
+# 新版数据向后兼容：这里覆盖它的上限，保持最新时区数据（B-03b 评审）。ib-async 放宽声明后删掉这一段
+override-dependencies = ["tzdata>=2026.5"]
 
 # ---------- ruff ----------
 [tool.ruff]
