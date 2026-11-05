@@ -9,6 +9,7 @@ MPL-2.0 是文件级传染：只要不修改这些包的源码就可以使用。
 
 | 生态 | 包 | 版本 | 许可 | 开发依赖 | 结论 |
 |---|---|---|---|---|---|
+| python | aeventkit | 2.1.0 | BSD License / Other/Proprietary License | — | 可用（已核对：随包 LICENSE 为 BSD-2-Clause，分类误标） |
 | python | alembic | 1.20.1 | MIT | — | 可用 |
 | python | annotated-doc | 0.0.5 | MIT | — | 可用 |
 | python | annotated-types | 0.8.0 | MIT | — | 可用 |
@@ -33,6 +34,7 @@ MPL-2.0 是文件级传染：只要不修改这些包的源码就可以使用。
 | python | httpcore | 1.0.9 | BSD-3-Clause | — | 可用 |
 | python | httpx | 0.28.1 | BSD License | — | 可用 |
 | python | hypothesis | 6.170.5 | MPL-2.0 | — | 可用 |
+| python | ib_async | 2.1.0 | Other/Proprietary License | — | 可用（已核对：随包 LICENSE 为 BSD-2-Clause，分类误标） |
 | python | idna | 3.20 | BSD-3-Clause | — | 可用 |
 | python | import-linter | 2.15 | BSD License | — | 可用 |
 | python | iniconfig | 2.3.1 | MIT | — | 可用 |
@@ -51,6 +53,7 @@ MPL-2.0 是文件级传染：只要不修改这些包的源码就可以使用。
 | python | msgpack | 1.2.4 | Apache-2.0 | — | 可用 |
 | python | mypy | 2.4.0 | MIT | — | 可用 |
 | python | mypy_extensions | 1.1.0 | MIT | — | 可用 |
+| python | nest-asyncio | 1.6.0 | BSD License | — | 可用 |
 | python | numpy | 2.5.4 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 | — | 可用 |
 | python | opentelemetry-api | 1.45.2 | Apache-2.0 | — | 可用 |
 | python | packageurl-python | 0.17.6 | MIT License | — | 可用 |
@@ -89,7 +92,7 @@ MPL-2.0 是文件级传染：只要不修改这些包的源码就可以使用。
 | python | toolz | 1.2.0 | BSD-3-Clause | — | 可用 |
 | python | typing-inspection | 0.4.4 | MIT | — | 可用 |
 | python | typing_extensions | 4.16.0 | PSF-2.0 | — | 可用 |
-| python | tzdata | 2026.5 | Apache-2.0 | — | 可用 |
+| python | tzdata | 2025.3 | Apache-2.0 | — | 可用 |
 | python | urllib3 | 2.8.0 | MIT | — | 可用 |
 | python | uvicorn | 0.54.0 | BSD-3-Clause | — | 可用 |
 | python | vulture | 2.16 | MIT License | — | 可用 |

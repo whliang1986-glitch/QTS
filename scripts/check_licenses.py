@@ -48,7 +48,12 @@ _ALLOWED = re.compile(
 )
 
 # 认不出许可、人工核对过的包：包名 → 核对结果（写明许可与核对依据）
-REVIEWED: dict[str, str] = {}
+REVIEWED: dict[str, str] = {
+    # PyPI 分类误标为 Other/Proprietary；随包附带的 LICENSE 全文是 BSD-2-Clause
+    # （2026-11-05 核对，B-03b）
+    "ib_async": "（已核对：随包 LICENSE 为 BSD-2-Clause，分类误标）",
+    "aeventkit": "（已核对：随包 LICENSE 为 BSD-2-Clause，分类误标）",
+}
 
 
 @dataclass(frozen=True)
