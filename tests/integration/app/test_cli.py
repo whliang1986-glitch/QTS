@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -396,7 +396,13 @@ def test_bad_overrides_make_tradingd_refuse(
     good = tmp_path / "processes.toml"
     good.write_text(GOOD, encoding="utf-8")
     bad = tmp_path / "calendar_overrides.toml"
-    bad.write_text("[calendar]\nadhoc_closures = [2026-12-25]\n", encoding="utf-8")
+    # 日历窗口按真实日期算（今天 -7 到今天 +400 天）：登记的日期也要按今天算，不能写死
+    # 12 月 25 日每年都不是交易日，取下一个，一定落在窗口内
+    today = datetime.now(UTC).date()
+    christmas = date(today.year, 12, 25)
+    if christmas < today:
+        christmas = date(today.year + 1, 12, 25)
+    bad.write_text(f"[calendar]\nadhoc_closures = [{christmas.isoformat()}]\n", encoding="utf-8")
     caplog.set_level("ERROR")
     assert main(["tradingd", "--config", str(good), "--calendar-overrides", str(bad)]) == (
         EXIT_REFUSED
