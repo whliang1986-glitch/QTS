@@ -32,6 +32,8 @@ SOURCE_DIRS = ["server", "tests", "scripts", "docs", "config", "web", ".claude",
 CACHE_PARTS = {"__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache", ".hypothesis"}
 # 前端的依赖、构建产物与测试报告（S-04）：只认 web/ 下这几个目录，源码目录里别处出现同名目录仍会报错
 WEB_ARTIFACTS = ("web/node_modules/", "web/dist/", "web/test-results/", "web/playwright-report/")
+# 只在本机生效、按设计不入库的个人配置（Claude Code 的个人权限放行清单，Dylan 本人维护）
+LOCAL_ONLY = frozenset({".claude/settings.local.json"})
 
 pytestmark = pytest.mark.skipif(
     shutil.which("git") is None or not (ROOT / ".git").exists(), reason="需要 git 工作副本"
@@ -59,5 +61,6 @@ def test_no_source_file_is_ignored() -> None:
         if not CACHE_PARTS.intersection(p.split("/"))
         and not p.startswith(WEB_ARTIFACTS)
         and not (p.startswith("web/") and p.endswith(".tsbuildinfo"))
+        and p not in LOCAL_ONLY
     ]
     assert real == [], f"这些源码目录下的文件被 .gitignore 忽略了：{real}"
