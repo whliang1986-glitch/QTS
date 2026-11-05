@@ -71,6 +71,8 @@ _ORDER_ERROR_CODES = frozenset({103, 110, 135, 161, 201, 202, 10147, 10148})
 
 
 class IbkrReadOnlyAdapter(BrokerAdapter):
+    _READONLY = True  # 下单适配器（trading.py）覆盖为 False
+
     def __init__(
         self,
         policy: ConnectionPolicy,
@@ -79,6 +81,10 @@ class IbkrReadOnlyAdapter(BrokerAdapter):
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         check_policy(policy)
+        if policy.readonly is not self._READONLY:
+            raise ValueError(
+                "只读适配器只接受只读连接" if self._READONLY else "下单适配器要求非只读连接"
+            )
         self._policy = policy
         self._client = client or IbAsyncClient()
         self._clock = clock

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Coroutine
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -221,6 +222,22 @@ async def test_client_itself_refuses_live_ports_and_non_read_only(
     with pytest.raises(ValueError):
         await IbAsyncClient(ib).connect(host, port, client_id, readonly=readonly)
     assert not ib.connected
+    if not readonly:  # 显式开启 allow_orders 也只能连本机模拟盘
+        with pytest.raises(ValueError, match="模拟盘端口"):
+            await IbAsyncClient(ib, allow_orders=True).connect(host, 7496, client_id,
+                                                               readonly=False)  # fmt: skip
+
+
+@pytest.mark.asyncio
+async def test_non_read_only_connection_needs_explicit_allow_orders() -> None:
+    ib = FakeIB()
+    await IbAsyncClient(ib, allow_orders=True).connect("127.0.0.1", 7497, 1, readonly=False)
+    assert ib.connected and ib.readonly is False
+
+
+def test_read_only_adapter_refuses_a_non_read_only_policy() -> None:
+    with pytest.raises(ValueError, match="只读适配器"):
+        IbkrReadOnlyAdapter(replace(policy(), readonly=False), client=IbAsyncClient(FakeIB()))
 
 
 # ---------- 快照 ----------

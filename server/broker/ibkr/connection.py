@@ -7,7 +7,16 @@
 - 连上后先核验账户：券商只管理这一个账户、账户 ID 与登记的模拟账户一致（PAPER 必须以 DU 开头）、
   账户类型与登记一致；不一致立即断开并停止重连（AccountMismatchError，由装配层进入 SAFE HALT，
   需 Dylan 人工处理）；
-- B-03 只读阶段：连接必须以只读方式建立，监督器本身不暴露任何下单接口。
+- 只读与否（B-05）：
+  - 规则层面，PAPER 模式可以建立非只读连接，供模拟盘下单；`readonly` 必须是 bool 本身；
+  - 实际能否下单要同时过四道关：
+    - 策略 `readonly=False`；
+    - 用下单适配器（trading.py）：只读适配器只接受只读策略，也没有下单路径；
+    - 客户端显式开启 `allow_orders`（构造后不能再改）；
+    - TWS 侧的 Read-Only API 设置由 Dylan 本人取消勾选，F-05 清单写明了这一步；
+  - 注意：本模块的监督器重连时固定用只读连接。下单适配器不能经由监督器重连，
+    装配时要么让监督器使用 `policy.readonly`，要么下单适配器自己重连（B-05 剩余风险）；
+  - 监督器本身不暴露任何下单接口。
 
 监督器：断线后带指数退避重连；券商每日重启窗口内不连接；任何一次（重）连接之后，
 必须由调用方对账成功（mark_reconciled）才允许新增订单（V4.1 7.5）。
@@ -86,8 +95,8 @@ def check_policy(policy: ConnectionPolicy) -> None:
         raise ConnectionPolicyError(f"只允许连接本机 {LOCALHOST}")
     if type(policy.port) is not int or policy.port in LIVE_PORTS or policy.port not in PAPER_PORTS:
         raise ConnectionPolicyError(f"PAPER 模式只允许模拟盘端口 {sorted(PAPER_PORTS)}")
-    if policy.readonly is not True:
-        raise ConnectionPolicyError("B-03 只读阶段：连接必须是只读的（下单在 B-05 放开）")
+    if type(policy.readonly) is not bool:
+        raise ConnectionPolicyError("readonly 必须是 True 或 False 本身（只读设置不能含糊）")
     # clientId 0 是 TWS 主客户端，能接管 TWS 手工单：不使用
     if type(policy.client_id) is not int or policy.client_id <= 0:
         raise ConnectionPolicyError("clientId 必须是正整数（0 是 TWS 主客户端，不使用）")
