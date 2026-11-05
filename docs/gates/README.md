@@ -10,4 +10,6 @@ config/risk 修改后，要复核已通过门禁的对应部分。
 |---|---|---|
 | G0 | 开工就绪 | 未开始（F-01 至 F-05 进行中） |
 
+G4 的证据与演练清单（草案，不代表放行）：[G4-checklist.md](G4-checklist.md)。
+
 经济门禁（策略值不值得用真钱跑，与 G5–G7 并行适用）：[economic-gate.md](economic-gate.md)，草案，待 Dylan 签字。
