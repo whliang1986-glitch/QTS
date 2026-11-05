@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 演示模式：不连接任何接口（connect-src 'none'） -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; object-src 'none'" />
+    <link rel="icon" href="data:," />
+    <title>QTS 指挥中枢（DEMO 演示）</title>
+  </head>
+  <body style="margin: 0">
+    <div id="root"></div>
+    <script type="module" src="/src/demo/main.tsx"></script>
+  </body>
+</html>

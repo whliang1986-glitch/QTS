@@ -92,7 +92,7 @@ MPL-2.0 是文件级传染：只要不修改这些包的源码就可以使用。
 | python | toolz | 1.2.0 | BSD-3-Clause | — | 可用 |
 | python | typing-inspection | 0.4.4 | MIT | — | 可用 |
 | python | typing_extensions | 4.16.0 | PSF-2.0 | — | 可用 |
-| python | tzdata | 2025.3 | Apache-2.0 | — | 可用 |
+| python | tzdata | 2026.6 | Apache-2.0 | — | 可用 |
 | python | urllib3 | 2.8.0 | MIT | — | 可用 |
 | python | uvicorn | 0.54.0 | BSD-3-Clause | — | 可用 |
 | python | vulture | 2.16 | MIT License | — | 可用 |
@@ -208,18 +208,25 @@ MPL-2.0 是文件级传染：只要不修改这些包的源码就可以使用。
 | npm | @types/babel__generator | 7.27.0 | MIT | 是 | 可用 |
 | npm | @types/babel__template | 7.4.4 | MIT | 是 | 可用 |
 | npm | @types/babel__traverse | 7.28.0 | MIT | 是 | 可用 |
+| npm | @types/d3-geo | 3.1.0 | MIT | 是 | 可用 |
 | npm | @types/estree | 1.0.10 | MIT | 是 | 可用 |
+| npm | @types/geojson | 7946.0.16 | MIT | 是 | 可用 |
 | npm | @types/node | 22.15.30 | MIT | 是 | 可用 |
 | npm | @types/react | 19.1.6 | MIT | 是 | 可用 |
 | npm | @types/react-dom | 19.1.5 | MIT | 是 | 可用 |
+| npm | @types/topojson-client | 3.1.5 | MIT | 是 | 可用 |
+| npm | @types/topojson-specification | 1.0.5 | MIT | 是 | 可用 |
 | npm | @vitejs/plugin-react | 4.5.0 | MIT | 是 | 可用 |
 | npm | axe-core | 4.10.3 | MPL-2.0 | 是 | 可用 |
 | npm | baseline-browser-mapping | 2.11.35 | Apache-2.0 | 是 | 可用 |
 | npm | braces | 3.0.3 | MIT | 是 | 可用 |
 | npm | browserslist | 4.29.5 | MIT | 是 | 可用 |
 | npm | caniuse-lite | 1.0.30001820 | CC-BY-4.0 | 是 | 可用 |
+| npm | commander | 2.20.3 | MIT | 否 | 可用 |
 | npm | convert-source-map | 2.0.0 | MIT | 是 | 可用 |
 | npm | csstype | 3.2.3 | MIT | 是 | 可用 |
+| npm | d3-array | 3.2.5 | ISC | 否 | 可用 |
+| npm | d3-geo | 3.1.1 | ISC | 否 | 可用 |
 | npm | debug | 4.4.3 | MIT | 是 | 可用 |
 | npm | electron-to-chromium | 1.5.475 | ISC | 是 | 可用 |
 | npm | esbuild | 0.25.12 | MIT | 是 | 可用 |
@@ -234,6 +241,7 @@ MPL-2.0 是文件级传染：只要不修改这些包的源码就可以使用。
 | npm | fsevents | 2.3.3 | MIT | 是 | 可用 |
 | npm | gensync | 1.0.0-beta.2 | MIT | 是 | 可用 |
 | npm | glob-parent | 5.1.2 | ISC | 是 | 可用 |
+| npm | internmap | 2.0.3 | ISC | 否 | 可用 |
 | npm | is-extglob | 2.1.1 | MIT | 是 | 可用 |
 | npm | is-glob | 4.0.3 | MIT | 是 | 可用 |
 | npm | is-number | 7.0.0 | MIT | 是 | 可用 |
@@ -270,6 +278,7 @@ MPL-2.0 是文件级传染：只要不修改这些包的源码就可以使用。
 | npm | strip-json-comments | 5.0.3 | MIT | 是 | 可用 |
 | npm | tinyglobby | 0.2.17 | MIT | 是 | 可用 |
 | npm | to-regex-range | 5.0.1 | MIT | 是 | 可用 |
+| npm | topojson-client | 3.1.0 | ISC | 否 | 可用 |
 | npm | tslib | 2.9.1 | 0BSD | 是 | 可用 |
 | npm | typescript | 5.8.3 | Apache-2.0 | 是 | 可用 |
 | npm | unbash | 2.2.0 | ISC | 是 | 可用 |
@@ -277,6 +286,7 @@ MPL-2.0 是文件级传染：只要不修改这些包的源码就可以使用。
 | npm | update-browserslist-db | 1.3.4 | MIT | 是 | 可用 |
 | npm | vite | 6.4.5 | MIT | 是 | 可用 |
 | npm | walk-up-path | 4.0.0 | ISC | 是 | 可用 |
+| npm | world-atlas | 2.0.2 | ISC | 否 | 可用 |
 | npm | yallist | 3.1.1 | ISC | 是 | 可用 |
 | npm | yaml | 2.9.1 | ISC | 是 | 可用 |
 | npm | zod | 4.6.7 | MIT | 是 | 可用 |
