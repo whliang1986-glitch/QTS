@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import subprocess
 import sys
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
-from server.app.diagnostics import MAX_LOG_LINES, DiagnosticsError, build_bundle, write_zip
+from server.app.diagnostics import (
+    MAX_LOG_LINES,
+    Bundle,
+    DiagnosticsError,
+    PreviewStore,
+    build_bundle,
+    zip_bytes,
+)
 from server.storage.credentials import SensitiveValue
 
 NOW = datetime(2026, 11, 5, 21, 0, tzinfo=UTC)
@@ -94,8 +103,6 @@ def test_key_directory_is_refused(tmp_path: Path) -> None:
     path.write_text("x", encoding="utf-8")
     with pytest.raises(DiagnosticsError, match="密钥目录"):
         bundle(tmp_path, configs=[path])
-    with pytest.raises(DiagnosticsError, match="密钥目录"):
-        write_zip(bundle(tmp_path), folder / "diag.zip")
 
 
 def test_bad_source_names_and_naive_clock_are_refused(tmp_path: Path) -> None:
@@ -103,17 +110,6 @@ def test_bad_source_names_and_naive_clock_are_refused(tmp_path: Path) -> None:
         bundle(tmp_path, sources={"../escape": dict})
     with pytest.raises(DiagnosticsError, match="时区"):
         bundle(tmp_path, clock=lambda: datetime(2026, 11, 5, 21, 0))  # noqa: DTZ001
-
-
-def test_zip_matches_the_preview_and_is_reproducible(tmp_path: Path) -> None:
-    b = bundle(tmp_path, sources={"mode": lambda: {"mode": "PAPER"}})
-    first = write_zip(b, tmp_path / "a.zip")
-    second = write_zip(b, tmp_path / "b.zip")
-    assert first.read_bytes() == second.read_bytes()
-    with zipfile.ZipFile(first) as archive:
-        assert {n: archive.read(n).decode("utf-8") for n in archive.namelist()} == dict(b.files)
-    with pytest.raises(DiagnosticsError, match="不覆盖"):
-        write_zip(b, first)
 
 
 def test_manifest_lists_every_file(tmp_path: Path) -> None:
@@ -224,26 +220,6 @@ def test_naive_times_and_nan_stay_valid_json(tmp_path: Path) -> None:
     assert data == {"t": "<naive>", "x": "nan"}
 
 
-def test_bundle_is_read_only_and_bad_entries_are_not_written(tmp_path: Path) -> None:
-    from server.app.diagnostics import Bundle  # noqa: PLC0415
-
-    b = bundle(tmp_path)
-    with pytest.raises(TypeError):
-        b.files["x"] = "y"  # type: ignore[index,unused-ignore]
-    forged = Bundle(created_at=NOW, files={"../escape.txt": "x"})
-    with pytest.raises(DiagnosticsError, match="条目名"):
-        write_zip(forged, tmp_path / "forged.zip")
-    assert not (tmp_path / "forged.zip").exists()
-    assert not list(tmp_path.glob(".*.partial"))
-
-
-def test_zip_cannot_be_written_into_config(tmp_path: Path) -> None:
-    target = tmp_path / "config" / "live"
-    target.mkdir(parents=True)
-    with pytest.raises(DiagnosticsError, match="config/"):
-        write_zip(bundle(tmp_path), target / "diag.zip")
-
-
 # ---------- 评审补充（S-09a 第二轮） ----------
 
 
@@ -265,24 +241,73 @@ def test_quoted_keys_and_secrets_inside_json_strings_are_scrubbed(tmp_path: Path
     assert json.loads(lines[3])["message"].startswith("login failed password=***")
 
 
-def test_failed_write_leaves_no_partial_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+# ---------- 打包与暂存（S-09b：不写盘） ----------
+
+
+def test_zip_matches_the_preview_and_is_reproducible(tmp_path: Path) -> None:
     b = bundle(tmp_path, sources={"mode": lambda: {"mode": "PAPER"}})
-
-    def boom(*args: object, **kwargs: object) -> None:
-        raise OSError("磁盘满")
-
-    monkeypatch.setattr(zipfile.ZipFile, "writestr", boom)
-    with pytest.raises(OSError, match="磁盘满"):
-        write_zip(b, tmp_path / "diag.zip")
-    assert not (tmp_path / "diag.zip").exists()
-    assert not list(tmp_path.glob(".*.partial"))
+    data = zip_bytes(b)
+    assert data == zip_bytes(b)
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        assert {n: archive.read(n).decode("utf-8") for n in archive.namelist()} == dict(b.files)
 
 
-def test_someone_elses_partial_file_is_not_deleted(tmp_path: Path) -> None:
-    other = tmp_path / ".diag.zip.partial"
-    other.write_bytes(b"in progress")
-    with pytest.raises(FileExistsError):
-        write_zip(bundle(tmp_path), tmp_path / "diag.zip")
-    assert other.read_bytes() == b"in progress"
+def test_bundle_is_read_only_and_bad_entries_are_not_zipped(tmp_path: Path) -> None:
+    b = bundle(tmp_path)
+    with pytest.raises(TypeError):
+        b.files["x"] = "y"  # type: ignore[index,unused-ignore]
+    for bad in ("../escape.txt", "/abs.txt", "a\\b.txt", "c:/x.txt", ""):
+        with pytest.raises(DiagnosticsError, match="条目名"):
+            zip_bytes(Bundle(created_at=NOW, files={bad: "x"}))
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = NOW
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def store(tmp_path: Path, clock: Clock, **kw: Any) -> PreviewStore:
+    return PreviewStore(lambda: bundle(tmp_path, clock=clock), clock=clock, **kw)
+
+
+def test_download_returns_the_previewed_copy(tmp_path: Path) -> None:
+    values = iter(["first", "second"])
+    held = PreviewStore(lambda: bundle(tmp_path, sources={"v": lambda: next(values)}))
+    first_id, first = held.create_preview()
+    held.create_preview()  # 之后状态变了，也不影响已经预览过的那一份
+    data = held.archive(first_id)
+    assert data is not None
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        assert archive.read("v.json").decode("utf-8") == first.files["v.json"]
+        assert "first" in first.files["v.json"]
+
+
+def test_previews_expire_and_unknown_ids_get_nothing(tmp_path: Path) -> None:
+    clock = Clock()
+    held = store(tmp_path, clock, ttl=timedelta(minutes=10))
+    preview_id, _ = held.create_preview()
+    clock.now = NOW + timedelta(minutes=9, seconds=59)
+    assert held.archive(preview_id) is not None
+    clock.now = NOW + timedelta(minutes=10)
+    assert held.archive(preview_id) is None
+    assert held.archive("guess") is None
+
+
+def test_capacity_drops_the_oldest(tmp_path: Path) -> None:
+    held = store(tmp_path, Clock(), capacity=2)
+    first, _ = held.create_preview()
+    second, _ = held.create_preview()
+    third, _ = held.create_preview()
+    assert held.archive(first) is None
+    assert held.archive(second) is not None and held.archive(third) is not None
+    assert len({first, second, third}) == 3
+
+
+def test_store_arguments_are_checked(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="必须为正"):
+        store(tmp_path, Clock(), capacity=0)
+    with pytest.raises(ValueError, match="必须为正"):
+        store(tmp_path, Clock(), ttl=timedelta(0))
