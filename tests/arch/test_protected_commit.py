@@ -42,8 +42,16 @@ def test_config_allowed_only_with_override() -> None:
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="需要 git")
 def test_script_rejects_staged_protected_file(tmp_path: Path) -> None:
+    # 必须清掉 GIT_*：从 worktree 提交时，钩子继承的 GIT_DIR 指向真实仓库，
+    # 这里的 git init 会重新初始化它，把共享配置改成 core.bare=true，所有检出都用不了。
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k != "ALLOW_PROTECTED_CONFIG" and not k.upper().startswith("GIT_")
+    }
+
     def git(*args: str) -> None:
-        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True, env=env)
 
     git("init", "-q")
     target = tmp_path / "config" / "risk" / "parameters.yaml"
@@ -51,7 +59,6 @@ def test_script_rejects_staged_protected_file(tmp_path: Path) -> None:
     target.write_text("leverage: 1.0\n", encoding="utf-8")
     git("add", "-A")
 
-    env = {k: v for k, v in os.environ.items() if k != "ALLOW_PROTECTED_CONFIG"}
     blocked = subprocess.run(
         [sys.executable, str(SCRIPT)], cwd=tmp_path, capture_output=True, check=False, env=env
     )
