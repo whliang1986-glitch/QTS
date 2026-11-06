@@ -14,6 +14,8 @@
 | [C-03](C-03.md) | SQLite 存储层与迁移 | P0 | ACCEPTED |
 | [C-04](C-04.md) | ModeManager 与实盘切换门禁 | P0 | ACCEPTED |
 | [S-02](S-02.md) | REST 与 WebSocket API | P0 | IN REVIEW |
+| [B-05w](B-05w.md) | 交易核心数据来源接线（只接 FakeBroker，不是 IBKR 联调） | P0 | IN REVIEW |
+| B-05x | 关键组件校验下沉到风控层（`build_trading_core` 拒绝空清单或缺关键组件，见 [B-05w](B-05w.md) 残留风险） | P0 | NOT STARTED |
 | [T-09](T-09.md) | 策略库与生命周期注册表（计划补充） | P1 | NOT STARTED |
 | [T-10](T-10.md) | 因子库（计划补充，约 6.5 工日，T-07 之后、T-09 之前） | P1 | NOT STARTED |
 | [T-10a](T-10.md#7-子任务) | 因子数据模型与注册表（1 工日，前置 T-07） | P1 | NOT STARTED |
