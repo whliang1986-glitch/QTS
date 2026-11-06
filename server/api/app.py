@@ -12,22 +12,26 @@
 - 告警与审计（S-05a）：告警只读自 alerts.db（guardd 写），读不了 503（界面显示“无法获取告警”，
   不显示“没有告警”）；确认只有 owner 能发，操作者取令牌身份，确认请求与审计同一事务写入 api.db，
   由 guardd 执行；已确认的再确认不重复记录，已解除的返回 409。审计查询只给 owner。
+- 诊断包（S-09b）：只给 owner；先预览再下载，下载的就是预览的那一份；不写盘。
+  预览和下载都要先写审计，写不进去就不给（503，失败即关闭）。
 - 生产不开放 /docs 与 /openapi.json（expose_docs=False）；OpenAPI 由 scripts/gen_api_types.py 导出。
 """
 
 # 不用 from __future__ import annotations：FastAPI 要在定义时解析路由里局部的 Annotated 依赖别名
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Protocol
 
 from fastapi import Depends, FastAPI, Path, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBearer
 from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect, WebSocketState
@@ -55,6 +59,8 @@ from server.api.models import (
     CommandResponse,
     ConfirmationRequest,
     ConfirmationResponse,
+    DiagnosticsFile,
+    DiagnosticsPreview,
     ErrorResponse,
     ExecutionView,
     HaltView,
@@ -120,6 +126,29 @@ class AuditLog(Protocol):
     ) -> list[tuple[int, str, str, str, dict[str, str]]]: ...
 
 
+class PreviewBundle(Protocol):
+    """一份已脱敏的诊断包（server.app.diagnostics.Bundle）。"""
+
+    @property
+    def created_at(self) -> datetime: ...
+
+    @property
+    def errors(self) -> Mapping[str, str]: ...
+
+    def preview(self) -> list[tuple[str, str]]: ...
+
+
+class DiagnosticsSource(Protocol):
+    """诊断包的预览与下载（api 不依赖装配层，由 apid 注入 PreviewStore）。"""
+
+    @property
+    def ttl(self) -> timedelta: ...
+
+    def create_preview(self) -> tuple[str, PreviewBundle]: ...
+
+    def archive(self, preview_id: str) -> bytes | None: ...
+
+
 @dataclass(frozen=True)
 class ApiDeps:
     authenticator: Authenticator
@@ -130,6 +159,7 @@ class ApiDeps:
     alerts: AlertSource | None = None
     acks: AckRequests | None = None
     audit_log: AuditLog | None = None
+    diagnostics: DiagnosticsSource | None = None
     limiter: FailureLimiter = field(default_factory=FailureLimiter)
     confirmations: ConfirmationBook = field(default_factory=ConfirmationBook)
     stream_interval: float = 1.0  # 事件流轮询账本的间隔（秒）
@@ -358,6 +388,50 @@ def create_app(deps: ApiDeps) -> FastAPI:  # noqa: PLR0915 - 路由集中在一�
         except Exception as exc:
             log_event(log, logging.ERROR, "读取审计失败", error=type(exc).__name__)
             raise ApiError(503, "无法获取审计记录") from exc
+
+    @app.post(f"{API_PREFIX}/diagnostics/previews", responses=ERRORS)
+    def diagnostics_preview(who: Owner, response: Response) -> DiagnosticsPreview:
+        """生成诊断包并返回全部内容（已脱敏）。人看过之后，再用 preview_id 下载同一份。"""
+        if deps.diagnostics is None:
+            raise ApiError(503, "诊断包不可用")
+        _audit_required(deps.audit, "diagnostics_preview", who.name, {})
+        try:
+            preview_id, bundle = deps.diagnostics.create_preview()
+        except Exception as exc:  # 配置了不允许收集的文件等：不给部分结果
+            log_event(log, logging.ERROR, "生成诊断包失败", error=type(exc).__name__)
+            raise ApiError(503, "无法生成诊断包") from exc
+        # 打包后再记一条带编号的：审计能对上后面导出的是哪一份
+        _audit_required(deps.audit, "diagnostics_preview_created", who.name,
+                        {"preview_id": preview_id})  # fmt: skip
+        response.headers["Cache-Control"] = "no-store"
+        return DiagnosticsPreview(
+            preview_id=preview_id, created_at=bundle.created_at.isoformat(),
+            expires_in_seconds=int(deps.diagnostics.ttl.total_seconds()),
+            files=[DiagnosticsFile(name=n, content=c) for n, c in bundle.preview()],
+            errors=dict(bundle.errors),
+        )  # fmt: skip
+
+    @app.get(
+        f"{API_PREFIX}/diagnostics/previews/{{preview_id}}/archive",
+        responses={**ERRORS, 200: {"content": {"application/zip": {}}}},
+        response_class=Response,
+    )
+    def diagnostics_archive(
+        who: Owner, preview_id: Annotated[str, Path(min_length=1, max_length=64)]
+    ) -> Response:
+        """下载预览过的那一份（zip）。不存在或已过期返回 404，要重新预览。"""
+        if deps.diagnostics is None:
+            raise ApiError(503, "诊断包不可用")
+        data = deps.diagnostics.archive(preview_id)
+        if data is None:
+            raise ApiError(404, "这份诊断包不存在或已过期，请重新预览")
+        digest = hashlib.sha256(data).hexdigest()
+        _audit_required(deps.audit, "diagnostics_export", who.name,
+                        {"preview_id": preview_id, "sha256": digest})  # fmt: skip
+        return Response(data, media_type="application/zip", headers={
+            "Content-Disposition": 'attachment; filename="qts-diagnostics.zip"',
+            "Cache-Control": "no-store",
+        })  # fmt: skip
 
     @app.websocket(f"{API_PREFIX}/stream")
     async def stream(ws: WebSocket) -> None:

@@ -97,6 +97,7 @@ ignore_names = [
     "retry_same_request_id", "changed_by", "base_currency", "exchange", "broker_contract_id",
     "bid_size", "ask_size", "account_ok", "risk_ok", "unit", "description",
     "requested", "already",  # S-05a：告警确认接口 AckResponse 的返回字段
+    "expires_in_seconds",  # S-09b：诊断包预览接口的返回字段
     # 预留给后续任务（见报告）
     "OUTSIDE_TRADING_HOURS", "ORDER_PRECAUTION",  # B-05：IBKR 拒单原因映射
     "StrategyVersion", "params_hash",              # T-09：策略版本注册表

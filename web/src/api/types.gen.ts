@@ -71,6 +71,19 @@ export interface ConfirmationResponse {
   expires_at: string;
 }
 
+export interface DiagnosticsFile {
+  name: string;
+  content: string;
+}
+
+export interface DiagnosticsPreview {
+  preview_id: string;
+  created_at: string;
+  expires_in_seconds: number;
+  files: DiagnosticsFile[];
+  errors: Record<string, string>;
+}
+
 export interface ErrorResponse {
   error: string;
   retry_same_request_id: boolean;

@@ -194,6 +194,19 @@ class AuditList(Strict):
     entries: list[AuditEntry]  # 从新到旧
 
 
+class DiagnosticsFile(Strict):
+    name: str
+    content: str  # 已脱敏的完整内容
+
+
+class DiagnosticsPreview(Strict):
+    preview_id: str  # 下载这一份时用；过期后要重新预览
+    created_at: str
+    expires_in_seconds: int
+    files: list[DiagnosticsFile]
+    errors: dict[str, str]  # 取数失败的来源 → 脱敏后的说明
+
+
 # ---------- WebSocket 消息（/v1/stream） ----------
 
 

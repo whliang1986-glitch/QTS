@@ -18,4 +18,6 @@
 | GET | /v1/alerts | 告警列表：全部未解除的加最近 limit 条 | 网页告警页 | tests/unit/api/test_alerts_api.py | 是 | S-05a |
 | POST | /v1/alerts/{alert_id}/ack | 确认告警（只停止重复提醒，仅 owner） | 网页告警页 | tests/unit/api/test_alerts_api.py | 是 | S-05a |
 | GET | /v1/audit | apid 审计记录（仅 owner，可翻页） | 网页审计日志页 | tests/unit/api/test_alerts_api.py | 是 | S-05a |
+| POST | /v1/diagnostics/previews | 生成诊断包并预览全部内容（仅 owner，写审计） | 运维排查（curl）；网页诊断页 | tests/integration/app/test_diagnostics_api.py | 否 | S-09b（网页在 S-09c） |
+| GET | /v1/diagnostics/previews/{preview_id}/archive | 下载预览过的那一份 zip（仅 owner，写审计） | 运维排查（curl）；网页诊断页 | tests/integration/app/test_diagnostics_api.py | 否 | S-09b（网页在 S-09c） |
 | WS | /v1/stream | 状态与订单事件推送 | 网页从轮询改为推送 | tests/unit/api/test_app.py | 否 | S-05（实时推送） |

@@ -72,5 +72,6 @@ S-05a 新增的三个接口（alerts、ack、audit）在 S-05a 合并后补进�
 ## 合并 main（S-05a 之后）补充
 
 - vulture：S-05a 的 `AckResponse.requested`、`already` 是接口返回字段，按数据契约字段登记忽略。
+- vulture：S-09b 的 `DiagnosticsPreview.expires_in_seconds` 是接口返回字段（代码里只赋值、由客户端读取），按数据契约字段登记忽略。
 - 接口清单补上 `GET /v1/alerts`、`POST /v1/alerts/{alert_id}/ack`、`GET /v1/audit`。
 - knip：`useLang` 已被告警页使用，现在 0 条，CI 改为必过。

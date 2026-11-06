@@ -15,18 +15,21 @@ import ipaddress
 import logging
 import ssl
 import threading
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from datetime import timedelta
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
 
-from server.api.app import ApiDeps, create_app
+from server.api.app import ApiDeps, create_app, order_view, status_view
 from server.api.auth import Authenticator
 from server.api.commands import CommandClient, IpcCommandGateway
 from server.api.security import Audit, ConfirmationBook, TokenAdmin, TokenAuthenticator
 from server.app.common import LOCK_WAIT_SECONDS, acquire_lock
+from server.app.diagnostics import Bundle, PreviewStore, build_bundle
 from server.app.supervisor import EXIT_BUSY, EXIT_OK, EXIT_REFUSED
 from server.ipc.protocol import Role
 from server.ipc.transport import Endpoints, connect_role
@@ -53,6 +56,8 @@ class ApidSettings:
     instance: str = "qts"
     lock_wait_seconds: float = LOCK_WAIT_SECONDS
     alerts_db: Path | None = None  # guardd 写的告警库，apid 只读；None：告警页显示无法获取
+    diagnostics_logs: tuple[Path, ...] = ()  # 诊断包收集尾部的日志文件
+    diagnostics_configs: tuple[Path, ...] = ()  # 诊断包只收文件名与哈希的配置文件
 
 
 def api_db_lock(api_db: Path) -> Path:
@@ -103,6 +108,46 @@ def check_listen(settings: ApidSettings) -> str | None:
     return None
 
 
+def _package_version() -> str:
+    try:
+        return version("quant")
+    except PackageNotFoundError:  # 诊断工具不能因为缺包元数据就不可用
+        return "unknown"
+
+
+def diagnostics_builder(
+    settings: ApidSettings, ledger: ReadOnlyLedger, alerts: AlertsReader | None, db: ApiDb | None
+) -> Callable[[], Bundle]:
+    """诊断包的数据来源：都是只读的，取不到的记进 errors.json（S-09b）。"""
+
+    def read_alerts() -> object:
+        if alerts is None:
+            raise RuntimeError("没有配置告警库")
+        return [asdict(a) for a in alerts.recent(100)]
+
+    def read_audit() -> object:
+        if db is None:
+            raise RuntimeError("没有 api.db")
+        return db.recent_audits(200)
+
+    sources = {
+        "status": lambda: status_view(ledger()).model_dump(),
+        "recent_orders": lambda: [order_view(s).model_dump() for s in ledger().recent_orders(100)],
+        "alerts": read_alerts,
+        "api_audit": read_audit,
+    }
+
+    def build() -> Bundle:
+        return build_bundle(
+            sources=sources,
+            logs=settings.diagnostics_logs,
+            configs=settings.diagnostics_configs,
+            version=_package_version(),
+        )
+
+    return build
+
+
 def build_apid_app(  # noqa: PLR0913 - 装配入口，依赖显式传入
     settings: ApidSettings,
     channel: LocalChannel,
@@ -117,15 +162,18 @@ def build_apid_app(  # noqa: PLR0913 - 装配入口，依赖显式传入
     async def connect() -> CommandClient:
         return await connect_role(endpoints, Role.APID, server_account=settings.tradingd_account)
 
+    ledger = ReadOnlyLedger(settings.ledger_path)
+    alerts = None if settings.alerts_db is None else AlertsReader(settings.alerts_db)
     deps = ApiDeps(
         authenticator=authenticator,
-        ledger=ReadOnlyLedger(settings.ledger_path),
+        ledger=ledger,
         gateway=IpcCommandGateway(connect),
         audit=audit,
         tokens=tokens,
-        alerts=None if settings.alerts_db is None else AlertsReader(settings.alerts_db),
+        alerts=alerts,
         acks=db,
         audit_log=db,
+        diagnostics=PreviewStore(diagnostics_builder(settings, ledger, alerts, db)),
         confirmations=ConfirmationBook(ttl=settings.confirmation_ttl),
     )
     return create_app(deps)
@@ -190,6 +238,7 @@ __all__ = (
     "api_db_lock",
     "build_apid_app",
     "check_listen",
+    "diagnostics_builder",
     "loopback",
     "run_apid",
     "uvicorn_config",

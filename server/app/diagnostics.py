@@ -3,12 +3,15 @@
 用途：出问题时把排查需要的信息打成一个包，交给 Dylan 或支持人员。原则：
 
 - **先预览、再导出**：`build_bundle` 只在内存里生成，`Bundle.preview()` 列出每个文件与完整内容，
-  确认后才由 `write_zip` 写盘。包的内容不可修改（只读映射），写盘前再校验一次条目名。
+  确认后才由 `zip_bytes` 打成 zip。包的内容不可修改（只读映射），打包前再校验一次条目名。
 - **全部脱敏**：
-  - 来源数据经 `server.storage.logs.redact`：账户号只留前缀与后 3 位，
-    像密钥的字段与 SensitiveValue 替换为 ***；
-  - 日志逐行处理：能解析成 JSON 的走 `redact`；其余文本遮账户号，
-    并把 `键=值` / `键: 值` 里像密钥的键、`Bearer …`、网址里的 `token=…` 替换为 ***；
+  - 来源数据与能解析成 JSON 的日志行先走 `server.storage.logs.redact`
+    （账户号只留前缀与后 3 位，像密钥的字段与 SensitiveValue 替换为 ***），
+    再把每个字符串过一遍文本规则；
+  - 文本规则：遮账户号，并把 `键=值` / `键: 值` 里像密钥的键、`Bearer …`、
+    网址里的 `token=…`、apid 令牌本体替换为 ***；
+  - 脱敏是尽力而为：带空格的值、自然语言（“密码是 abc”）遮不全，
+    所以导出前必须由人预览（这也是先预览再导出的意义）；
   - 文件名、错误信息同样脱敏（文件名里也可能有账户号）。
 - **不收集密钥与受保护配置的内容**（失败即关闭：直接报错，不是静默跳过）：
   - 路径先 `resolve()` 再检查，符号链接与 Windows 目录联接一律拒绝（防止链接把密钥目录带进来）；
@@ -19,27 +22,28 @@
   取数失败记进 errors.json，不中断打包。
   保留名 manifest、errors、configs 不能用作来源名；重名一律报错。
 - **日志只取尾部**：每个文件最多读 `MAX_LOG_BYTES` 字节、保留 `MAX_LOG_LINES` 行。
-- **写盘**：不覆盖已有文件；不写进密钥目录或 config/；
-  先写同目录临时文件，完成后再改名，出错时删除半成品。
+- **不写盘**：包只在内存里（`PreviewStore` 短暂保存），下载时直接发给客户端。
 - 时间一律 UTC（不带时区的时间标为 <naive>，不按本地时区猜）；
   NaN、无穷大写成字符串，保证是合法 JSON；
   包内文件按名字排序、zip 时间戳固定，同样的输入得到同样的包。
 
-S-09b 再做：apid 的预览与下载接口（只限 owner，写审计、固定输出目录）、网页预览页、日终报告。
+apid 的预览与下载接口见 server/api/app.py（只限 owner，写审计）。
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
-import os
 import re
 import sys
+import threading
+import uuid
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -50,11 +54,12 @@ from server.storage.logs import mask_text, redact
 
 MAX_LOG_LINES = 500
 MAX_LOG_BYTES = 2_000_000  # 只读文件尾部这么多字节，避免把巨大的日志读进内存
+MAX_LINE_CHARS = 20_000  # 单行上限：超长的整行省略并注明（正则对超长的连续文本很慢）
 MAX_SOURCE_CHARS = 2_000_000  # 单个来源序列化后的上限，超出截断并在 errors.json 里注明
 LOG_SUFFIXES = frozenset({".log", ".jsonl", ".txt"})
 RESERVED = frozenset({"manifest", "errors", "configs"})
 _KEY_DIR = "sec" + "rets"  # 密钥目录名（拆开写：仓库的钩子按字面拦截命令里的这个词）
-_PROTECTED_TOP = "config"  # 日志不能来自 config/ 下；zip 也不能写进去
+_PROTECTED_TOP = "config"  # 日志不能来自 config/ 下
 _CREDENTIAL_SUFFIXES = frozenset({
     ".pem", ".key", ".p12", ".pfx", ".kdbx", ".ppk", ".jks", ".keystore", ".gpg", ".asc",
     ".ovpn", ".crt", ".cer", ".der",
@@ -64,10 +69,11 @@ _CREDENTIAL_NAMES = frozenset(
 )
 # 键两边可以带引号（"api_token": "…"、{'password': '…'}）；值可以带引号，或到空白、分隔符、括号为止
 _KEY_VALUE = re.compile(
-    r"""(?P<q>["']?)(?P<key>[A-Za-z_][\w.-]*)(?P=q)(?P<sep>\s*[=:]\s*)"""
+    r"""(?P<q>["']?)(?P<key>[^\W\d][\w.-]{0,127})(?P=q)(?P<sep>\s*[=＝:：]\s*)"""
     r"""(?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&{}\[\]]+)"""  # 认转义引号；不跨括号
 )
 _BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+")
+_API_TOKEN = re.compile(r"\bqts_[0-9a-f]{16}_[A-Za-z0-9_-]{43}")  # 没有键名的 apid 令牌本体
 
 
 class DiagnosticsError(ValueError):
@@ -110,9 +116,11 @@ def _plain(value: Any) -> Any:  # noqa: PLR0911 - 按类型逐一转换
 
 
 def _json(value: Any) -> str:
+    # 来源里也有自由文本（吊销原因、HALT 原因、告警参数）：和日志行一样，每个字符串都要过文本规则
     text = json.dumps(
-        _plain(redact(value)), ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False
-    )
+        _scrub_leaves(_plain(redact(value))),
+        ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False,
+    )  # fmt: skip
     return text + "\n"
 
 
@@ -126,7 +134,10 @@ def scrub_text(text: str) -> str:
         quote = value[0] if value[:1] in {'"', "'"} else ""  # 值原来带引号就保留引号
         return f"{m.group('q')}{m.group('key')}{m.group('q')}{m.group('sep')}{quote}{MASK}{quote}"
 
-    return _BEARER.sub(lambda m: f"{m.group(1)} {MASK}", _KEY_VALUE.sub(key_value, mask_text(text)))
+    masked = _API_TOKEN.sub(MASK, mask_text(text))
+    # 先遮 Bearer：否则 `token=Bearer abc` 的键值规则只遮到 `Bearer` 这个词，令牌本体会留下
+    masked = _BEARER.sub(lambda m: f"{m.group(1)} {MASK}", masked)
+    return _KEY_VALUE.sub(key_value, masked)
 
 
 def _scrub_line(line: str) -> str:
@@ -147,7 +158,13 @@ def _scrub_line(line: str) -> str:
 
 def _scrub_leaves(value: Any) -> Any:
     if isinstance(value, dict):
-        return {k: _scrub_leaves(v) for k, v in value.items()}
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            safe = scrub_text(key)
+            while safe in out:  # 脱敏后键冲突：加后缀，不丢数据（与 redact 同样处理）
+                safe += "#"
+            out[safe] = _scrub_leaves(item)
+        return out
     if isinstance(value, list):
         return [_scrub_leaves(v) for v in value]
     return scrub_text(value) if isinstance(value, str) else value
@@ -205,7 +222,14 @@ def _tail(path: Path) -> str:
             fh.readline()  # 丢掉被截断的半行
         data = fh.read(MAX_LOG_BYTES)  # 读取期间文件还在增长也不多读
     lines = data.decode("utf-8", errors="replace").splitlines()
-    return "".join(_scrub_line(line) + "\n" for line in lines[-MAX_LOG_LINES:])
+    return "".join(_log_line(line) + "\n" for line in lines[-MAX_LOG_LINES:])
+
+
+def _log_line(line: str) -> str:
+    """超长的行整行省略、不截断：截断后 JSON 解析不了、令牌只剩半截，脱敏会变弱（失败即关闭）。"""
+    if len(line) > MAX_LINE_CHARS:
+        return f"…（本行过长，已省略 {len(line)} 字符）"
+    return _scrub_line(line)
 
 
 def _sha256(path: Path) -> str:
@@ -288,32 +312,76 @@ def _check_entry(name: str) -> None:
         raise DiagnosticsError(f"诊断包条目名不合法：{name!r}")
 
 
-def write_zip(bundle: Bundle, target: Path) -> Path:
-    """把预览过的包写成 zip。目标已存在时拒绝覆盖；不写进密钥目录或 config/；不留半成品。"""
-    resolved = _refuse_secret_path(target)
-    if _PROTECTED_TOP in {p.lower() for p in resolved.parent.parts}:
-        raise DiagnosticsError("诊断包不能写进 config/")
-    if resolved.exists():
-        raise DiagnosticsError(f"{target.name} 已存在，不覆盖")
+def zip_bytes(bundle: Bundle) -> bytes:
+    """把预览过的包打成 zip（只在内存里，不写盘）。时间戳固定：同样内容得到同样的字节。"""
     entries = bundle.preview()
     for name, _ in entries:
         _check_entry(name)
     stamp = bundle.created_at.timetuple()[:6]
-    partial = resolved.with_name(f".{resolved.name}.partial")
-    # "x" 模式：半成品已存在（另一个写入正在进行）就失败，并且不会删掉别人的文件
-    archive = zipfile.ZipFile(partial, "x", compression=zipfile.ZIP_DEFLATED)
-    try:
-        with archive:
-            for name, text in entries:
-                info = zipfile.ZipInfo(name, date_time=stamp)  # 固定时间戳：同样内容得到同样的包
-                archive.writestr(info, text.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED)
-        # 硬链接再删半成品：目标已存在时 link 一定失败，各平台都不会覆盖（POSIX 的 rename 会覆盖）
-        os.link(partial, resolved)
-    except FileExistsError as exc:
-        raise DiagnosticsError(f"{target.name} 已存在，不覆盖") from exc
-    finally:
-        partial.unlink(missing_ok=True)  # 只删本次创建的半成品
-    return resolved
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, text in entries:
+            info = zipfile.ZipInfo(name, date_time=stamp)
+            archive.writestr(info, text.encode("utf-8"), compress_type=zipfile.ZIP_DEFLATED)
+    return buffer.getvalue()
+
+
+class PreviewStore:
+    """预览过的包暂存在内存里，下载时给的就是预览的那一份（S-09b）。
+
+    - 编号随机、不可猜；过期（默认 10 分钟）或超过容量（默认 3 份，先进先出）就不再给出；
+      过期的内容在下一次请求时才从内存清掉；
+    - 只保存 `build_bundle` 生成的包：外面拿不到往里塞任意内容的入口；
+    - 不落盘：进程退出就没了。同步路由在线程池里跑，所以要加锁。
+    """
+
+    def __init__(
+        self,
+        build: Callable[[], Bundle],
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        ttl: timedelta = timedelta(minutes=10),
+        capacity: int = 3,
+    ) -> None:
+        if ttl <= timedelta(0) or capacity <= 0:
+            raise ValueError("保存时长与容量都必须为正")
+        self._build = build
+        self._clock = clock
+        self.ttl = ttl
+        self._capacity = capacity
+        self._held: dict[str, tuple[datetime, Bundle]] = {}
+        self._lock = threading.Lock()
+        self._building = threading.Lock()
+
+    def create_preview(self) -> tuple[str, Bundle]:
+        # 同一时间只生成一份：打包可能较慢，并发请求不该把内存撑大
+        if not self._building.acquire(blocking=False):
+            raise DiagnosticsError("正在生成另一份诊断包，请稍后再试")
+        try:
+            bundle = self._build()
+        finally:
+            self._building.release()
+        for name in bundle.files:  # 预览时就校验：不能预览成功、下载却永远失败
+            _check_entry(name)
+        preview_id = uuid.uuid4().hex  # 122 位随机数，来自操作系统的随机源
+        with self._lock:
+            self._expire()
+            while len(self._held) >= self._capacity:
+                del self._held[next(iter(self._held))]  # dict 保持插入顺序：丢最早的
+            self._held[preview_id] = (self._clock(), bundle)
+        return preview_id, bundle
+
+    def archive(self, preview_id: str) -> bytes | None:
+        """这份预览的 zip；不存在或已过期返回 None。"""
+        with self._lock:
+            self._expire()
+            held = self._held.get(preview_id)
+        return None if held is None else zip_bytes(held[1])
+
+    def _expire(self) -> None:
+        now = self._clock()
+        for key in [k for k, (at, _) in self._held.items() if now - at >= self.ttl]:
+            del self._held[key]
 
 
 __all__ = (
@@ -322,7 +390,8 @@ __all__ = (
     "RESERVED",
     "Bundle",
     "DiagnosticsError",
+    "PreviewStore",
     "build_bundle",
     "scrub_text",
-    "write_zip",
+    "zip_bytes",
 )
