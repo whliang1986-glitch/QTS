@@ -5,6 +5,7 @@ import { call, getToken, setToken } from "./api/client";
 import type { WhoAmI } from "./api/types.gen";
 import { CommandStore } from "./commands";
 import { Alerts, Audit } from "./pages/Alerts";
+import { Diagnostics } from "./pages/Diagnostics";
 import { Emergency } from "./pages/Emergency";
 import { Showroom } from "./pages/Showroom";
 import { Orders, Overview, Positions, Risk, connectionText } from "./pages/Views";
@@ -21,6 +22,7 @@ const PAGES: readonly [string, MessageKey, IconName][] = [
   ["risk", "nav.risk", "risk"],
   ["alerts", "nav.alerts", "bell"],
   ["audit", "nav.audit", "log"],
+  ["diagnostics", "nav.diagnostics", "tool"],
   ["emergency", "nav.emergency", "stop"],
 ];
 
@@ -144,6 +146,7 @@ function Shell({ onLogout, prefs }: { onLogout: () => void; prefs: Prefs }) {
         {page === "risk" ? <Risk state={state} /> : null}
         {page === "alerts" ? <Alerts canAck={who?.role === "owner"} /> : null}
         {page === "audit" ? <Audit /> : null}
+        {page === "diagnostics" ? <Diagnostics canUse={who?.role === "owner"} /> : null}
         {page === "emergency" ? <Emergency canCommand={who?.role === "owner"} /> : null}
       </main>
     </div>

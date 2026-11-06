@@ -173,6 +173,8 @@ main { flex: 1; padding: var(--s5) var(--s4); width: 100%; }
 
 /* ---------- 卡片 ---------- */
 .card { background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r2); padding: var(--s4); }
+.diag-file summary { cursor: pointer; }
+.diag-file pre { margin: var(--s2) 0 0; max-height: 40vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--s3); }
 .stat-label { color: var(--fg-2); font-size: 13px; display: flex; align-items: center; gap: var(--s2); }
 .stat-value { font-size: 22px; font-weight: 600; margin-top: var(--s2); font-variant-numeric: tabular-nums; }
