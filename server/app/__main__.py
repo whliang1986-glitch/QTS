@@ -17,7 +17,7 @@ import argparse
 import asyncio
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -41,6 +41,7 @@ from server.app.tradingd import (
     TradingdSettings,
     run_tradingd,
 )
+from server.app.wiring import Feeds, core_inputs
 from server.app.workerd import WorkerdSettings, run_workerd
 from server.data.calendar import TradingCalendar
 from server.data.calendar_config import parse_calendar_overrides
@@ -80,6 +81,15 @@ class TimeWiring:
         raise AdapterNotAvailableError(
             "行情、账户同步等数据源尚未接入（B-03 / D 组），tradingd 拒绝启动；"
             "接入时 broker_window=self.broker_window、session_day=self.calendar.session_day"
+        )
+
+    def wire(self, feeds: Feeds, clock: Callable[[], datetime]) -> CoreInputs:
+        """按这份日历和券商窗口接好数据来源（B-05w）。生产入口还没有调用它，见 inputs。"""
+        return core_inputs(
+            feeds,
+            broker_window=self.broker_window,
+            session_day=self.calendar.session_day,
+            clock=clock,
         )
 
 
