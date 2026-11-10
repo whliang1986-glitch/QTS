@@ -38,6 +38,30 @@ export function newRequestId(): string {
   return `web-${crypto.randomUUID()}`;
 }
 
+/** 下载文件（如诊断包）。令牌放在请求头，不进 URL；失败按 call 的同样方式返回。cancel 用于离开页面时取消。 */
+export async function download(path: string, cancel: AbortSignal, timeoutMs: number = COMMAND_TIMEOUT_MS): Promise<Result<Blob>> {
+  const token = getToken();
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      cache: "no-store",
+      signal: AbortSignal.any([cancel, AbortSignal.timeout(timeoutMs)]),
+    });
+    if (response.ok) return { ok: true, data: await response.blob() };
+  } catch {
+    return { ok: false, status: 0, error: translate(currentLang(), "status.unreachable"), retrySame: false };
+  }
+  if (response.status === 401) setToken(null);
+  const err = (await response.json().catch(() => null)) as Partial<ErrorResponse> | null;
+  return {
+    ok: false,
+    status: response.status,
+    error: typeof err?.error === "string" ? err.error : translate(currentLang(), "status.requestFailed", { status: response.status }),
+    retrySame: false,
+  };
+}
+
 export async function call<T>(
   method: "GET" | "POST",
   path: string,

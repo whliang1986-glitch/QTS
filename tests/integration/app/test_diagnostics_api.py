@@ -7,6 +7,7 @@ import io
 import json
 import zipfile
 from datetime import UTC, datetime
+from decimal import Decimal
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import Any
@@ -23,10 +24,13 @@ from server.app.diagnostics import (
     build_bundle,
     scrub_text,
 )
+from server.domain.enums import Mode
+from server.domain.modes import HaltState
 from server.storage.alertsdb import StoredAlert
 from server.storage.apidb import ApiDb
 from server.storage.migrate import upgrade
 
+from tests.support.oms import Env
 from tests.unit.api.test_app import OWNER, VIEWER, Gateway, Tokens
 
 NOW = datetime(2026, 11, 5, 21, 0, tzinfo=UTC)
@@ -149,6 +153,33 @@ def test_apid_wires_read_only_sources(tmp_path: Path) -> None:
     assert "hunter2" not in bundle.files["logs/apid.log"]
     assert json.loads(bundle.files["recent_orders.json"]) == []
     assert "alerts" in bundle.errors  # 没配置告警库：如实记下，不中断
+
+
+@pytest.mark.asyncio
+async def test_real_orders_and_status_serialize_into_the_bundle(tmp_path: Path) -> None:
+    """S-09b 只测过空账本：这里用账本里真实的订单和 HALT 模式记录。"""
+    env = Env(tmp_path)
+    await env.broker.connect()
+    _, status = await env.submit("d-1", quantity=Decimal("3"))
+    halt = HaltState(halted=True, reason="急停 密码=halt-pass", since=NOW, set_by="dylan")
+    env.repo.append_mode_change("mc-1", Mode.HALT, halt, NOW, "dylan")
+    path = tmp_path / "ledger.db"
+    settings = ApidSettings(
+        runtime_dir=tmp_path, ledger_path=path, api_db=tmp_path / "api.db", tradingd_account="svc"
+    )
+    bundle = diagnostics_builder(settings, ReadOnlyLedger(path), None, None)()
+    assert "recent_orders" not in bundle.errors and "status" not in bundle.errors
+    orders = json.loads(bundle.files["recent_orders.json"])
+    assert [o["intent_id"] for o in orders] == ["d-1"]
+    assert orders[0]["status"] == status.value
+    assert Decimal(orders[0]["quantity"]) == Decimal(3)
+    current = json.loads(bundle.files["status.json"])
+    assert current["mode"] == "HALT"
+    assert current["halt"]["halted"] is True
+    assert current["halt"]["set_by"] == "dylan"
+    assert current["changed_at"].startswith("2026-11-05T21:00")
+    assert current["halt"]["reason"].startswith("急停")  # 原因文本保留，密钥遮掉
+    assert "halt-pass" not in bundle.files["status.json"]
 
 
 class FakeAlerts:
