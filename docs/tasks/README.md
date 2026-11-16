@@ -83,12 +83,12 @@
 | [T-10d](T-10.md#7-子任务) | 因子自动验证流水线（2 工日，前置 T-10b、T-04） | P1 | ACCEPTED |
 | [T-10e](T-10.md#7-子任务) | 多重检验校正、报告固化与转正门禁（1 工日，前置 T-10d、T-07） | P1 | ACCEPTED |
 | [T-10f](T-10.md#7-子任务) | AI 因子候选通道（0.5 工日，前置 T-10e） | P1 | ACCEPTED |
-| [T-11](T-11.md) | 事件驱动策略（计划补充） | P1 | NOT STARTED |
-| [A-11](A-11.md) | 实时情报流水线（计划补充） | P1 | NOT STARTED |
-| [A-12](A-12.md) | 事件抽取与可信度评估（计划补充） | P1 | NOT STARTED |
-| [A-13](A-13.md) | 产业链图谱（计划补充） | P1 | NOT STARTED |
-| [A-14](A-14.md) | 影响传导与选股排名（计划补充） | P1 | NOT STARTED |
-| [A-15](A-15.md) | 资讯数据源平台管理（计划补充） | P1 | NOT STARTED |
+| [T-11](T-11.md) | 事件驱动策略（计划补充） | P1 | ACCEPTED |
+| [A-11](A-11.md) | 实时情报流水线（计划补充） | P1 | ACCEPTED |
+| [A-12](A-12.md) | 事件抽取与可信度评估（计划补充） | P1 | ACCEPTED |
+| [A-13](A-13.md) | 产业链图谱（计划补充） | P1 | ACCEPTED |
+| [A-14](A-14.md) | 影响传导与选股排名（计划补充） | P1 | ACCEPTED |
+| [A-15](A-15.md) | 资讯数据源平台管理（计划补充） | P1 | ACCEPTED |
 | [H-01](H-01.md) | 工程卫生（无效代码、字体与许可证、漏洞扫描） | P1 | IN REVIEW；已合并 52d7a8d，待逐项验收 |
 | [UI-02](UI-02.md) | 指挥中枢布局原型（DEMO 模式） | P2 | IMPLEMENTED；已合并 ec1d458，待逐项验收 |
 | [P-MAC](P-MAC.md) | macOS 支持 | P1 | DEFERRED（Dylan 2026-10-28：最终要同时支持 Windows 与 macOS；先做 Windows 与 Linux，macOS 留到计划后段） |
