@@ -437,6 +437,10 @@ async def test_queries_refused_when_not_connected() -> None:
 # ---------- 事件 ----------
 
 
+def _connected(adapter: IbkrReadOnlyAdapter) -> bool:
+    return adapter.connected
+
+
 @pytest.mark.asyncio
 async def test_events_status_fill_error_and_disconnect() -> None:
     adapter, ib = await connected()
@@ -457,6 +461,18 @@ async def test_events_status_fill_error_and_disconnect() -> None:
     ib.errorEvent.emit(5, 354, "没有行情订阅", None)  # 不是订单错误：reqId 不当订单号
     err = await asyncio.wait_for(anext(stream), 1)
     assert isinstance(err, BrokerError) and err.broker_order_id is None
+    ib.errorEvent.emit(-1, 1100, "TWS 与 IB 服务器断开", None)
+    assert not _connected(adapter)
+    lost = await asyncio.wait_for(anext(stream), 1)
+    assert isinstance(lost, ConnectionEvent) and lost.state is ConnectionState.DISCONNECTED
+    err_1100 = await asyncio.wait_for(anext(stream), 1)
+    assert isinstance(err_1100, BrokerError) and err_1100.code == "1100"
+    ib.errorEvent.emit(-1, 1102, "TWS 与 IB 服务器恢复连接", None)
+    assert _connected(adapter)
+    restored = await asyncio.wait_for(anext(stream), 1)
+    assert isinstance(restored, ConnectionEvent) and restored.state is ConnectionState.CONNECTED
+    err_1102 = await asyncio.wait_for(anext(stream), 1)
+    assert isinstance(err_1102, BrokerError) and err_1102.code == "1102"
     await adapter.disconnect()
     gone = await asyncio.wait_for(anext(stream), 1)
     assert isinstance(gone, ConnectionEvent) and gone.state is ConnectionState.DISCONNECTED

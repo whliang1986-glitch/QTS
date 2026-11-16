@@ -15,14 +15,14 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 from server.domain.account import CashBalance, Position
-from server.domain.enums import Side
+from server.domain.enums import OrderClass, Side
 from server.domain.instrument import Instrument
 from server.domain.market import Quote
 from server.domain.order_state import TERMINAL
@@ -398,10 +398,56 @@ def _nav(
     return total
 
 
+@dataclass(frozen=True)
+class LedgerStopCooldownSource:
+    """从账本读取保护性止损成交并按交易日历计算冷却期（B-05y，接 R-02b StopCooldownRule）。
+
+    每个保护性止损意图（OrderClass.PROTECTIVE_STOP）的有效成交按成交所属交易日计入；
+    账本或日历读取出错、或当前交易日早于止损交易日（时钟回拨）时返回 None（fail closed）。
+    """
+
+    repo: LedgerRepository
+    session_day: Callable[[datetime], date]
+    sessions_between: Callable[[date, date], Iterable[Any]]
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    rebalance_days: Callable[[], Collection[date]] = lambda: ()
+
+    def __call__(self) -> Mapping[str, StopCooldown] | None:
+        try:
+            today = self.session_day(self.clock())
+            rebalances = set(self.rebalance_days())
+            latest_stop: dict[str, date] = {}
+            for intent_id in self.repo.submitted_intents():
+                intent = self.repo.get_intent(intent_id)
+                if intent is None or intent.order_class is not OrderClass.PROTECTIVE_STOP:
+                    continue
+                for fill in self.repo.effective_executions_for(intent_id):
+                    stop_day = self.session_day(fill.executed_at)
+                    prev = latest_stop.get(fill.symbol)
+                    if prev is None or stop_day > prev:
+                        latest_stop[fill.symbol] = stop_day
+            result: dict[str, StopCooldown] = {}
+            for symbol, stop_day in sorted(latest_stop.items()):
+                if today < stop_day:
+                    return None
+                sessions = list(self.sessions_between(stop_day, today))
+                days_since = sum(1 for s in sessions if getattr(s, "day", s) > stop_day)
+                rebalanced = any(stop_day < d <= today for d in rebalances)
+                result[symbol] = StopCooldown(
+                    trading_days_since_stop=days_since,
+                    rebalanced_since_stop=rebalanced,
+                )
+            return result
+        except Exception as exc:
+            log_event(log, logging.ERROR, "止损冷却期读取失败", error=type(exc).__name__)
+            return None
+
+
 __all__ = (
     "AccountSource",
     "BrokerOpenOrder",
     "BrokerOrderSource",
     "LedgerContextProvider",
+    "LedgerStopCooldownSource",
     "QuoteSource",
 )

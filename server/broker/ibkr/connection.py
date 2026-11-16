@@ -300,7 +300,7 @@ class ConnectionSupervisor:
         # 不在重连时清除 1100 标志：TWS 可能仍与 IB 断开，新连接上未必补发 1100（未实测）；
         # 只有 1101 / 1102 能清除（失败即关闭；B-03b 实测后再决定）
         try:
-            await self._client.connect(LOCALHOST, p.port, p.client_id, readonly=True)
+            await self._client.connect(LOCALHOST, p.port, p.client_id, readonly=p.readonly)
         except (OSError, TimeoutError, ConnectionError):
             await self._safe_disconnect()  # 底层可能半连上
             self._failures += 1

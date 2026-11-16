@@ -58,7 +58,7 @@ from server.broker.ibkr.convert import (
     position,
     utc,
 )
-from server.broker.ibkr.mapping import MappingError, error_info
+from server.broker.ibkr.mapping import BROKER_LOST, BROKER_RESTORED, MappingError, error_info
 from server.domain.account import Account, CashBalance, Position
 from server.storage.logs import log_event, mask_text
 
@@ -90,6 +90,7 @@ class IbkrReadOnlyAdapter(BrokerAdapter):
         self._clock = clock
         self._account: Account | None = None
         self._halted: str | None = None
+        self._broker_lost = False  # 收到 1100（TWS 与 IB 断开）后置 True，1101/1102 才恢复
         self._events: asyncio.Queue[BrokerEvent] = asyncio.Queue(EVENT_QUEUE_SIZE)
         self._subscribed = False
 
@@ -100,6 +101,7 @@ class IbkrReadOnlyAdapter(BrokerAdapter):
             raise BrokerUnavailableError(f"账户核验失败后已停机，需人工处理：{self._halted}")
         check_policy(self._policy)  # 纵深防御：真正连接前再查一次
         p = self._policy
+        self._broker_lost = False
         try:
             await self._client.connect(p.host, p.port, p.client_id, readonly=p.readonly)
             self._account = await verify_account(self._client, p)
@@ -115,6 +117,7 @@ class IbkrReadOnlyAdapter(BrokerAdapter):
 
     async def disconnect(self) -> None:
         self._account = None
+        self._broker_lost = False
         self._unsubscribe()  # 先退订：自己断开时不会再从回调里多发一条 DISCONNECTED
         await self._client.disconnect()
         self._emit(ConnectionEvent(state=ConnectionState.DISCONNECTED, at=self._clock()))
@@ -122,7 +125,9 @@ class IbkrReadOnlyAdapter(BrokerAdapter):
     @property
     def connected(self) -> bool:
         try:
-            return self._account is not None and self._client.is_connected()
+            return (
+                self._account is not None and not self._broker_lost and self._client.is_connected()
+            )
         except Exception:  # 查不到连接状态：按断开处理
             return False
 
@@ -309,10 +314,18 @@ class IbkrReadOnlyAdapter(BrokerAdapter):
     def _on_error(self, req_id: int, code: int, message: str, contract: Any = None) -> None:
         del contract
         try:
-            info = error_info(int(code))
+            num = int(code)
+            if num == BROKER_LOST and not self._broker_lost:
+                self._broker_lost = True
+                self._emit(ConnectionEvent(state=ConnectionState.DISCONNECTED, at=self._clock()))
+            elif num in BROKER_RESTORED and self._broker_lost:
+                self._broker_lost = False
+                if self._account is not None and self._client.is_connected():
+                    self._emit(ConnectionEvent(state=ConnectionState.CONNECTED, at=self._clock()))
+            info = error_info(num)
             if info is None:
                 return
-            order_id = str(req_id) if int(code) in _ORDER_ERROR_CODES and req_id > 0 else None
+            order_id = str(req_id) if num in _ORDER_ERROR_CODES and req_id > 0 else None
             self._emit(BrokerError(category=info.category, code=str(code),
                                    message=mask_text(str(message))[:500],
                                    retryable=info.retryable, broker_order_id=order_id,

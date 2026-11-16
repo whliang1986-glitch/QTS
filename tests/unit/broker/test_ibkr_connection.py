@@ -168,6 +168,9 @@ async def test_connects_read_only_and_requires_reconciliation_before_trading() -
     assert not sup.trading_allowed()  # 连上后必须先对账
     sup.mark_reconciled(sup.epoch)
     assert sup.trading_allowed()
+    paper_write = StubClient()
+    await _supervisor(paper_write, policy=replace(POLICY, readonly=False)).step()
+    assert paper_write.connects == [("127.0.0.1", 7497, 1, False)]
 
 
 @pytest.mark.asyncio

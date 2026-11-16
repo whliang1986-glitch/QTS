@@ -30,6 +30,7 @@
 | [B-05](B-05.md) | IBKR 模拟盘下单（不连 TWS 的部分） | P0 | PARTIALLY VERIFIED：代码与单元测试完成；**没有**在 TWS 模拟盘联调，契约套件**没有**在 IBKR 上运行 |
 | [B-05w](B-05w.md) | 交易核心数据来源接线（只接 FakeBroker） | P0 | IN REVIEW；已合并 7ee2aa7（safety-reviewer 第三轮 APPROVE），待逐项验收；接入 IBKR 前须处理下方残留风险，后续任务 B-05x |
 | [B-05x](B-05x.md) | 关键组件校验下沉到风控层（`build_trading_core` 拒绝空清单或缺关键组件，见 [B-05w](B-05w.md) 残留风险） | P0 | ACCEPTED |
+| [B-05y](B-05y.md) | 交易核心真实数据源装配与连接加固（公司行动、止损冷却、开盘净值、回撤、账户同步、时钟偏差、1100 联动） | P0 | ACCEPTED |
 | [O-01](O-01.md) | 订单状态机与 UNKNOWN | P0 | ACCEPTED |
 | [O-02](O-02.md) | 幂等与成交去重 | P0 | ACCEPTED |
 | [O-03](O-03.md) | 撤单与改单竞态 | P0 | ACCEPTED |

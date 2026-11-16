@@ -23,7 +23,17 @@ from server.app.common import AdapterNotAvailableError
 from server.app.scheduler import ScheduleSettings
 from server.app.supervisor import EXIT_OK, EXIT_REFUSED
 from server.app.tradingd import TradingdDeps, production_broker
-from server.app.wiring import Feeds, UnavailableCorporateActions, health_reporter
+from server.app.wiring import (
+    AccountSyncMonitor,
+    DailyNavBook,
+    Feeds,
+    LakeCorporateActionSource,
+    LedgerStopCooldownSource,
+    StrategyDrawdownBook,
+    UnavailableCorporateActions,
+    clock_skew_probe,
+    health_reporter,
+)
 from server.broker.ibkr.client import IbAsyncClient
 from server.broker.ibkr.market_data import IbkrQuoteSource
 from server.domain.enums import OrderClass, Side
@@ -443,3 +453,143 @@ async def test_production_entry_still_refuses(env: Env, tmp_path: Path) -> None:
     time = production_time(ScheduleSettings(), date(2026, 10, 28), tmp_path / "none.toml")
     with pytest.raises(AdapterNotAvailableError):
         time.inputs()
+
+
+# ---------- B-05y：真实数据来源实现 ----------
+
+
+@pytest.mark.asyncio
+async def test_lake_corporate_action_source_reads_splits(env: Env, tmp_path: Path) -> None:
+    from server.data.corporate_actions import actions_table  # noqa: PLC0415
+    from server.data.lake import DataLake  # noqa: PLC0415
+    from server.domain.corporate_actions import (  # noqa: PLC0415
+        CorporateActionKind,
+        CorporateActionRecord,
+    )
+
+    lake = DataLake(tmp_path / "lake")
+    ex_day = CALENDAR.session_day(env.clock())
+    split = CorporateActionRecord(
+        event_id="sp-1",
+        symbol="SPY",
+        kind=CorporateActionKind.SPLIT,
+        ex_date=ex_day,
+        source="ibkr",
+        numerator=2,
+        denominator=1,
+    )
+    div = CorporateActionRecord(
+        event_id="dv-1",
+        symbol="SPY",
+        kind=CorporateActionKind.CASH_DIVIDEND,
+        ex_date=ex_day,
+        source="ibkr",
+        amount=Decimal("1.25"),
+        currency="USD",
+    )
+    lake.write_partition(
+        "normalized",
+        "corp_actions",
+        ex_day,
+        actions_table([split, div]),
+        provider="ibkr",
+        fetched_at=env.clock(),
+        license_url="https://example.com",
+    )
+    source = LakeCorporateActionSource(
+        lake=lake, calendar=CALENDAR, start=ex_day - timedelta(days=5), clock=env.clock
+    )
+    got = await source.actions(["SPY"])
+    assert len(got) == 1 and got[0].event_id == "sp-1" and got[0].numerator == 2
+    assert await source.actions([]) == ()
+
+
+@pytest.mark.asyncio
+async def test_ledger_stop_cooldown_source_tracks_protective_stop_fills(env: Env) -> None:
+    from server.domain.orders import PROTECTIVE_STOP_SOURCE  # noqa: PLC0415
+
+    await env.broker.connect()
+    await env.pump()
+    await env.submit(
+        "stop-1",
+        strategy_id=PROTECTIVE_STOP_SOURCE,
+        side=Side.SELL,
+        order_class=OrderClass.PROTECTIVE_STOP,
+        order_type=env.make_intent().order_type.__class__.STOP,
+        limit_price=None,
+        stop_price=Decimal("90.00"),
+        time_in_force=env.make_intent().time_in_force.__class__.GTC,
+        quantity=Decimal(5),
+    )
+    env.server.fill(env.oid("stop-1"), Decimal(5), Decimal("90.00"))
+    await env.pump()
+
+    rebalances: list[date] = []
+    source = LedgerStopCooldownSource(
+        repo=env.repo,
+        session_day=CALENDAR.session_day,
+        sessions_between=CALENDAR.sessions_between,
+        clock=env.clock,
+        rebalance_days=lambda: rebalances,
+    )
+    day0 = source()
+    assert day0 is not None and day0["SPY"].trading_days_since_stop == 0
+    assert day0["SPY"].rebalanced_since_stop is False
+
+    env.clock.advance(86400 * 7)  # 跨过 5 个交易日
+    rebalances.append(CALENDAR.session_day(env.clock()))
+    after = source()
+    assert after is not None and after["SPY"].trading_days_since_stop >= 5
+    assert after["SPY"].rebalanced_since_stop is True
+
+
+def test_daily_nav_book_and_strategy_drawdown_book(env: Env) -> None:
+    navs = DailyNavBook(CALENDAR.session_day, clock=env.clock)
+    today = CALENDAR.session_day(env.clock())
+    assert navs("DU0000001") is None
+    navs.record("DU0000001", today, Decimal(200000))
+    navs.record("DU0000001", today, Decimal(200000))  # 同值幂等
+    assert navs("DU0000001") == Decimal(200000)
+    with pytest.raises(ValueError, match="禁止覆盖"):
+        navs.record("DU0000001", today, Decimal(210000))
+
+    dd = StrategyDrawdownBook(stale_after=timedelta(seconds=60), clock=env.clock)
+    dd.record("s", Decimal(100))
+    dd.record("s", Decimal(95))
+    got = dd()
+    assert got is not None and got["s"] == Decimal("0.05")
+    env.clock.advance(120)
+    assert dd() == {}  # 过期后不再返回，由 StrategyDrawdownRule 拒绝
+
+
+@pytest.mark.asyncio
+async def test_account_sync_monitor_and_clock_skew_probe(env: Env) -> None:
+    await env.broker.connect()
+    reconciled = [True]
+    monitor = AccountSyncMonitor(
+        lambda: env.broker,
+        lambda: reconciled[0],
+        stale_after=timedelta(seconds=30),
+        clock=env.clock,
+    )
+    assert monitor.is_synced() is None and monitor.check() is False
+    monitor.mark_synced()
+    assert monitor.is_synced() is True and monitor.check() is True
+    reconciled[0] = False
+    assert monitor.is_synced() is False and monitor.check() is False
+    reconciled[0] = True
+    env.clock.advance(60)
+    assert monitor.is_synced() is False
+
+    async def ref_ok() -> Any:
+        return env.clock() + timedelta(milliseconds=120)
+
+    probe = clock_skew_probe(ref_ok, local_clock=env.clock, max_rtt=timedelta(seconds=1))
+    assert await probe() == 120
+
+    async def ref_slow() -> Any:
+        env.clock.advance(5)
+        return env.clock()
+
+    slow = clock_skew_probe(ref_slow, local_clock=env.clock, max_rtt=timedelta(seconds=1))
+    assert await slow() is None
