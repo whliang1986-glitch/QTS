@@ -28,13 +28,17 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
+from datetime import datetime
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
-from server.domain.enums import Side
+from server.domain.enums import OrderClass, OrderType, Side, TimeInForce
+from server.domain.instrument import Instrument
+from server.domain.orders import PROTECTIVE_STOP_SOURCE, OrderIntent
+from server.risk.default_deny import ProtectiveStopParams
 
 
 class Coverage(StrEnum):
@@ -209,4 +213,219 @@ def _same_account(expected: str, actual: str, what: str) -> None:
         raise ValueError(f"保护性止损核对收到不属于登记账户的{what}")
 
 
-__all__ = ("Coverage", "CoverageReport", "Gap", "HeldPosition", "WorkingOrder", "check_coverage")
+# ---------- R-06b：券商记录视图转换、空快照拒绝与止损建单规划 ----------
+
+_TERMINAL_BROKER_STATES = frozenset({"FILLED", "CANCELLED", "REJECTED", "EXPIRED"})
+
+
+class BrokerOrderLike(Protocol):
+    @property
+    def account_id(self) -> str: ...
+
+    @property
+    def symbol(self) -> str: ...
+
+    @property
+    def side(self) -> Side: ...
+
+    @property
+    def remaining_quantity(self) -> Decimal: ...
+
+    @property
+    def raw_order_type(self) -> str: ...
+
+    @property
+    def time_in_force(self) -> str: ...
+
+    @property
+    def state(self) -> Any: ...
+
+
+@dataclass(frozen=True)
+class WorkingOrderView:
+    account_id: str
+    symbol: str
+    side: Side
+    remaining_quantity: Decimal
+    kind: str
+    working: bool
+    time_in_force: str
+
+
+def to_working_orders(records: Iterable[BrokerOrderLike]) -> tuple[WorkingOrderView, ...]:
+    """券商订单转 WorkingOrder 视图（R-06b）：STP 填 STOP，LMT 填 LIMIT，其余填 OTHER。"""
+    views: list[WorkingOrderView] = []
+    for r in records:
+        raw = str(r.raw_order_type).strip().upper()
+        if raw == "STP":
+            kind = "STOP"
+        elif raw == "LMT":
+            kind = "LIMIT"
+        else:
+            kind = "OTHER"
+        state_val = str(getattr(r.state, "value", r.state)).upper()
+        working = state_val not in _TERMINAL_BROKER_STATES
+        views.append(
+            WorkingOrderView(
+                account_id=r.account_id,
+                symbol=r.symbol,
+                side=r.side,
+                remaining_quantity=r.remaining_quantity,
+                kind=kind,
+                working=working,
+                time_in_force=str(r.time_in_force).strip().upper(),
+            )
+        )
+    return tuple(views)
+
+
+def check_broker_coverage(
+    account_id: str,
+    positions: Sequence[HeldPosition] | None,
+    open_orders: Sequence[BrokerOrderLike] | None,
+) -> CoverageReport:
+    """从券商持仓与未结束订单快照核对覆盖（R-06b）：取数失败（None）时直接拒绝，防止空快照得出“全部覆盖”。"""
+    if positions is None or open_orders is None:
+        raise ValueError("持仓或未结束订单快照不可用，无法核对保护性止损覆盖")
+    return check_coverage(account_id, positions, to_working_orders(open_orders))
+
+
+@dataclass(frozen=True)
+class ProtectiveSyncPlan:
+    report: CoverageReport
+    intents: tuple[OrderIntent, ...]
+    below_stop_symbols: tuple[str, ...]
+    fractional_symbols: tuple[str, ...]
+
+    def alert_symbols(self) -> tuple[str, ...]:
+        """需要发 P0 告警的标的（覆盖缺口 + 跌破止损线 + 碎股）。"""
+        return tuple(
+            sorted(
+                set(self.report.alert_symbols())
+                | set(self.below_stop_symbols)
+                | set(self.fractional_symbols)
+            )
+        )
+
+
+def _ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal:
+    steps = (price / tick).to_integral_value(rounding=ROUND_CEILING)
+    return steps * tick
+
+
+def _resolve_stop_price(
+    avg_cost: Decimal,
+    last: Decimal,
+    tick: Decimal,
+    params: ProtectiveStopParams,
+) -> tuple[Decimal | None, bool]:
+    """返回 (合规止损价, 是否跌破原止损线)。无法挂出合规止损时止损价返回 None。"""
+    base_stop = _ceil_to_tick(avg_cost * (Decimal(1) - params.stop_distance), tick)
+    if last <= base_stop:
+        if params.below_stop_distance is None:
+            return None, True
+        fallback = _ceil_to_tick(last * (Decimal(1) - params.below_stop_distance), tick)
+        return (fallback if Decimal(0) < fallback < last else None), True
+    if Decimal(0) < base_stop < min(avg_cost, last):
+        return base_stop, False
+    return None, False
+
+
+def plan_protective_stops(  # noqa: PLR0913 - 规划依赖的快照与参数全部显式传入
+    account_id: str,
+    positions: Sequence[HeldPosition] | None,
+    open_orders: Sequence[BrokerOrderLike] | None,
+    *,
+    instruments: Mapping[str, Instrument],
+    last_prices: Mapping[str, Decimal],
+    params: ProtectiveStopParams,
+    now: datetime,
+    intent_prefix: str = "pstop",
+) -> ProtectiveSyncPlan:
+    """按券商持仓规划缺失的保护性止损意图（R-06b，Dylan 2026-11-16 确认规则）。
+
+    - 只对当前没有任何在途卖单的持仓标的新建止损单（已有止损或减仓卖单时不叠加以免超卖）；
+    - 碎股持仓：记录到 fractional_symbols 告警；若 allow_fractional_floor 为 True 且整股部分 ≥ 1，
+      为整股部分建止损单，否则只告警不建单；
+    - 跌破止损线（last ≤ 成本 × (1 − stop_distance)）：记录到 below_stop_symbols 告警；
+      若配置了 below_stop_distance，按当前价下方缓冲距离挂止损，否则 fail closed 只告警不建单。
+    """
+    report = check_broker_coverage(account_id, positions, open_orders)
+    assert positions is not None and open_orders is not None  # noqa: S101
+    working = to_working_orders(open_orders)
+    has_sell = {o.symbol for o in working if o.side is Side.SELL and o.remaining_quantity > 0}
+    held: dict[str, Decimal] = defaultdict(Decimal)
+    costs: dict[str, list[Decimal]] = defaultdict(list)
+    for p in positions:
+        held[p.symbol] += p.quantity
+        cost = getattr(p, "average_cost", None)
+        if cost is not None:
+            costs[p.symbol].append(Decimal(cost))
+
+    intents: list[OrderIntent] = []
+    below_stop: set[str] = set()
+    fractional: set[str] = set()
+    for symbol, qty in sorted(held.items()):
+        if qty <= 0:
+            continue
+        whole = qty.to_integral_value(rounding=ROUND_FLOOR)
+        if qty != whole:
+            fractional.add(symbol)
+            if not params.allow_fractional_floor or whole <= 0:
+                continue
+        symbol_costs = costs.get(symbol, [])
+        instrument = instruments.get(symbol)
+        last = last_prices.get(symbol)
+        if (
+            len(symbol_costs) != 1
+            or instrument is None
+            or instrument.tick_size is None
+            or last is None
+        ):
+            continue
+        stop_price, is_below = _resolve_stop_price(
+            symbol_costs[0], last, instrument.tick_size, params
+        )
+        if is_below:
+            below_stop.add(symbol)
+        if stop_price is None or symbol in has_sell:
+            continue
+        intents.append(
+            OrderIntent(
+                intent_id=f"{intent_prefix}-{symbol}-{int(now.timestamp())}",
+                created_at=now,
+                strategy_id=PROTECTIVE_STOP_SOURCE,
+                strategy_version="1",
+                account_id=account_id,
+                symbol=symbol,
+                side=Side.SELL,
+                quantity=whole,
+                order_type=OrderType.STOP,
+                limit_price=None,
+                stop_price=stop_price,
+                order_class=OrderClass.PROTECTIVE_STOP,
+                time_in_force=TimeInForce.GTC,
+            )
+        )
+    return ProtectiveSyncPlan(
+        report=report,
+        intents=tuple(intents),
+        below_stop_symbols=tuple(sorted(below_stop)),
+        fractional_symbols=tuple(sorted(fractional)),
+    )
+
+
+__all__ = (
+    "BrokerOrderLike",
+    "Coverage",
+    "CoverageReport",
+    "Gap",
+    "HeldPosition",
+    "ProtectiveSyncPlan",
+    "WorkingOrder",
+    "WorkingOrderView",
+    "check_broker_coverage",
+    "check_coverage",
+    "plan_protective_stops",
+    "to_working_orders",
+)

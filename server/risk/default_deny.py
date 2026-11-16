@@ -26,7 +26,7 @@ DefaultDenyRule（所有订单，“无专项规则即禁止”）：
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 
 from server.domain.enums import AssetClass, OrderClass, OrderType, RiskVerdict, Side
 from server.domain.errors import InstrumentSpecMissingError
@@ -67,6 +67,7 @@ STOP_COST = "持仓成本价不可用，无法核对止损价"
 STOP_RANGE = "止损价必须在成本价下方、且不低于批准的止损距离"
 STOP_TICK = "止损价不在最小跳动上"
 STOP_TRIGGERS = "止损价不低于最新价，提交即触发（等于市价卖出）"
+BELOW_STOP_OPEN = "持仓已跌破止损线，禁止该标的新开仓"
 
 
 def _reject(message: str) -> RuleResult:
@@ -77,10 +78,18 @@ class ProtectiveStopParams(ValueModel):
     """附录 A 的保护性止损参数，由 Dylan 在受保护配置里批准（R-02 加载）；开发方不定数值。"""
 
     stop_distance: Decimal  # 成本价下方的距离（比例，0 < d < 1）
+    # R-06b：持仓跌破止损线时，按当前价下方固定缓冲距离补挂止损；未提供则 fail closed
+    below_stop_distance: Decimal | None = None
+    # R-06b：券商侧出现碎股持仓时，允许止损数量向下取整为整股（剩余碎股单独告警）
+    allow_fractional_floor: bool = False
 
     def model_post_init(self, __context: object) -> None:
         if not Decimal(0) < self.stop_distance < Decimal(1):
             raise ValueError("止损距离必须在 0 与 1 之间（比例）")
+        if self.below_stop_distance is not None and not (
+            Decimal(0) < self.below_stop_distance < Decimal(1)
+        ):
+            raise ValueError("跌破止损线后的缓冲距离必须在 0 与 1 之间（比例）")
 
 
 class DefaultDenyRule:
@@ -95,7 +104,9 @@ class DefaultDenyRule:
         if message is None:
             order_class = subject.intent.order_class
             if order_class is OrderClass.OPEN:
-                message = _no_leverage(subject, context)
+                message = _below_stop_open(subject, context, self._protective) or _no_leverage(
+                    subject, context
+                )
             elif order_class is OrderClass.REDUCE:
                 message = _no_short(subject, context)
             else:
@@ -172,11 +183,38 @@ def _no_short(subject: Subject, context: RiskContext) -> str | None:
     return None
 
 
+def _below_stop_open(
+    subject: Subject, context: RiskContext, params: ProtectiveStopParams | None
+) -> str | None:
+    """R-06b：持仓已跌破止损线（最新价 ≤ 成本 × (1 − 止损距离)）时，禁止该标的新开仓。"""
+    if params is None or params.below_stop_distance is None:
+        return None
+    symbol = subject.intent.symbol
+    last = (context.last_prices or {}).get(symbol)
+    if last is None:
+        return None
+    for p in context.positions or ():
+        if p.symbol == symbol and p.quantity > 0 and p.average_cost is not None:
+            floor = p.average_cost * (Decimal(1) - params.stop_distance)
+            if last <= floor:
+                return BELOW_STOP_OPEN
+    return None
+
+
 def _protective_stop(
     subject: Subject, context: RiskContext, params: ProtectiveStopParams | None
 ) -> str | None:
     intent = subject.intent
     held = context.position(intent.symbol)
+    expected_qty = held
+    if (
+        params is not None
+        and params.allow_fractional_floor
+        and held is not None
+        and held > 0
+        and held != held.to_integral_value()
+    ):
+        expected_qty = held.to_integral_value(rounding=ROUND_FLOOR)
     others = [
         o
         for o in context.open_orders or ()
@@ -189,9 +227,12 @@ def _protective_stop(
         (intent.strategy_id != PROTECTIVE_STOP_SOURCE, STOP_SOURCE),
         (params is None, STOP_PARAMS),
         (held is None or context.open_orders is None or last is None, STOP_CONTEXT),
-        (held is not None and held <= 0, STOP_NO_HOLDING),
+        (
+            held is not None and (held <= 0 or (expected_qty is not None and expected_qty <= 0)),
+            STOP_NO_HOLDING,
+        ),
         (bool(others), STOP_DUPLICATE),
-        (held is not None and subject.quantity != held, STOP_QUANTITY),
+        (expected_qty is not None and subject.quantity != expected_qty, STOP_QUANTITY),
     ]
     for failed, message in checks:  # 按顺序给出第一条不满足的条件
         if failed:
@@ -212,7 +253,12 @@ def _stop_price(
     if len(costs) != 1:
         return STOP_COST
     cost = costs[0]
-    if not cost * (Decimal(1) - params.stop_distance) <= subject.price < cost:
+    floor = cost * (Decimal(1) - params.stop_distance)
+    if last <= floor and params.below_stop_distance is not None:
+        fallback_floor = last * (Decimal(1) - params.below_stop_distance)
+        if not fallback_floor <= subject.price < last:
+            return STOP_RANGE
+    elif not floor <= subject.price < cost:
         return STOP_RANGE
     if not (context.instruments or {})[symbol].is_on_tick(subject.price):
         return STOP_TICK

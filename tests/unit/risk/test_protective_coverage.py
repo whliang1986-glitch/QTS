@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 from server.domain.enums import Side
-from server.risk.protective_coverage import Coverage, check_coverage
+from server.risk.default_deny import ProtectiveStopParams
+from server.risk.protective_coverage import (
+    Coverage,
+    check_broker_coverage,
+    check_coverage,
+    plan_protective_stops,
+    to_working_orders,
+)
+from tests.support.oms import SPY
 
 ACCOUNT = "DU1234567"
+NOW = datetime(2026, 11, 5, 15, 0, tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -17,6 +27,7 @@ class Pos:
     symbol: str
     quantity: Decimal
     account_id: str = ACCOUNT
+    average_cost: Decimal | None = Decimal(100)
 
 
 @dataclass(frozen=True)
@@ -125,3 +136,93 @@ def test_bad_input_is_refused_not_skipped(
 ) -> None:
     with pytest.raises(ValueError, match=match):
         check_coverage(ACCOUNT, positions, orders)
+
+
+# ---------- R-06b：券商记录视图转换、空快照拒绝与止损建单规划 ----------
+
+
+@dataclass(frozen=True)
+class BrokerOrder:
+    symbol: str
+    remaining_quantity: Decimal
+    raw_order_type: str = "STP"
+    time_in_force: str = "GTC"
+    side: Side = Side.SELL
+    state: str = "ACKNOWLEDGED"
+    account_id: str = ACCOUNT
+
+
+def test_to_working_orders_maps_only_plain_stp_to_stop() -> None:
+    views = to_working_orders(
+        [
+            BrokerOrder("SPY", Decimal(10), "STP"),
+            BrokerOrder("QQQ", Decimal(10), "LMT"),
+            BrokerOrder("IWM", Decimal(10), "STP LMT"),
+            BrokerOrder("TLT", Decimal(10), "TRAIL"),
+            BrokerOrder("GLD", Decimal(10), "STP", state="FILLED"),
+        ]
+    )
+    assert [(v.symbol, v.kind, v.working) for v in views] == [
+        ("SPY", "STOP", True),
+        ("QQQ", "LIMIT", True),
+        ("IWM", "OTHER", True),
+        ("TLT", "OTHER", True),
+        ("GLD", "STOP", False),
+    ]
+
+
+def test_check_broker_coverage_refuses_missing_snapshots() -> None:
+    with pytest.raises(ValueError, match="快照不可用"):
+        check_broker_coverage(ACCOUNT, None, [])
+    with pytest.raises(ValueError, match="快照不可用"):
+        check_broker_coverage(ACCOUNT, [], None)
+
+
+def test_plan_protective_stops_covers_normal_fractional_and_below_stop() -> None:
+    params = ProtectiveStopParams(
+        stop_distance=Decimal("0.10"),
+        below_stop_distance=Decimal("0.05"),
+        allow_fractional_floor=True,
+    )
+    plan = plan_protective_stops(
+        ACCOUNT,
+        [Pos("SPY", Decimal("10.5"), average_cost=Decimal(100))],
+        [],
+        instruments={"SPY": SPY},
+        last_prices={"SPY": Decimal(98)},
+        params=params,
+        now=NOW,
+    )
+    assert plan.fractional_symbols == ("SPY",)
+    assert plan.below_stop_symbols == ()
+    assert len(plan.intents) == 1
+    assert plan.intents[0].quantity == Decimal(10)
+    assert plan.intents[0].stop_price == Decimal("90.00")
+
+    # 跌破止损线（last=88 <= 90）：记录告警并按当前价下方 5% 挂止损（83.60）
+    below = plan_protective_stops(
+        ACCOUNT,
+        [Pos("SPY", Decimal(10), average_cost=Decimal(100))],
+        [],
+        instruments={"SPY": SPY},
+        last_prices={"SPY": Decimal(88)},
+        params=params,
+        now=NOW,
+    )
+    assert below.below_stop_symbols == ("SPY",)
+    assert "SPY" in below.alert_symbols()
+    assert len(below.intents) == 1 and below.intents[0].stop_price == Decimal("83.60")
+
+    # 未配置 below_stop_distance 时 fail closed：只告警，不建止损单
+    strict_params = ProtectiveStopParams(stop_distance=Decimal("0.10"))
+    strict_plan = plan_protective_stops(
+        ACCOUNT,
+        [Pos("SPY", Decimal(10), average_cost=Decimal(100))],
+        [],
+        instruments={"SPY": SPY},
+        last_prices={"SPY": Decimal(88)},
+        params=strict_params,
+        now=NOW,
+    )
+    assert strict_plan.below_stop_symbols == ("SPY",)
+    assert strict_plan.intents == ()

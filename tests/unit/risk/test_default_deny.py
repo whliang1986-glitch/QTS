@@ -259,3 +259,19 @@ def test_protective_stop_without_approved_params_is_rejected() -> None:
 def test_stop_distance_must_be_a_proportion(distance: str) -> None:
     with pytest.raises((ValidationError, ValueError)):
         ProtectiveStopParams(stop_distance=Decimal(distance))
+
+
+def test_r06b_below_stop_blocks_new_open_and_allows_fallback_stop() -> None:
+    params = ProtectiveStopParams(
+        stop_distance=Decimal("0.10"),
+        below_stop_distance=Decimal("0.05"),
+        allow_fractional_floor=True,
+    )
+    # 持仓成本 100，止损线 90，现价 88（已跌破止损线）：禁止新开仓
+    ctx_below = context(last={"SPY": Decimal("88")})
+    assert check(intent(), ctx_below, params=params) == dd.BELOW_STOP_OPEN
+    # 按现价 88 下方 5%（83.60）补挂保护性止损：放行
+    assert check(stop(qty=100, price="83.60"), ctx_below, params=params) is None
+    # 碎股持仓 100.5 股，止损单向下取整为 100 股：放行
+    ctx_frac = context(positions=(position("100.5"),))
+    assert check(stop(qty=100, price="95"), ctx_frac, params=params) is None
