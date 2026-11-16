@@ -27,4 +27,14 @@
 | POST | /v1/strategies/{strategy_id}/versions/{version}/stop | 停用策略版本（立即生效，仅 owner） | 策略中心页 | tests/integration/storage/test_strategy_registry.py | 否 | T-09b / S-05 |
 | POST | /v1/strategies/{strategy_id}/versions/{version}/resume | 恢复已停用策略版本（PAPER 及之后须附门禁报告，仅 owner） | 策略中心页 | tests/integration/storage/test_strategy_registry.py | 否 | T-09b / S-05 |
 | POST | /v1/strategies/{strategy_id}/archive | 归档隐藏整个策略（须先停用全部版本，ID 不可复用，仅 owner） | 策略中心页 | tests/integration/storage/test_strategy_registry.py | 否 | T-09b / S-05 |
+| GET | /v1/watchlist | 自选标的列表（含行情状态、交易名单三层状态与资格检查结果） | 自选与交易名单页 | tests/integration/risk/test_watchlist_and_approvals.py | 否 | S-14 |
+| POST | /v1/watchlist | 新增或更新自选标的（仅 owner，写审计，不开放交易权限） | 自选与交易名单页 | tests/integration/risk/test_watchlist_and_approvals.py | 否 | S-14 |
+| DELETE | /v1/watchlist/{symbol} | 从自选列表移除标的（仅 owner，写审计） | 自选与交易名单页 | tests/integration/risk/test_watchlist_and_approvals.py | 否 | S-14 |
+| GET | /v1/trading-list | 查询生效交易名单与待确认名单 | 自选与交易名单页 | tests/integration/risk/test_watchlist_and_approvals.py | 否 | S-14 |
+| POST | /v1/trading-list/requests | 发起加入交易名单请求（服务端资格与硬上限检查，仅 owner） | 自选与交易名单页 | tests/integration/risk/test_watchlist_and_approvals.py | 否 | S-14 |
+| POST | /v1/trading-list/requests/{symbol}/confirm | 二次确认短语生效加入交易名单（仅 owner） | 自选与交易名单页 | tests/integration/risk/test_watchlist_and_approvals.py | 否 | S-14 |
+| POST | /v1/trading-list/requests/{symbol}/cancel | 撤回待确认的加入交易名单请求（仅 owner） | 自选与交易名单页 | tests/integration/risk/test_watchlist_and_approvals.py | 否 | S-14 |
+| POST | /v1/trading-list/{symbol}/remove | 立即移出交易名单（调严，仅 owner） | 自选与交易名单页 | tests/integration/risk/test_watchlist_and_approvals.py | 否 | S-14 |
+| GET | /v1/approvals | 查询待审批队列 | 待审批队列页 | tests/integration/risk/test_watchlist_and_approvals.py | 否 | S-10 |
+| POST | /v1/approvals/{approval_id}/decide | 批准或拒绝待审批项（仅 owner，写审计） | 待审批队列页 | tests/integration/risk/test_watchlist_and_approvals.py | 否 | S-10 |
 | WS | /v1/stream | 状态与订单事件推送 | 网页从轮询改为推送 | tests/unit/api/test_app.py | 否 | S-05（实时推送） |

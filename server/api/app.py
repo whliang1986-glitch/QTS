@@ -51,6 +51,9 @@ from server.api.models import (
     AckResponse,
     AlertList,
     AlertView,
+    ApprovalDecisionRequest,
+    ApprovalItemView,
+    ApprovalListView,
     AuditEntry,
     AuditList,
     CommandCatalog,
@@ -85,6 +88,13 @@ from server.api.models import (
     StreamHello,
     StreamOrderEvent,
     StreamStatus,
+    TradingListAddRequest,
+    TradingListConfirmRequest,
+    TradingListReasonRequest,
+    TradingListView,
+    WatchlistItemView,
+    WatchlistUpsertRequest,
+    WatchlistView,
     WhoAmI,
 )
 from server.api.security import (
@@ -105,9 +115,18 @@ from server.domain.strategy_lifecycle import (
 from server.guard.alerts import CODES, LANGS, Alert, Level, render
 from server.storage.alertsdb import StoredAlert
 from server.storage.apidb import ApiDbError, TokenNotFoundError
+from server.storage.approval_queue import ApprovalError, ApprovalItem, ApprovalQueue, ApprovalStatus
 from server.storage.ledger import LedgerRepository, OrderEventRow, OrderSummary
 from server.storage.logs import log_event
 from server.storage.strategy_registry import StrategyRegistry
+from server.storage.trading_list import (
+    SymbolProfile,
+    TradingListError,
+    TradingListState,
+    TradingListStore,
+    check_eligibility,
+)
+from server.storage.watchlist import WatchlistError, WatchlistStore
 
 log = logging.getLogger(__name__)
 
@@ -209,6 +228,11 @@ class ApiDeps:
     diagnostics: DiagnosticsSource | None = None
     daily_reports: Callable[[date], DailyReportData] | None = None  # 未来的日期抛 ValueError
     strategies: StrategyRegistry | None = None
+    watchlist: WatchlistStore | None = None
+    trading_list: TradingListStore | None = None
+    symbol_profiles: Callable[[str], SymbolProfile | None] | None = None
+    quote_delayed_map: Callable[[], dict[str, bool]] | None = None
+    approvals: ApprovalQueue | None = None
     limiter: FailureLimiter = field(default_factory=FailureLimiter)
     confirmations: ConfirmationBook = field(default_factory=ConfirmationBook)
     stream_interval: float = 1.0  # 事件流轮询账本的间隔（秒）
@@ -659,6 +683,203 @@ def create_app(deps: ApiDeps) -> FastAPI:  # noqa: PLR0915 - 路由集中在一�
             archived_versions=[r.version for r in archived],
         )
 
+    def watchlist_store() -> WatchlistStore:
+        if deps.watchlist is None:
+            raise ApiError(503, "自选服务未配置")
+        return deps.watchlist
+
+    def trading_list_store() -> TradingListStore:
+        if deps.trading_list is None:
+            raise ApiError(503, "交易名单服务未配置")
+        return deps.trading_list
+
+    def approval_store() -> ApprovalQueue:
+        if deps.approvals is None:
+            raise ApiError(503, "待审批队列未配置")
+        return deps.approvals
+
+    @app.get(f"{API_PREFIX}/watchlist", responses=ERRORS)
+    def get_watchlist(_who: Who) -> WatchlistView:
+        w_store = watchlist_store()
+        delayed = deps.quote_delayed_map() if deps.quote_delayed_map is not None else None
+        entries = w_store.list_entries(quote_delayed_map=delayed)
+        t_snap = deps.trading_list.snapshot() if deps.trading_list is not None else None
+        active_cnt = len(t_snap.active) if t_snap is not None else 0
+        items: list[WatchlistItemView] = []
+        for entry in entries:
+            if t_snap is not None and entry.symbol in t_snap.active:
+                t_state = TradingListState.IN_TRADING_LIST
+            elif t_snap is not None and entry.symbol in t_snap.pending:
+                t_state = TradingListState.PENDING_CONFIRMATION
+            else:
+                t_state = TradingListState.WATCHLIST_ONLY
+            prof = deps.symbol_profiles(entry.symbol) if deps.symbol_profiles is not None else None
+            if prof is None:
+                eligible, reasons = False, ["缺少标的资格数据"]
+            else:
+                elig = check_eligibility(prof, current_count=active_cnt)
+                eligible, reasons = elig.eligible, list(elig.reasons)
+            items.append(
+                WatchlistItemView(
+                    symbol=entry.symbol,
+                    group_name=entry.group_name,
+                    tags=list(entry.tags),
+                    note=entry.note,
+                    updated_at=entry.updated_at.astimezone(UTC).isoformat(timespec="microseconds"),
+                    quote_status=entry.subscription_status.value,
+                    trading_state=t_state.value,
+                    eligible=eligible,
+                    eligibility_reasons=reasons,
+                )
+            )
+        return WatchlistView(items=items)
+
+    @app.post(f"{API_PREFIX}/watchlist", responses=ERRORS)
+    def upsert_watchlist(body: WatchlistUpsertRequest, who: Owner) -> WatchlistItemView:
+        w_store = watchlist_store()
+        _audit_required(deps.audit, "watchlist_upsert", who.name, {"symbol": body.symbol})
+        try:
+            entry = w_store.upsert(
+                body.symbol,
+                group_name=body.group_name,
+                tags=tuple(body.tags),
+                note=body.note,
+                actor=who.name,
+                at=datetime.now(UTC),
+            )
+        except WatchlistError as exc:
+            raise ApiError(422, str(exc)) from exc
+        t_state = (
+            deps.trading_list.state_of(entry.symbol)
+            if deps.trading_list is not None
+            else TradingListState.WATCHLIST_ONLY
+        )
+        return WatchlistItemView(
+            symbol=entry.symbol,
+            group_name=entry.group_name,
+            tags=list(entry.tags),
+            note=entry.note,
+            updated_at=entry.updated_at.astimezone(UTC).isoformat(timespec="microseconds"),
+            quote_status=entry.subscription_status.value,
+            trading_state=t_state.value,
+            eligible=False,
+            eligibility_reasons=["待资格核验"],
+        )
+
+    @app.delete(f"{API_PREFIX}/watchlist/{{symbol}}", responses=ERRORS)
+    def delete_watchlist(
+        who: Owner, symbol: Annotated[str, Path(pattern=r"^\S{1,32}$")]
+    ) -> WatchlistView:
+        w_store = watchlist_store()
+        _audit_required(deps.audit, "watchlist_remove", who.name, {"symbol": symbol})
+        try:
+            w_store.remove(symbol, actor=who.name, at=datetime.now(UTC))
+        except WatchlistError as exc:
+            raise ApiError(404, str(exc)) from exc
+        return get_watchlist(who)
+
+    @app.get(f"{API_PREFIX}/trading-list", responses=ERRORS)
+    def get_trading_list(_who: Who) -> TradingListView:
+        snap = trading_list_store().snapshot()
+        return TradingListView(active=sorted(snap.active), pending=sorted(snap.pending))
+
+    @app.post(f"{API_PREFIX}/trading-list/requests", responses=ERRORS)
+    def request_trading_list_add(body: TradingListAddRequest, who: Owner) -> TradingListView:
+        t_store = trading_list_store()
+        _audit_required(deps.audit, "trading_list_request_add", who.name, {"symbol": body.symbol})
+        prof = deps.symbol_profiles(body.symbol) if deps.symbol_profiles is not None else None
+        if prof is None:
+            raise ApiError(422, f"缺少 {body.symbol} 的合约与流动性资格数据")
+        try:
+            t_store.request_add(prof, actor=who.name, reason=body.reason, at=datetime.now(UTC))
+        except TradingListError as exc:
+            raise ApiError(409, str(exc)) from exc
+        snap = t_store.snapshot()
+        return TradingListView(active=sorted(snap.active), pending=sorted(snap.pending))
+
+    @app.post(f"{API_PREFIX}/trading-list/requests/{{symbol}}/confirm", responses=ERRORS)
+    def confirm_trading_list_add(
+        body: TradingListConfirmRequest,
+        who: Owner,
+        symbol: Annotated[str, Path(pattern=r"^\S{1,32}$")],
+    ) -> TradingListView:
+        t_store = trading_list_store()
+        _audit_required(deps.audit, "trading_list_confirm_add", who.name, {"symbol": symbol})
+        try:
+            snap = t_store.confirm_add(
+                symbol,
+                actor=who.name,
+                confirmation_phrase=body.confirmation_phrase,
+                at=datetime.now(UTC),
+            )
+        except TradingListError as exc:
+            raise ApiError(403, str(exc)) from exc
+        return TradingListView(active=sorted(snap.active), pending=sorted(snap.pending))
+
+    @app.post(f"{API_PREFIX}/trading-list/requests/{{symbol}}/cancel", responses=ERRORS)
+    def cancel_trading_list_pending(
+        body: TradingListReasonRequest,
+        who: Owner,
+        symbol: Annotated[str, Path(pattern=r"^\S{1,32}$")],
+    ) -> TradingListView:
+        t_store = trading_list_store()
+        _audit_required(deps.audit, "trading_list_cancel_pending", who.name, {"symbol": symbol})
+        try:
+            snap = t_store.cancel_pending(
+                symbol, actor=who.name, reason=body.reason, at=datetime.now(UTC)
+            )
+        except TradingListError as exc:
+            raise ApiError(409, str(exc)) from exc
+        return TradingListView(active=sorted(snap.active), pending=sorted(snap.pending))
+
+    @app.post(f"{API_PREFIX}/trading-list/{{symbol}}/remove", responses=ERRORS)
+    def remove_from_trading_list(
+        body: TradingListReasonRequest,
+        who: Owner,
+        symbol: Annotated[str, Path(pattern=r"^\S{1,32}$")],
+    ) -> TradingListView:
+        t_store = trading_list_store()
+        _audit_required(deps.audit, "trading_list_remove", who.name, {"symbol": symbol})
+        try:
+            snap = t_store.remove(symbol, actor=who.name, reason=body.reason, at=datetime.now(UTC))
+        except TradingListError as exc:
+            raise ApiError(409, str(exc)) from exc
+        return TradingListView(active=sorted(snap.active), pending=sorted(snap.pending))
+
+    @app.get(f"{API_PREFIX}/approvals", responses=ERRORS)
+    def list_approvals(_who: Who, pending_only: bool = True) -> ApprovalListView:
+        q = approval_store()
+        status_filter = ApprovalStatus.PENDING if pending_only else None
+        return ApprovalListView(
+            items=[_approval_view(it) for it in q.list_items(status=status_filter)]
+        )
+
+    @app.post(f"{API_PREFIX}/approvals/{{approval_id}}/decide", responses=ERRORS)
+    def decide_approval(
+        body: ApprovalDecisionRequest,
+        who: Owner,
+        approval_id: Annotated[str, Path(pattern=r"^\S{1,64}$")],
+    ) -> ApprovalItemView:
+        q = approval_store()
+        _audit_required(
+            deps.audit,
+            "approval_decide",
+            who.name,
+            {"approval_id": approval_id, "approve": str(body.approve)},
+        )
+        try:
+            item = q.decide(
+                approval_id,
+                approve=body.approve,
+                actor_role=who.role.value,
+                actor_name=who.name,
+                reason=body.reason,
+                at=datetime.now(UTC),
+            )
+        except ApprovalError as exc:
+            raise ApiError(409, str(exc)) from exc
+        return _approval_view(item)
+
     @app.websocket(f"{API_PREFIX}/stream")
     async def stream(ws: WebSocket) -> None:
         await ws.accept()
@@ -699,6 +920,27 @@ def _to_evidence(payload: StrategyEvidencePayload | None) -> Evidence | None:
         evaluation_id=payload.evaluation_id,
         gate_report_id=payload.gate_report_id,
         exit_conditions=payload.exit_conditions,
+    )
+
+
+def _approval_view(it: ApprovalItem) -> ApprovalItemView:
+    return ApprovalItemView(
+        approval_id=it.approval_id,
+        kind=it.kind.value,
+        title=it.title,
+        summary=it.summary,
+        proposer=it.proposer,
+        payload=dict(it.payload),
+        status=it.status.value,
+        created_at=it.created_at.astimezone(UTC).isoformat(timespec="microseconds"),
+        expires_at=it.expires_at.astimezone(UTC).isoformat(timespec="microseconds"),
+        decided_by=it.decided_by,
+        decided_at=(
+            it.decided_at.astimezone(UTC).isoformat(timespec="microseconds")
+            if it.decided_at is not None
+            else None
+        ),
+        decision_reason=it.decision_reason,
     )
 
 

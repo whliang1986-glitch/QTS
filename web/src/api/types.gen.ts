@@ -23,6 +23,30 @@ export interface AlertView {
   resolved_at: string | null;
 }
 
+export interface ApprovalDecisionRequest {
+  approve: boolean;
+  reason?: string;
+}
+
+export interface ApprovalItemView {
+  approval_id: string;
+  kind: string;
+  title: string;
+  summary: string;
+  proposer: string;
+  payload: Record<string, unknown>;
+  status: string;
+  created_at: string;
+  expires_at: string;
+  decided_by: string | null;
+  decided_at: string | null;
+  decision_reason: string;
+}
+
+export interface ApprovalListView {
+  items: ApprovalItemView[];
+}
+
 export interface AuditEntry {
   seq: number;
   at: string;
@@ -263,6 +287,47 @@ export interface StreamStatus {
 export type Tier = "control" | "high";
 
 export type TimeInForce = "DAY" | "GTD" | "GTC";
+
+export interface TradingListAddRequest {
+  symbol: string;
+  reason: string;
+}
+
+export interface TradingListConfirmRequest {
+  confirmation_phrase: string;
+}
+
+export interface TradingListReasonRequest {
+  reason: string;
+}
+
+export interface TradingListView {
+  active: string[];
+  pending: string[];
+}
+
+export interface WatchlistItemView {
+  symbol: string;
+  group_name: string;
+  tags: string[];
+  note: string;
+  updated_at: string;
+  quote_status: string;
+  trading_state: string;
+  eligible: boolean;
+  eligibility_reasons: string[];
+}
+
+export interface WatchlistUpsertRequest {
+  symbol: string;
+  group_name?: string;
+  tags?: string[];
+  note?: string;
+}
+
+export interface WatchlistView {
+  items: WatchlistItemView[];
+}
 
 export interface WhoAmI {
   name: string;

@@ -266,6 +266,77 @@ class StrategyArchiveResponse(Strict):
     archived_versions: list[str]
 
 
+# ---------- 自选与交易名单（S-14） ----------
+
+
+class WatchlistItemView(Strict):
+    symbol: str
+    group_name: str
+    tags: list[str]
+    note: str
+    updated_at: str
+    quote_status: str
+    trading_state: str
+    eligible: bool
+    eligibility_reasons: list[str]
+
+
+class WatchlistView(Strict):
+    items: list[WatchlistItemView]
+
+
+class WatchlistUpsertRequest(Strict):
+    symbol: str = Field(min_length=1, max_length=32, pattern=r"^\S+$")
+    group_name: str = Field(default="default", max_length=64)
+    tags: list[str] = Field(default_factory=list, max_length=16)
+    note: str = Field(default="", max_length=500)
+
+
+class TradingListView(Strict):
+    active: list[str]
+    pending: list[str]
+
+
+class TradingListReasonRequest(Strict):
+    reason: str = Field(min_length=1, max_length=500, pattern=r"\S")
+
+
+class TradingListAddRequest(Strict):
+    symbol: str = Field(min_length=1, max_length=32, pattern=r"^\S+$")
+    reason: str = Field(min_length=1, max_length=500, pattern=r"\S")
+
+
+class TradingListConfirmRequest(Strict):
+    confirmation_phrase: str = Field(min_length=1, max_length=128)
+
+
+# ---------- 待审批队列（S-10） ----------
+
+
+class ApprovalItemView(Strict):
+    approval_id: str
+    kind: str
+    title: str
+    summary: str
+    proposer: str
+    payload: dict[str, Any]
+    status: str
+    created_at: str
+    expires_at: str
+    decided_by: str | None
+    decided_at: str | None
+    decision_reason: str
+
+
+class ApprovalListView(Strict):
+    items: list[ApprovalItemView]
+
+
+class ApprovalDecisionRequest(Strict):
+    approve: bool
+    reason: str = Field(default="", max_length=500)
+
+
 # ---------- WebSocket 消息（/v1/stream） ----------
 
 
@@ -309,6 +380,9 @@ __all__ = (
     "AckResponse",
     "AlertList",
     "AlertView",
+    "ApprovalDecisionRequest",
+    "ApprovalItemView",
+    "ApprovalListView",
     "AuditEntry",
     "AuditList",
     "CommandCatalog",
@@ -336,5 +410,12 @@ __all__ = (
     "StreamHello",
     "StreamOrderEvent",
     "StreamStatus",
+    "TradingListAddRequest",
+    "TradingListConfirmRequest",
+    "TradingListReasonRequest",
+    "TradingListView",
+    "WatchlistItemView",
+    "WatchlistUpsertRequest",
+    "WatchlistView",
     "WhoAmI",
 )
