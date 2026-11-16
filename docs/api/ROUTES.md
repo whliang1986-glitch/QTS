@@ -21,4 +21,10 @@
 | POST | /v1/diagnostics/previews | 生成诊断包并预览全部内容（仅 owner，写审计） | 运维排查（curl）；网页诊断页 | tests/integration/app/test_diagnostics_api.py | 否 | S-09b（网页在 S-09c） |
 | GET | /v1/diagnostics/previews/{preview_id}/archive | 下载预览过的那一份 zip（仅 owner，写审计） | 运维排查（curl）；网页诊断页 | tests/integration/app/test_diagnostics_api.py | 否 | S-09b（网页在 S-09c） |
 | GET | /v1/reports/daily | 某 UTC 日期的日终报告（JSON 与 Markdown，仅 owner，只读） | 日终复盘（curl）；G6 日报 | tests/integration/app/test_daily_report.py | 否 | S-09d |
+| GET | /v1/strategies | 策略库版本列表（默认不含已归档） | 策略中心页与运维查询 | tests/integration/storage/test_strategy_registry.py | 否 | T-09b / S-05 |
+| POST | /v1/strategies | 新建候选策略版本（IDEA 阶段，仅 owner） | 策略中心页 | tests/integration/storage/test_strategy_registry.py | 否 | T-09b / S-05 |
+| POST | /v1/strategies/{strategy_id}/versions/{version}/promote | 逐级晋级策略版本（核验实验与门禁证据，仅 owner） | 策略中心页 | tests/integration/storage/test_strategy_registry.py | 否 | T-09b / S-05 |
+| POST | /v1/strategies/{strategy_id}/versions/{version}/stop | 停用策略版本（立即生效，仅 owner） | 策略中心页 | tests/integration/storage/test_strategy_registry.py | 否 | T-09b / S-05 |
+| POST | /v1/strategies/{strategy_id}/versions/{version}/resume | 恢复已停用策略版本（PAPER 及之后须附门禁报告，仅 owner） | 策略中心页 | tests/integration/storage/test_strategy_registry.py | 否 | T-09b / S-05 |
+| POST | /v1/strategies/{strategy_id}/archive | 归档隐藏整个策略（须先停用全部版本，ID 不可复用，仅 owner） | 策略中心页 | tests/integration/storage/test_strategy_registry.py | 否 | T-09b / S-05 |
 | WS | /v1/stream | 状态与订单事件推送 | 网页从轮询改为推送 | tests/unit/api/test_app.py | 否 | S-05（实时推送） |

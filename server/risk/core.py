@@ -98,11 +98,13 @@ class TradingCore:
         actor: str = "tradingd",
         intent_max_age: timedelta | None = None,
         session_day: Callable[[datetime], date] | None = None,
+        strategy_allowed: Callable[[str, str, Mode], bool] | None = None,
     ) -> None:
         if intent_max_age is not None and intent_max_age <= timedelta(0):
             raise ValueError("intent_max_age 必须为正")
         self._intent_max_age = intent_max_age
         self._session_day = session_day
+        self._strategy_allowed = strategy_allowed
         self._repo = repo
         self._oms = oms
         self._modes = modes
@@ -173,6 +175,20 @@ class TradingCore:
             and self._modes.configured_mode() is not Mode.PAPER
         ):
             raise IntakeError("冒烟策略只能在模拟盘运行")
+        if self._strategy_allowed is not None:
+            mode = self._modes.configured_mode()
+            try:
+                allowed = mode is not None and self._strategy_allowed(
+                    intent.strategy_id, intent.strategy_version, mode
+                )
+            except Exception as exc:  # 失败即关闭
+                raise IntakeError(
+                    f"策略生命周期校验异常（{intent.strategy_id}:{intent.strategy_version}）"
+                ) from exc
+            if not allowed:
+                raise IntakeError(
+                    f"策略版本 {intent.strategy_id}:{intent.strategy_version} 未获准在当前模式交易"
+                )
         async with self._lock:
             # 已签发（交给过券商）的意图是重投：跳过过期检查，由风控按 intent_id 返回原决定，
             # 否则“已下单”会被回答成“已拒绝”（S-01c 第二轮评审 P1-A）。

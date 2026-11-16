@@ -65,6 +65,7 @@ class CoreInputs:
     # 交易日历：当日有效的意图跨时段作废。必填，不提供就装配不出交易核心（S-01d 评审 P1-1）
     session_day: Callable[[datetime], date]
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    strategy_allowed: Callable[[str, str, Mode], bool] | None = None
 
     def __post_init__(self) -> None:
         require_critical_components(self.components)
@@ -168,7 +169,7 @@ def _assemble(
         repo, om, modes, mode_config=inputs.mode_config, broker_account=broker.account,
         engine=engine, reconciler=reconciler, run_state=run_state, emergency=emergency,
         context=provider, clock=clock, actor=actor, intent_max_age=INTENT_MAX_AGE,
-        session_day=inputs.session_day,
+        session_day=inputs.session_day, strategy_allowed=inputs.strategy_allowed,
     )  # fmt: skip
     return Assembled(core, modes, run_state, reconciler)
 

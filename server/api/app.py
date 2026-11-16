@@ -25,7 +25,7 @@ import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Protocol
 
@@ -73,6 +73,13 @@ from server.api.models import (
     RevokeRequest,
     RevokeResponse,
     StatusView,
+    StrategyArchiveResponse,
+    StrategyCreateRequest,
+    StrategyEvidencePayload,
+    StrategyListView,
+    StrategyPromoteRequest,
+    StrategyReasonRequest,
+    StrategyVersionView,
     StreamAuth,
     StreamError,
     StreamHello,
@@ -88,11 +95,19 @@ from server.api.security import (
     TokenAdmin,
 )
 from server.domain.orders import Execution, OrderIntent
+from server.domain.strategy_lifecycle import (
+    Actor,
+    ActorKind,
+    Evidence,
+    LifecycleError,
+    StrategyRecord,
+)
 from server.guard.alerts import CODES, LANGS, Alert, Level, render
 from server.storage.alertsdb import StoredAlert
 from server.storage.apidb import ApiDbError, TokenNotFoundError
 from server.storage.ledger import LedgerRepository, OrderEventRow, OrderSummary
 from server.storage.logs import log_event
+from server.storage.strategy_registry import StrategyRegistry
 
 log = logging.getLogger(__name__)
 
@@ -193,6 +208,7 @@ class ApiDeps:
     audit_log: AuditLog | None = None
     diagnostics: DiagnosticsSource | None = None
     daily_reports: Callable[[date], DailyReportData] | None = None  # 未来的日期抛 ValueError
+    strategies: StrategyRegistry | None = None
     limiter: FailureLimiter = field(default_factory=FailureLimiter)
     confirmations: ConfirmationBook = field(default_factory=ConfirmationBook)
     stream_interval: float = 1.0  # 事件流轮询账本的间隔（秒）
@@ -485,6 +501,164 @@ def create_app(deps: ApiDeps) -> FastAPI:  # noqa: PLR0915 - 路由集中在一�
             data=dict(report.data), markdown=report.markdown,
         )  # fmt: skip
 
+    def strategy_store() -> StrategyRegistry:
+        if deps.strategies is None:
+            raise ApiError(503, "策略库未配置")
+        return deps.strategies
+
+    @app.get(f"{API_PREFIX}/strategies", responses=ERRORS)
+    def list_strategies(_who: Who, include_archived: bool = False) -> StrategyListView:
+        store = strategy_store()
+        try:
+            recs = store.list_records(include_archived=include_archived)
+        except Exception as exc:
+            log_event(log, logging.ERROR, "读取策略库失败", error=type(exc).__name__)
+            raise ApiError(503, "无法读取策略库") from exc
+        return StrategyListView(strategies=[_strategy_view(r) for r in recs])
+
+    @app.post(f"{API_PREFIX}/strategies", responses=ERRORS)
+    def create_strategy(body: StrategyCreateRequest, who: Owner) -> StrategyVersionView:
+        store = strategy_store()
+        _audit_required(
+            deps.audit,
+            "strategy_create",
+            who.name,
+            {"strategy_id": body.strategy_id, "version": body.version},
+        )
+        try:
+            rec = store.create_version(
+                strategy_id=body.strategy_id,
+                version=body.version,
+                code_hash=body.code_hash,
+                params_hash=body.params_hash,
+                actor=Actor(ActorKind.OWNER, who.name),
+                at=datetime.now(UTC),
+            )
+        except LifecycleError as exc:
+            raise ApiError(409, str(exc)) from exc
+        except Exception as exc:
+            log_event(log, logging.ERROR, "创建策略版本失败", error=type(exc).__name__)
+            raise ApiError(503, "写入策略库失败") from exc
+        return _strategy_view(rec)
+
+    @app.post(
+        f"{API_PREFIX}/strategies/{{strategy_id}}/versions/{{version}}/promote",
+        responses=ERRORS,
+    )
+    def promote_strategy(
+        body: StrategyPromoteRequest,
+        who: Owner,
+        strategy_id: Annotated[str, Path(pattern=r"^\S{1,64}$")],
+        version: Annotated[str, Path(pattern=r"^\S{1,64}$")],
+    ) -> StrategyVersionView:
+        store = strategy_store()
+        _audit_required(
+            deps.audit,
+            "strategy_promote",
+            who.name,
+            {"strategy_id": strategy_id, "version": version},
+        )
+        try:
+            rec = store.promote_version(
+                strategy_id=strategy_id,
+                version=version,
+                actor=Actor(ActorKind.OWNER, who.name),
+                at=datetime.now(UTC),
+                evidence=_to_evidence(body.evidence),
+            )
+        except LifecycleError as exc:
+            raise ApiError(409, str(exc)) from exc
+        except Exception as exc:
+            log_event(log, logging.ERROR, "晋级策略失败", error=type(exc).__name__)
+            raise ApiError(503, "写入策略库失败") from exc
+        return _strategy_view(rec)
+
+    @app.post(
+        f"{API_PREFIX}/strategies/{{strategy_id}}/versions/{{version}}/stop",
+        responses=ERRORS,
+    )
+    def stop_strategy(
+        body: StrategyReasonRequest,
+        who: Owner,
+        strategy_id: Annotated[str, Path(pattern=r"^\S{1,64}$")],
+        version: Annotated[str, Path(pattern=r"^\S{1,64}$")],
+    ) -> StrategyVersionView:
+        store = strategy_store()
+        _audit_required(
+            deps.audit, "strategy_stop", who.name, {"strategy_id": strategy_id, "version": version}
+        )
+        try:
+            rec = store.stop_version(
+                strategy_id=strategy_id,
+                version=version,
+                actor=Actor(ActorKind.OWNER, who.name),
+                at=datetime.now(UTC),
+                reason=body.reason,
+            )
+        except LifecycleError as exc:
+            raise ApiError(409, str(exc)) from exc
+        except Exception as exc:
+            log_event(log, logging.ERROR, "停用策略失败", error=type(exc).__name__)
+            raise ApiError(503, "写入策略库失败") from exc
+        return _strategy_view(rec)
+
+    @app.post(
+        f"{API_PREFIX}/strategies/{{strategy_id}}/versions/{{version}}/resume",
+        responses=ERRORS,
+    )
+    def resume_strategy(
+        body: StrategyPromoteRequest,
+        who: Owner,
+        strategy_id: Annotated[str, Path(pattern=r"^\S{1,64}$")],
+        version: Annotated[str, Path(pattern=r"^\S{1,64}$")],
+    ) -> StrategyVersionView:
+        store = strategy_store()
+        _audit_required(
+            deps.audit,
+            "strategy_resume",
+            who.name,
+            {"strategy_id": strategy_id, "version": version},
+        )
+        try:
+            rec = store.resume_version(
+                strategy_id=strategy_id,
+                version=version,
+                actor=Actor(ActorKind.OWNER, who.name),
+                at=datetime.now(UTC),
+                evidence=_to_evidence(body.evidence),
+            )
+        except LifecycleError as exc:
+            raise ApiError(409, str(exc)) from exc
+        except Exception as exc:
+            log_event(log, logging.ERROR, "恢复策略失败", error=type(exc).__name__)
+            raise ApiError(503, "写入策略库失败") from exc
+        return _strategy_view(rec)
+
+    @app.post(f"{API_PREFIX}/strategies/{{strategy_id}}/archive", responses=ERRORS)
+    def archive_strategy(
+        body: StrategyReasonRequest,
+        who: Owner,
+        strategy_id: Annotated[str, Path(pattern=r"^\S{1,64}$")],
+    ) -> StrategyArchiveResponse:
+        store = strategy_store()
+        _audit_required(deps.audit, "strategy_archive", who.name, {"strategy_id": strategy_id})
+        try:
+            archived = store.archive_strategy(
+                strategy_id=strategy_id,
+                actor=Actor(ActorKind.OWNER, who.name),
+                at=datetime.now(UTC),
+                reason=body.reason,
+            )
+        except LifecycleError as exc:
+            raise ApiError(409, str(exc)) from exc
+        except Exception as exc:
+            log_event(log, logging.ERROR, "归档策略失败", error=type(exc).__name__)
+            raise ApiError(503, "写入策略库失败") from exc
+        return StrategyArchiveResponse(
+            strategy_id=strategy_id,
+            archived_versions=[r.version for r in archived],
+        )
+
     @app.websocket(f"{API_PREFIX}/stream")
     async def stream(ws: WebSocket) -> None:
         await ws.accept()
@@ -497,6 +671,35 @@ def create_app(deps: ApiDeps) -> FastAPI:  # noqa: PLR0915 - 路由集中在一�
             await _close_with_error(ws, "事件流出错", 1011)
 
     return app
+
+
+def _strategy_view(rec: StrategyRecord) -> StrategyVersionView:
+    return StrategyVersionView(
+        strategy_id=rec.strategy_id,
+        version=rec.version,
+        code_hash=rec.code_hash,
+        params_hash=rec.params_hash,
+        stage=rec.stage.name,
+        enabled=rec.enabled,
+        archived=rec.archived,
+        created_by=f"{rec.created_by.kind.value}:{rec.created_by.name}",
+        updated_at=rec.updated_at.astimezone(UTC).isoformat(timespec="microseconds"),
+    )
+
+
+def _to_evidence(payload: StrategyEvidencePayload | None) -> Evidence | None:
+    if payload is None:
+        return None
+    return Evidence(
+        data_version=payload.data_version,
+        commit=payload.commit,
+        code_hash=payload.code_hash,
+        params_hash=payload.params_hash,
+        cost_model=payload.cost_model,
+        evaluation_id=payload.evaluation_id,
+        gate_report_id=payload.gate_report_id,
+        exit_conditions=payload.exit_conditions,
+    )
 
 
 def alert_view(item: StoredAlert) -> AlertView:

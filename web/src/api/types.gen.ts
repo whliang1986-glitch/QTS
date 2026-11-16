@@ -185,6 +185,53 @@ export interface StatusView {
   changed_by: string | null;
 }
 
+export interface StrategyArchiveResponse {
+  strategy_id: string;
+  archived_versions: string[];
+}
+
+export interface StrategyCreateRequest {
+  strategy_id: string;
+  version: string;
+  code_hash: string;
+  params_hash: string;
+}
+
+export interface StrategyEvidencePayload {
+  data_version: string;
+  commit: string;
+  code_hash: string;
+  params_hash: string;
+  cost_model: string;
+  evaluation_id: string;
+  gate_report_id?: string | null;
+  exit_conditions?: string | null;
+}
+
+export interface StrategyListView {
+  strategies: StrategyVersionView[];
+}
+
+export interface StrategyPromoteRequest {
+  evidence?: StrategyEvidencePayload | null;
+}
+
+export interface StrategyReasonRequest {
+  reason: string;
+}
+
+export interface StrategyVersionView {
+  strategy_id: string;
+  version: string;
+  code_hash: string;
+  params_hash: string;
+  stage: string;
+  enabled: boolean;
+  archived: boolean;
+  created_by: string;
+  updated_at: string;
+}
+
 export interface StreamAuth {
   type: "auth";
   token: string;

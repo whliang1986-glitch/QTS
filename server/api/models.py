@@ -216,6 +216,56 @@ class DailyReportView(Strict):
     markdown: str
 
 
+# ---------- 策略库与生命周期（T-09b） ----------
+
+
+class StrategyVersionView(Strict):
+    strategy_id: str
+    version: str
+    code_hash: str
+    params_hash: str
+    stage: str
+    enabled: bool
+    archived: bool
+    created_by: str
+    updated_at: str
+
+
+class StrategyListView(Strict):
+    strategies: list[StrategyVersionView]
+
+
+class StrategyCreateRequest(Strict):
+    strategy_id: str = Field(min_length=1, max_length=64, pattern=r"^\S+$")
+    version: str = Field(min_length=1, max_length=64, pattern=r"^\S+$")
+    code_hash: str = Field(min_length=1, max_length=128, pattern=r"^\S+$")
+    params_hash: str = Field(min_length=1, max_length=128, pattern=r"^\S+$")
+
+
+class StrategyEvidencePayload(Strict):
+    data_version: str = Field(min_length=1, max_length=128)
+    commit: str = Field(min_length=1, max_length=128)
+    code_hash: str = Field(min_length=1, max_length=128)
+    params_hash: str = Field(min_length=1, max_length=128)
+    cost_model: str = Field(min_length=1, max_length=128)
+    evaluation_id: str = Field(min_length=1, max_length=128)
+    gate_report_id: str | None = Field(default=None, max_length=128)
+    exit_conditions: str | None = Field(default=None, max_length=500)
+
+
+class StrategyPromoteRequest(Strict):
+    evidence: StrategyEvidencePayload | None = None
+
+
+class StrategyReasonRequest(Strict):
+    reason: str = Field(min_length=1, max_length=500, pattern=r"\S")
+
+
+class StrategyArchiveResponse(Strict):
+    strategy_id: str
+    archived_versions: list[str]
+
+
 # ---------- WebSocket 消息（/v1/stream） ----------
 
 
@@ -274,6 +324,13 @@ __all__ = (
     "OrderList",
     "OrderView",
     "StatusView",
+    "StrategyArchiveResponse",
+    "StrategyCreateRequest",
+    "StrategyEvidencePayload",
+    "StrategyListView",
+    "StrategyPromoteRequest",
+    "StrategyReasonRequest",
+    "StrategyVersionView",
     "StreamAuth",
     "StreamError",
     "StreamHello",
