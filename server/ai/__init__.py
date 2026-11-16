@@ -1,1 +1,63 @@
-"""ModelGateway、编排、知识库（M3）。不得 import broker。"""
+"""ModelGateway、编排、结构化协议、权限矩阵、知识库与评测集（A-01 ~ A-09）。"""
+
+from server.ai.gateway import (
+    BudgetPolicy,
+    GatewayError,
+    GatewayHealth,
+    ModelGateway,
+    ModelProvider,
+    ModelRequest,
+    ModelResponse,
+    ReplayCache,
+)
+from server.ai.orchestrator import (
+    TASK_REQUIRED_CAPABILITY,
+    AiOrchestrator,
+    EvalCase,
+    EvalSummary,
+    KnowledgeNote,
+    KnowledgeStore,
+    run_ai_eval_suite,
+)
+from server.ai.schemas import (
+    ALLOWED_AI_CAPABILITIES,
+    AiCapability,
+    AiError,
+    AiPermissionError,
+    Citation,
+    PromptInjectionError,
+    StructuredDecision,
+    TaskKind,
+    TradeSuggestion,
+    require_ai_capability,
+    sanitize_untrusted_text,
+)
+
+__all__ = (
+    "ALLOWED_AI_CAPABILITIES",
+    "TASK_REQUIRED_CAPABILITY",
+    "AiCapability",
+    "AiError",
+    "AiOrchestrator",
+    "AiPermissionError",
+    "BudgetPolicy",
+    "Citation",
+    "EvalCase",
+    "EvalSummary",
+    "GatewayError",
+    "GatewayHealth",
+    "KnowledgeNote",
+    "KnowledgeStore",
+    "ModelGateway",
+    "ModelProvider",
+    "ModelRequest",
+    "ModelResponse",
+    "PromptInjectionError",
+    "ReplayCache",
+    "StructuredDecision",
+    "TaskKind",
+    "TradeSuggestion",
+    "require_ai_capability",
+    "run_ai_eval_suite",
+    "sanitize_untrusted_text",
+)
