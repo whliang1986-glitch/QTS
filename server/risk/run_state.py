@@ -96,8 +96,15 @@ class RunStateMachine:
     ) -> None:
         """degraded_allowed：策略 → 它依赖的组件名；只有登记在这里的策略才可能在降级下运行。"""
         names = [c.name for c in components]
+        if not names:
+            raise ValueError("组件清单不能为空")
         if len(names) != len(set(names)):
             raise ValueError("组件名重复")
+        if any(
+            not isinstance(c.stale_after, timedelta) or c.stale_after <= timedelta(0)
+            for c in components
+        ):
+            raise ValueError("组件报告时效必须大于 0")
         unknown = {d for deps in degraded_allowed.values() for d in deps} - set(names)
         if unknown:
             raise ValueError(f"降级许可引用了未登记的组件：{sorted(unknown)}")

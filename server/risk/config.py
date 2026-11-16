@@ -14,7 +14,7 @@ config_version 不写在文件里，由加载器按文件内容哈希生成，�
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import timedelta
 
 from pydantic import ValidationError
@@ -40,8 +40,38 @@ def parse_mode_config(loaded: LoadedConfig) -> ModeConfig:
 
 _KINDS = {"DATA", "ACCOUNT", "OTHER"}
 _COMPONENT_KEYS = {"kind", "critical", "stale_after_seconds"}
-# 这些组件必须登记且为关键：配置文件不是受保护路径，不能靠改配置把 SAFE HALT 门禁关掉
-REQUIRED_CRITICAL = frozenset({"broker", "account_sync", "quotes"})
+# 这些组件必须登记、为关键且类别固定：配置文件不是受保护路径，不能靠改配置或类别关掉门禁
+REQUIRED_CRITICAL_KINDS: Mapping[str, Kind] = {
+    "broker": Kind.ACCOUNT,
+    "account_sync": Kind.ACCOUNT,
+    "quotes": Kind.DATA,
+}
+REQUIRED_CRITICAL = frozenset(REQUIRED_CRITICAL_KINDS)
+
+
+def require_critical_components(components: Collection[Component]) -> None:
+    """校验交易核心的关键组件清单（B-05x）：缺关键组件、降为非关键、类别被篡改或时效非法一律拒绝。"""
+    names = [c.name for c in components]
+    if len(names) != len(set(names)):
+        raise ValueError("组件名重复")
+    for c in components:
+        if not isinstance(c.kind, Kind) or not isinstance(c.critical, bool):
+            raise ValueError(f"组件 {c.name} 类别或 critical 不合法")
+        if not isinstance(c.stale_after, timedelta) or c.stale_after <= timedelta(0):
+            raise ValueError(f"组件 {c.name} 的 stale_after 必须大于 0")
+    by_name = {c.name: c for c in components}
+    missing = sorted(
+        name for name in REQUIRED_CRITICAL if name not in by_name or not by_name[name].critical
+    )
+    if missing:
+        raise ValueError(f"组件清单必须把这些组件登记为关键：{'、'.join(missing)}")
+    wrong_kind = sorted(
+        name
+        for name, expected in REQUIRED_CRITICAL_KINDS.items()
+        if by_name[name].kind is not expected
+    )
+    if wrong_kind:
+        raise ValueError(f"关键组件类别不合法：{'、'.join(wrong_kind)}")
 
 
 def parse_health_config(loaded: LoadedConfig) -> tuple[Component, ...]:
@@ -69,8 +99,8 @@ def parse_health_config(loaded: LoadedConfig) -> tuple[Component, ...]:
         if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0:
             raise ConfigError(f"{loaded.path} 的组件 {name} 的 stale_after_seconds 必须是正整数")
         components.append(Component(str(name), Kind(kind), critical, timedelta(seconds=seconds)))
-    critical = {c.name for c in components if c.critical}
-    missing = sorted(REQUIRED_CRITICAL - critical)
-    if missing:
-        raise ConfigError(f"{loaded.path} 必须把这些组件登记为关键：{'、'.join(missing)}")
+    try:
+        require_critical_components(components)
+    except ValueError as exc:
+        raise ConfigError(f"{loaded.path} {exc}") from None
     return tuple(components)

@@ -10,7 +10,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -29,10 +29,11 @@ from server.broker.ibkr.market_data import IbkrQuoteSource
 from server.domain.enums import OrderClass, Side
 from server.domain.order_state import OrderStatus
 from server.ipc.protocol import Role
-from server.risk.assembly import CoreInputs
+from server.risk.assembly import CoreInputs, build_trading_core
 from server.risk.config import parse_health_config
 from server.risk.context import QuoteSource
 from server.risk.reconcile import ADOPT_PHRASE, RECON_ACTION
+from server.risk.run_state import Kind
 from server.storage.config import load_toml
 
 from tests.integration.app.test_tradingd import CALENDAR, CHANNEL, Daemon
@@ -348,11 +349,22 @@ def test_a_demoted_or_missing_critical_component_is_refused(
 ) -> None:
     daemon = Wired(env, tmp_path)
     feeds = daemon.build_feeds()
+    valid = daemon.inputs()
     demoted = tuple(replace(c, critical=False) if c.name == name else c for c in COMPONENTS)
     missing = tuple(c for c in COMPONENTS if c.name != name)
-    for components in (demoted, missing):
+    wrong_kind = tuple(replace(c, kind=Kind.OTHER) if c.name == name else c for c in COMPONENTS)
+    bad_stale = tuple(
+        replace(c, stale_after=timedelta(0)) if c.name == name else c for c in COMPONENTS
+    )
+    for components in (demoted, missing, wrong_kind, bad_stale):
         with pytest.raises(ValueError, match=name):
             daemon.time.wire(replace(feeds, components=components), env.clock)
+        with pytest.raises(ValueError, match=name):
+            replace(valid, components=components)
+        bypassed = replace(valid)
+        object.__setattr__(bypassed, "components", components)
+        with pytest.raises(ValueError, match=name):
+            build_trading_core(env.repo, env.broker, bypassed)
 
 
 def _run_state() -> Mock:

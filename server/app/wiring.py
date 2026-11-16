@@ -24,7 +24,7 @@ from typing import Any
 
 from server.domain.instrument import Instrument
 from server.risk.assembly import CoreInputs
-from server.risk.config import REQUIRED_CRITICAL
+from server.risk.config import require_critical_components
 from server.risk.context import QuoteSource
 from server.risk.engine import StopCooldown
 from server.risk.mode_manager import ModeConfig
@@ -98,9 +98,7 @@ def core_inputs(
 
     组件清单为空或缺关键组件时，运行状态门禁等于没有：拒绝组装（与 parse_health_config 同一规则）。
     """
-    missing = sorted(REQUIRED_CRITICAL - {c.name for c in feeds.components if c.critical})
-    if missing:
-        raise ValueError(f"组件清单必须把这些组件登记为关键：{'、'.join(missing)}")
+    require_critical_components(feeds.components)
     return CoreInputs(
         mode_config=feeds.mode_config, instruments=feeds.instruments,
         components=feeds.components, parameters=feeds.parameters, quotes=feeds.quotes,

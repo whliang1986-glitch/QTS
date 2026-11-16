@@ -23,6 +23,7 @@ from typing import Any
 
 from server.domain.instrument import Instrument
 from server.oms.manager import OrderManager
+from server.risk.config import require_critical_components
 from server.risk.context import LedgerContextProvider, QuoteSource
 from server.risk.core import TradingCore
 from server.risk.emergency import EmergencyControls
@@ -63,6 +64,9 @@ class CoreInputs:
     session_day: Callable[[datetime], date]
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
+    def __post_init__(self) -> None:
+        require_critical_components(self.components)
+
 
 @dataclass(frozen=True)
 class Assembled:
@@ -74,6 +78,7 @@ class Assembled:
 
 def build_trading_core(repo: LedgerRepository, broker: Any, inputs: CoreInputs) -> Assembled:
     """按固定顺序接好交易核心。broker：已构造（可未连接）的券商适配器。"""
+    require_critical_components(inputs.components)
     clock = inputs.clock
     modes = ModeManager(repo, clock=clock)
 
