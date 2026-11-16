@@ -283,3 +283,17 @@ input.input::placeholder { color: var(--fg-3); }
   .who:empty { display: none; }
   .who { order: 10; width: 100%; }
 }
+
+/* ---------- 科幻表现层动效（S-16：仅当 data-motion="on" 且非减少动态效果时生效） ---------- */
+@media (prefers-reduced-motion: no-preference) {
+  :root[data-motion="on"] .card {
+    box-shadow: 0 0 0 1px rgba(106, 156, 245, 0.14), 0 8px 24px rgba(0, 0, 0, 0.25);
+    transition: border-color 180ms ease, box-shadow 180ms ease;
+  }
+  :root[data-motion="on"] .card:hover {
+    border-color: var(--brand);
+    box-shadow: 0 0 16px rgba(106, 156, 245, 0.22), 0 8px 24px rgba(0, 0, 0, 0.3);
+  }
+}
+/* 关键安全标识（模式徽章、HALT 横幅、断连提示）保持绝对静态清晰（S-16 原则 2） */
+.mode, .halt-band, .stale { animation: none !important; transition: none !important; }

@@ -9,6 +9,7 @@ const KEY = "qts.prefs";
 interface Prefs {
   theme?: Theme;
   lang?: Lang;
+  motion?: boolean;
 }
 
 function load(): Prefs {
@@ -16,7 +17,8 @@ function load(): Prefs {
     const raw = JSON.parse(localStorage.getItem(KEY) ?? "{}") as Record<string, unknown>;
     const theme = raw.theme === "dark" || raw.theme === "light" || raw.theme === "system" ? raw.theme : undefined;
     const lang = (LANGS as readonly unknown[]).includes(raw.lang) ? (raw.lang as Lang) : undefined;
-    return { theme, lang };
+    const motion = typeof raw.motion === "boolean" ? raw.motion : undefined;
+    return { theme, lang, motion };
   } catch {
     return {};
   }
@@ -62,4 +64,21 @@ export function useLangPref(): [Lang, (l: Lang) => void] {
     setStored(l);
   };
   return [lang, choose];
+}
+
+/** 动效开关（S-16）：遵守系统 prefers-reduced-motion，并允许应用内手动切换。 */
+export function useMotionPref(): [boolean, (enabled: boolean) => void] {
+  const [motion, setMotion] = useState<boolean>(() => {
+    const stored = load().motion;
+    if (stored !== undefined) return stored;
+    if (typeof window !== "undefined" && window.matchMedia) {
+      return !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    }
+    return true;
+  });
+  useEffect(() => {
+    document.documentElement.dataset.motion = motion ? "on" : "off";
+    save({ motion });
+  }, [motion]);
+  return [motion, setMotion];
 }

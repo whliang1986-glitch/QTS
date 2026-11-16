@@ -184,6 +184,19 @@ const zh = {
   "diag.download": "下载这一份",
   "diag.saved": "已交给浏览器下载；服务端已记入审计",
   "diag.badResponse": "服务端的回答格式不对",
+  "nav.intel": "情报与自选",
+  "nav.console": "指挥中枢",
+  "motion.label": "动态效果",
+  "motion.on": "动效开",
+  "motion.off": "静态",
+  "intel.researchOnly": "仅供研究，不触发下单",
+  "intel.researchHint": "页面没有任何下单或改仓控件；未核实或有争议的情报不进入影响排名。",
+  "intel.unavailable": "无法获取情报或自选数据",
+  "intel.watchlist": "自选与交易名单（三层隔离）",
+  "intel.approvals": "待审批队列",
+  "intel.emptyApprovals": "暂无待审批事项",
+  "intel.approve": "批准",
+  "intel.reject": "拒绝",
 } as const;
 
 export type MessageKey = keyof typeof zh;
@@ -363,6 +376,19 @@ const en: Messages = {
   "diag.download": "Download this copy",
   "diag.saved": "Handed to the browser to download; the server has recorded it in the audit log",
   "diag.badResponse": "the server's reply was not in the expected format",
+  "nav.intel": "Intel & Watchlist",
+  "nav.console": "Command Center",
+  "motion.label": "Visual motion",
+  "motion.on": "Motion On",
+  "motion.off": "Static",
+  "intel.researchOnly": "Research only — does not trigger orders",
+  "intel.researchHint": "There are no order or position controls here; unverified or disputed items are excluded from impact rankings.",
+  "intel.unavailable": "Unable to fetch intelligence or watchlist data",
+  "intel.watchlist": "Watchlist & Trading List (3-Layer Isolation)",
+  "intel.approvals": "Approval Queue",
+  "intel.emptyApprovals": "No pending approvals",
+  "intel.approve": "Approve",
+  "intel.reject": "Reject",
 };
 
 export const MESSAGES: Record<Lang, Messages> = { zh, en };

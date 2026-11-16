@@ -7,16 +7,18 @@ import { CommandStore } from "./commands";
 import { Alerts, Audit } from "./pages/Alerts";
 import { Diagnostics } from "./pages/Diagnostics";
 import { Emergency } from "./pages/Emergency";
+import { IntelWatchlist } from "./pages/IntelWatchlist";
 import { Showroom } from "./pages/Showroom";
 import { Orders, Overview, Positions, Risk, connectionText } from "./pages/Views";
 import { LangProvider, type MessageKey, useT } from "./i18n";
-import { type Theme, useLangPref, useTheme } from "./prefs";
+import { type Theme, useLangPref, useMotionPref, useTheme } from "./prefs";
 import { modeLabel, useStatus } from "./status";
 import { Button, Icon, type IconName, LangToggle, ModeBadge, Notice, Tag, ThemeToggle } from "./ui";
 import type { Lang } from "./i18n";
 
 const PAGES: readonly [string, MessageKey, IconName][] = [
   ["overview", "nav.overview", "overview"],
+  ["intel", "nav.intel", "overview"],
   ["orders", "nav.orders", "orders"],
   ["positions", "nav.positions", "positions"],
   ["risk", "nav.risk", "risk"],
@@ -31,6 +33,8 @@ interface Prefs {
   setTheme: (t: Theme) => void;
   lang: Lang;
   setLang: (l: Lang) => void;
+  motion: boolean;
+  setMotion: (m: boolean) => void;
 }
 
 function Login({ onLogin, prefs }: { onLogin: () => void; prefs: Prefs }) {
@@ -114,6 +118,10 @@ function Shell({ onLogout, prefs }: { onLogout: () => void; prefs: Prefs }) {
         </span>
         <LangToggle lang={prefs.lang} onChange={prefs.setLang} />
         <ThemeToggle theme={prefs.theme} onChange={prefs.setTheme} />
+        <Button kind="ghost" small onClick={() => prefs.setMotion(!prefs.motion)}
+          aria-pressed={prefs.motion} data-testid="motion-toggle">
+          {prefs.motion ? t("motion.on") : t("motion.off")}
+        </Button>
         <Button kind="ghost" small icon="logout" onClick={() => { setToken(null); onLogout(); }}>{t("top.logout")}</Button>
       </header>
       {mode === "HALT" ? (
@@ -141,6 +149,7 @@ function Shell({ onLogout, prefs }: { onLogout: () => void; prefs: Prefs }) {
       </nav>
       <main>
         {page === "overview" ? <Overview state={state} /> : null}
+        {page === "intel" ? <IntelWatchlist canApprove={who?.role === "owner"} /> : null}
         {page === "orders" ? <Orders /> : null}
         {page === "positions" ? <Positions /> : null}
         {page === "risk" ? <Risk state={state} /> : null}
@@ -169,7 +178,8 @@ export function App() {
   const hash = useHash();
   const [theme, setTheme] = useTheme(); // 主题与语言只在这里持有：登录页、陈列室、外壳共用
   const [lang, setLang] = useLangPref();
-  const prefs: Prefs = { theme, setTheme, lang, setLang };
+  const [motion, setMotion] = useMotionPref();
+  const prefs: Prefs = { theme, setTheme, lang, setLang, motion, setMotion };
   // CommandStore 在最外层：退出、令牌失效、打开陈列室再回来，结果未知的编号都还在（只在内存里）
   // 陈列室只在开发与测试构建里提供（正式构建不含示例页面）
   const showroom = import.meta.env.DEV && hash === "#showroom";
