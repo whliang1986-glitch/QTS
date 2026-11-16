@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 每周二定时全量跑一次：没有新提交时也能发现“写死日期遇到真实时钟”这类定时炸弹（S-01f、B-05 各出过一次）
+  schedule:
+    - cron: "0 2 * * 2"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -51,8 +55,41 @@ jobs:
       - name: 唯一下单出口与风控绕过扫描
         run: uv run python scripts/arch_scan.py
 
-      - name: pytest
+      # 覆盖率只是报告，没有门槛：只在 ubuntu 上统计，Windows 不再承担覆盖率插桩的开销
+      - name: pytest（含覆盖率）
+        if: runner.os == 'Linux'
         run: uv run pytest --cov --cov-report=term-missing
+
+      - name: pytest
+        if: runner.os != 'Linux'
+        run: uv run pytest
+
+  web:
+    name: 前端类型检查、构建与端到端测试
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    env:
+      PW_CHANNEL: chrome  # 用 runner 自带的 Chrome，不下载 Playwright 浏览器
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci --ignore-scripts
+
+      - name: 类型检查与正式构建
+        run: npm run build
+
+      # 视觉回归的截图基线是在 Windows 上生成的，Linux 字体渲染不同，这里不跑；本地 Windows 照常全跑
+      - name: Playwright（视觉回归除外）
+        run: npx playwright test --trace off --grep-invert "视觉回归"
 
   secret-scan:
     name: gitleaks 全历史扫描

@@ -43,17 +43,20 @@ server/            Python 服务端（单包 `server`）
   oms/ risk/       订单管理、风控与急停
   data/            DataProvider、日历、数据质量门禁
   strategy/ backtest/ ai/ api/ guard/
+  app/             装配层（进程入口、调度、接线、诊断包）：在依赖图顶端，其他层不得依赖它
+  platforms/       操作系统相关（进程间通道、锁）：只依赖标准库
 web/               React 客户端（S-04 起）
 config/            配置；config/risk、config/live 受保护（Dylan 专属）
-tests/             unit property integration fault arch
+tests/             unit property integration fault arch contract；共用辅助放 support
 scripts/           仓库工具脚本
-docs/              adr specs tasks runbooks gates
+docs/              adr specs tasks runbooks gates design hygiene
 .claude/           权限规则、钩子、子代理
 ```
 
 依赖规则（F-03，CI 与 pre-commit 强制）：
 - import-linter（`pyproject.toml` 的 `[tool.importlinter]`）：domain 不依赖其他层；strategy、ai、api 不依赖 broker
-  （含间接，共享类型放 domain）；只有 oms、guard、backtest、data 可以直接 import broker。
+  （含间接，共享类型放 domain）；只有 oms、guard、backtest、data、app 可以直接 import broker；
+  app 不得直接 import oms。
 - `scripts/arch_scan.py`：下单/改单只在 oms，撤单只在 oms 与 guard，禁止全局撤单；oms 提交入口只由 risk 调用；
   只有 risk、backtest 可 import oms；ib_async 只在 broker/ibkr。oms 以外反射只允许字面量直接调用
   （不要写 `getattr(x, name)`、`dir()`、`__dict__`）。受保护名（如 `cancel_order`）不要用作变量或枚举值。

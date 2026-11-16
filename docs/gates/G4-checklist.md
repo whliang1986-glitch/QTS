@@ -36,10 +36,10 @@
 | B-05 | IBKR 模拟盘下单 | PARTIALLY VERIFIED | 🔴 Dylan 取消勾选 Read-Only API；在模拟盘上跑契约套件（B-05 清单共 10 条） |
 | O-01 至 O-05 | 订单状态机、幂等、竞态、属性测试、崩溃恢复 | ACCEPTED | ✅（O-05 还要在模拟盘做崩溃恢复演练，见第 3 节） |
 | R-01、R-02、R-04 | 风控引擎、限额、默认禁用 | ACCEPTED | ✅ |
-| R-03 | 数据门禁 | IMPLEMENTED（待合并） | 🟡 核对合并记录 |
-| R-05 | 急停四级 | IMPLEMENTED（待合并） | 🟡 核对合并记录；做急停演练 |
-| R-07 | 对账 | IMPLEMENTED（待合并） | 🟡 核对合并记录；Flex Query 部分 BLOCKED |
-| R-08 | 运行状态机 | IMPLEMENTED（待合并） | 🟡 核对合并记录 |
+| R-03 | 数据门禁 | IMPLEMENTED（已合并 19421d6，待逐项验收） | 🟡 逐项验收 |
+| R-05 | 急停四级 | IMPLEMENTED（已合并 c964063，待逐项验收） | 🟡 逐项验收；做急停演练 |
+| R-07 | 对账 | IMPLEMENTED（已合并 ea04f2f，待逐项验收） | 🟡 逐项验收；Flex Query 部分 BLOCKED |
+| R-08 | 运行状态机 | IMPLEMENTED（已合并 4a62771，待逐项验收） | 🟡 逐项验收 |
 | D-01 | DataProvider 与 IBKR 历史数据 | IN REVIEW（D-01b：PARTIALLY VERIFIED） | 🔴 在 IBKR 上跑契约测试（D-01b 清单共 11 条） |
 | D-03 | 交易日历 | ACCEPTED | ✅ |
 | D-05 | 数据质量门禁 | IN REVIEW | 🟡 核对合并记录 |
@@ -53,6 +53,8 @@
 | T-02 | 基准策略 | IN REVIEW | 🟡 核对合并记录；在模拟盘端到端跑通 |
 
 > 上表把 O 组、R 组中同状态的任务合并成一行，加起来正好是 36 个 P0 任务。
+>
+> 交易核心的数据来源接线 B-05w 已合并（7ee2aa7），只接了 FakeBroker，**不是** IBKR 联调证据。生产入口接入真实券商之前，必须先处理 `docs/tasks/B-05w.md` 的残留风险表（监督器接入与 1100 处理、五个“不知道”的数据来源、news/model 组件、健康上报间隔等），并完成 B-05x（关键组件校验下沉到风控层，NOT STARTED）。
 
 ### 任务单状态核对（2026-11-05）
 
