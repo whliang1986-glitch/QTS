@@ -1,5 +1,6 @@
-"""回测引擎，复用 oms 与 risk（T-04）。"""
+"""回测引擎、成本模型、绩效稳健性、实验注册表与发布门禁（T-04 ~ T-08）。"""
 
+from server.backtest.costs import CostBreakdown, UsEtfCostModel
 from server.backtest.engine import (
     BACKTEST_COMPONENTS,
     BacktestConfig,
@@ -12,16 +13,73 @@ from server.backtest.engine import (
     run_backtest,
     vectorized_dual_momentum_reference,
 )
+from server.backtest.experiments import ExperimentRecord, ExperimentRegistry
+from server.backtest.metrics import (
+    ParameterRobustnessResult,
+    PerformanceSummary,
+    ReplayComparison,
+    TaxProfile,
+    YearlySubperiodResult,
+    compare_with_backtest_replay,
+    compute_60_40_monthly_navs,
+    compute_max_drawdown,
+    compute_spy_buy_hold_navs,
+    daily_returns_from_navs,
+    deflated_sharpe_psr,
+    evaluate_parameter_neighborhood,
+    evaluate_yearly_vs_60_40,
+    summarize_performance,
+)
+from server.backtest.release_gate import (
+    BacktestGateInput,
+    CapitalTier,
+    DecayAction,
+    DecayEvaluation,
+    GateCheckItem,
+    GateReport,
+    PaperForwardGateInput,
+    evaluate_backtest_gate,
+    evaluate_paper_forward_gate,
+    evaluate_strategy_decay,
+)
 
 __all__ = (
     "BACKTEST_COMPONENTS",
     "BacktestConfig",
     "BacktestError",
+    "BacktestGateInput",
     "BacktestResult",
+    "CapitalTier",
+    "CostBreakdown",
+    "DecayAction",
+    "DecayEvaluation",
     "DualMomentumStrategy",
     "EquityPoint",
+    "ExperimentRecord",
+    "ExperimentRegistry",
+    "GateCheckItem",
+    "GateReport",
     "LookaheadError",
+    "PaperForwardGateInput",
+    "ParameterRobustnessResult",
+    "PerformanceSummary",
     "ReferenceDay",
+    "ReplayComparison",
+    "TaxProfile",
+    "UsEtfCostModel",
+    "YearlySubperiodResult",
+    "compare_with_backtest_replay",
+    "compute_60_40_monthly_navs",
+    "compute_max_drawdown",
+    "compute_spy_buy_hold_navs",
+    "daily_returns_from_navs",
+    "deflated_sharpe_psr",
+    "evaluate_backtest_gate",
+    "evaluate_paper_forward_gate",
+    "evaluate_parameter_neighborhood",
+    "evaluate_strategy_decay",
+    "evaluate_yearly_vs_60_40",
     "run_backtest",
+    "summarize_performance",
     "vectorized_dual_momentum_reference",
 )
