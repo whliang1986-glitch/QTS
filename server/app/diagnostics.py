@@ -126,18 +126,26 @@ def _json(value: Any) -> str:
 
 def scrub_text(text: str) -> str:
     """一段文本：遮账户号，替换像密钥的 键=值、Bearer 令牌。"""
-
-    def key_value(m: re.Match[str]) -> str:
-        if not is_credential_key(m.group("key")):
-            return m.group(0)
-        value = m.group("value")
-        quote = value[0] if value[:1] in {'"', "'"} else ""  # 值原来带引号就保留引号
-        return f"{m.group('q')}{m.group('key')}{m.group('q')}{m.group('sep')}{quote}{MASK}{quote}"
-
     masked = _API_TOKEN.sub(MASK, mask_text(text))
     # 先遮 Bearer：否则 `token=Bearer abc` 的键值规则只遮到 `Bearer` 这个词，令牌本体会留下
     masked = _BEARER.sub(lambda m: f"{m.group(1)} {MASK}", masked)
-    return _KEY_VALUE.sub(key_value, masked)
+    out: list[str] = []
+    pos = 0
+    while (m := _KEY_VALUE.search(masked, pos)) is not None:
+        if not is_credential_key(m.group("key")):
+            # 非密钥键（如 `OSError: password=...` 的 `OSError:`）：只跳过键与分隔符，继续检查值内部
+            out.append(masked[pos : m.end("sep")])
+            pos = m.end("sep")
+            continue
+        value = m.group("value")
+        quote = value[0] if value[:1] in {'"', "'"} else ""  # 值原来带引号就保留引号
+        out.append(
+            f"{masked[pos : m.start()]}{m.group('q')}{m.group('key')}{m.group('q')}"
+            f"{m.group('sep')}{quote}{MASK}{quote}"
+        )
+        pos = m.end()
+    out.append(masked[pos:])
+    return "".join(out)
 
 
 def _scrub_line(line: str) -> str:
@@ -168,6 +176,15 @@ def _scrub_leaves(value: Any) -> Any:
     if isinstance(value, list):
         return [_scrub_leaves(v) for v in value]
     return scrub_text(value) if isinstance(value, str) else value
+
+
+def scrub_value(value: Any) -> Any:
+    """一份来源数据：按键脱敏、转成严格的 JSON 值，再把每个字符串过文本规则（与诊断包同一套）。"""
+    return _scrub_leaves(_plain(redact(value)))
+
+
+def safe_error(exc: BaseException) -> str:
+    return _safe_error(exc)
 
 
 def _safe_error(exc: BaseException) -> str:

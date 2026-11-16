@@ -20,4 +20,5 @@
 | GET | /v1/audit | apid 审计记录（仅 owner，可翻页） | 网页审计日志页 | tests/unit/api/test_alerts_api.py | 是 | S-05a |
 | POST | /v1/diagnostics/previews | 生成诊断包并预览全部内容（仅 owner，写审计） | 运维排查（curl）；网页诊断页 | tests/integration/app/test_diagnostics_api.py | 否 | S-09b（网页在 S-09c） |
 | GET | /v1/diagnostics/previews/{preview_id}/archive | 下载预览过的那一份 zip（仅 owner，写审计） | 运维排查（curl）；网页诊断页 | tests/integration/app/test_diagnostics_api.py | 否 | S-09b（网页在 S-09c） |
+| GET | /v1/reports/daily | 某 UTC 日期的日终报告（JSON 与 Markdown，仅 owner，只读） | 日终复盘（curl）；G6 日报 | tests/integration/app/test_daily_report.py | 否 | S-09d |
 | WS | /v1/stream | 状态与订单事件推送 | 网页从轮询改为推送 | tests/unit/api/test_app.py | 否 | S-05（实时推送） |

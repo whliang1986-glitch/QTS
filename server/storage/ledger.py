@@ -155,6 +155,16 @@ class ModeChange:
     actor: str
 
 
+def _mode_change(row: Any) -> ModeChange:
+    return ModeChange(
+        row.change_id,
+        Mode(row.mode),
+        HaltState.model_validate_json(row.halt),
+        row.changed_at,
+        row.actor,
+    )
+
+
 class LedgerRepository:
     """ledger.db 的唯一访问入口。只追加、只查询。"""
 
@@ -325,6 +335,18 @@ class LedgerRepository:
 
     def recent_orders(self, limit: int) -> list[OrderSummary]:
         """最近的意图（按生成时间从新到旧）及各自最新状态；单条查询，读到同一时刻的状态。"""
+        return self._order_summaries(limit)
+
+    def orders_created_between(
+        self, start: datetime, end: datetime, limit: int
+    ) -> list[OrderSummary]:
+        """[start, end) 内生成的意图及各自最新状态（从新到旧）；调用方按返回条数判断是否被截断。"""
+        o = schema.orders
+        return self._order_summaries(
+            limit, o.c.created_at >= _iso(start), o.c.created_at < _iso(end)
+        )
+
+    def _order_summaries(self, limit: int, *where: Any) -> list[OrderSummary]:
         if not 1 <= limit <= MAX_VIEW_ROWS:
             raise StorageError(f"limit 必须在 1 到 {MAX_VIEW_ROWS} 之间")
         o, ev = schema.orders, schema.order_events
@@ -339,6 +361,7 @@ class LedgerRepository:
             select(o.c.payload, ev.c.status, ev.c.occurred_at)
             .select_from(o)
             .outerjoin(ev, ev.c.seq == latest)
+            .where(*where)
             .order_by(o.c.created_at.desc(), o.c.intent_id.desc())
             .limit(limit)
         )
@@ -468,6 +491,27 @@ class LedgerRepository:
             select(e.c.payload)
             .where(e.c.intent_id == intent_id, ~superseded.exists())
             .order_by(e.c.executed_at, e.c.execution_id)
+        )
+        with self._reading("executions") as conn:
+            return [Execution.model_validate_json(p) for (p,) in conn.execute(stmt)]
+
+    def effective_executions_between(
+        self, start: datetime, end: datetime, limit: int
+    ) -> list[Execution]:
+        """[start, end) 内的有效成交（去掉被更正取代的）；调用方按返回条数判断是否被截断。"""
+        if not 1 <= limit <= MAX_VIEW_ROWS:
+            raise StorageError(f"limit 必须在 1 到 {MAX_VIEW_ROWS} 之间")
+        e, t = schema.executions, schema.execution_supersessions
+        superseded = select(t.c.superseded_execution_id).where(
+            t.c.superseded_execution_id == e.c.execution_id
+        )
+        stmt = (
+            select(e.c.payload)
+            .where(
+                e.c.executed_at >= _iso(start), e.c.executed_at < _iso(end), ~superseded.exists()
+            )
+            .order_by(e.c.executed_at, e.c.execution_id)
+            .limit(limit)
         )
         with self._reading("executions") as conn:
             return [Execution.model_validate_json(p) for (p,) in conn.execute(stmt)]
@@ -875,6 +919,24 @@ class LedgerRepository:
         with self._reading("audit_events") as conn:
             return [AuditEvent.model_validate_json(p) for (p,) in conn.execute(stmt)]
 
+    def audits_between(
+        self, action: str, start: datetime, end: datetime, limit: int
+    ) -> list[AuditEvent]:
+        """某类审计事件中 [start, end) 内发生的，按写入顺序从新到旧。"""
+        if not 1 <= limit <= MAX_VIEW_ROWS:
+            raise StorageError(f"limit 必须在 1 到 {MAX_VIEW_ROWS} 之间")
+        t = schema.audit_events
+        stmt = (
+            select(t.c.payload)
+            .where(
+                t.c.action == action, t.c.occurred_at >= _iso(start), t.c.occurred_at < _iso(end)
+            )
+            .order_by(t.c.seq.desc())
+            .limit(limit)
+        )
+        with self._reading("audit_events") as conn:
+            return [AuditEvent.model_validate_json(p) for (p,) in conn.execute(stmt)]
+
     # ---------- 模式与急停 ----------
 
     def commit_mode_and_audits(
@@ -936,15 +998,30 @@ class LedgerRepository:
 
     def latest_mode(self) -> ModeChange | None:
         t = schema.mode_changes
-        stmt = select(t).order_by(t.c.seq.desc()).limit(1)
+        return self._first_mode(select(t).order_by(t.c.seq.desc()).limit(1))
+
+    def latest_mode_before(self, at: datetime) -> ModeChange | None:
+        """at 之前最后一次模式变更（某一时刻的模式）。"""
+        t = schema.mode_changes
+        return self._first_mode(
+            select(t).where(t.c.changed_at < _iso(at)).order_by(t.c.seq.desc()).limit(1)
+        )
+
+    def mode_changes_between(self, start: datetime, end: datetime, limit: int) -> list[ModeChange]:
+        """[start, end) 内的模式变更，按写入顺序从旧到新。"""
+        if not 1 <= limit <= MAX_VIEW_ROWS:
+            raise StorageError(f"limit 必须在 1 到 {MAX_VIEW_ROWS} 之间")
+        t = schema.mode_changes
+        stmt = (
+            select(t)
+            .where(t.c.changed_at >= _iso(start), t.c.changed_at < _iso(end))
+            .order_by(t.c.seq)
+            .limit(limit)
+        )
+        with self._reading("mode_changes") as conn:
+            return [_mode_change(row) for row in conn.execute(stmt)]
+
+    def _first_mode(self, stmt: Any) -> ModeChange | None:
         with self._reading("mode_changes") as conn:
             row = conn.execute(stmt).first()
-            if row is None:
-                return None
-            return ModeChange(
-                row.change_id,
-                Mode(row.mode),
-                HaltState.model_validate_json(row.halt),
-                row.changed_at,
-                row.actor,
-            )
+            return None if row is None else _mode_change(row)

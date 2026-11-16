@@ -25,7 +25,7 @@ import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Protocol
 
@@ -33,7 +33,7 @@ from fastapi import Depends, FastAPI, Path, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBearer
-from pydantic import ValidationError
+from pydantic import BeforeValidator, ValidationError
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from server.api.auth import Authenticator, Principal, Role, bearer_token
@@ -59,6 +59,7 @@ from server.api.models import (
     CommandResponse,
     ConfirmationRequest,
     ConfirmationResponse,
+    DailyReportView,
     DiagnosticsFile,
     DiagnosticsPreview,
     ErrorResponse,
@@ -138,6 +139,37 @@ class PreviewBundle(Protocol):
     def preview(self) -> list[tuple[str, str]]: ...
 
 
+def _iso_date(value: Any) -> date:
+    if not isinstance(value, str) or len(value) != 10:
+        raise ValueError("日期必须是 YYYY-MM-DD")
+    return date.fromisoformat(value)
+
+
+IsoDate = Annotated[date, BeforeValidator(_iso_date)]
+
+
+class DailyReportData(Protocol):
+    """一份已脱敏的日终报告（server.app.daily_report.DailyReport）。"""
+
+    @property
+    def day(self) -> date: ...
+
+    @property
+    def generated_at(self) -> datetime: ...
+
+    @property
+    def final(self) -> bool: ...
+
+    @property
+    def complete(self) -> bool: ...
+
+    @property
+    def data(self) -> Mapping[str, Any]: ...
+
+    @property
+    def markdown(self) -> str: ...
+
+
 class DiagnosticsSource(Protocol):
     """诊断包的预览与下载（api 不依赖装配层，由 apid 注入 PreviewStore）。"""
 
@@ -160,6 +192,7 @@ class ApiDeps:
     acks: AckRequests | None = None
     audit_log: AuditLog | None = None
     diagnostics: DiagnosticsSource | None = None
+    daily_reports: Callable[[date], DailyReportData] | None = None  # 未来的日期抛 ValueError
     limiter: FailureLimiter = field(default_factory=FailureLimiter)
     confirmations: ConfirmationBook = field(default_factory=ConfirmationBook)
     stream_interval: float = 1.0  # 事件流轮询账本的间隔（秒）
@@ -432,6 +465,25 @@ def create_app(deps: ApiDeps) -> FastAPI:  # noqa: PLR0915 - 路由集中在一�
             "Content-Disposition": 'attachment; filename="qts-diagnostics.zip"',
             "Cache-Control": "no-store",
         })  # fmt: skip
+
+    @app.get(f"{API_PREFIX}/reports/daily", responses=ERRORS)
+    def daily_report(_who: Owner, day: IsoDate, response: Response) -> DailyReportView:
+        """某个 UTC 日期的日终报告（只读）。取不到的部分如实标出，不写成 0。"""
+        if deps.daily_reports is None:
+            raise ApiError(503, "日终报告不可用")
+        try:
+            report = deps.daily_reports(day)
+        except ValueError as exc:  # 这一天还没开始
+            raise ApiError(400, "这一天还没开始") from exc
+        except Exception as exc:
+            log_event(log, logging.ERROR, "生成日终报告失败", error=type(exc).__name__)
+            raise ApiError(503, "无法生成日终报告") from exc
+        response.headers["Cache-Control"] = "no-store"
+        return DailyReportView(
+            day=report.day.isoformat(), generated_at=report.generated_at.isoformat(),
+            final=report.final, complete=report.complete,
+            data=dict(report.data), markdown=report.markdown,
+        )  # fmt: skip
 
     @app.websocket(f"{API_PREFIX}/stream")
     async def stream(ws: WebSocket) -> None:

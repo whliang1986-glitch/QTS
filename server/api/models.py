@@ -207,6 +207,15 @@ class DiagnosticsPreview(Strict):
     errors: dict[str, str]  # 取数失败的来源 → 脱敏后的说明
 
 
+class DailyReportView(Strict):
+    day: str
+    generated_at: str
+    final: bool  # 这一天已经结束；否则数字还可能变化
+    complete: bool  # 全部取到，也没有被截断；否则缺的部分不等于 0
+    data: dict[str, Any]  # 已脱敏；取不到的部分是 null，原因在 errors 里
+    markdown: str
+
+
 # ---------- WebSocket 消息（/v1/stream） ----------
 
 

@@ -92,6 +92,13 @@ _ACTIVE = frozenset(
 )
 _RAW_TYPE = {BrokerOrderType.LIMIT: "LMT", BrokerOrderType.STOP: "STP"}
 _SATURDAY = 5
+_COST_PLACES = Decimal("1e-10")
+
+
+def _round_cost(cost: Decimal | None) -> Decimal | None:
+    if cost is None or -int(cost.as_tuple().exponent) <= 10:
+        return cost
+    return cost.quantize(_COST_PLACES)
 
 
 def next_weekday(executed_at: datetime) -> date:
@@ -280,8 +287,8 @@ class FakeBrokerServer:
                 account_id=self.account.account_id,
                 symbol=h.symbol,
                 quantity=h.quantity,
-                # 不含佣金（IBKR 的 avgCost 含佣金，R-07 对账时注意口径）
-                average_cost=h.average_cost,
+                # 不含佣金（IBKR 的 avgCost 含佣金，R-07 对账注意口径）；无限小数按 10 位取整
+                average_cost=_round_cost(h.average_cost),
                 as_of=now,
             )
             for h in self.ledger.positions()

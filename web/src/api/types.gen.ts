@@ -71,6 +71,15 @@ export interface ConfirmationResponse {
   expires_at: string;
 }
 
+export interface DailyReportView {
+  day: string;
+  generated_at: string;
+  final: boolean;
+  complete: boolean;
+  data: Record<string, unknown>;
+  markdown: string;
+}
+
 export interface DiagnosticsFile {
   name: string;
   content: string;

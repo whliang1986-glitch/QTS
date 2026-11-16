@@ -142,6 +142,51 @@ class ReconReport:
         return tuple(i for i in self.items if i.status is Status.UNEXPLAINED)
 
 
+@dataclass(frozen=True)
+class ReconRecord:
+    """账本里记下的一次对账结果（日终报告读取用）。"""
+
+    recon_id: str
+    kind: ReconKind
+    at: datetime
+    clean: bool
+    settled: bool
+    items: tuple[Mapping[str, str], ...]
+
+
+def _parse_bool(value: str, field: str) -> bool:
+    if value == "True":
+        return True
+    if value == "False":
+        return False
+    raise ValueError(f"对账记录字段 {field} 非法布尔值：{value!r}")
+
+
+def recon_records_between(
+    repo: LedgerRepository, start: datetime, end: datetime, limit: int
+) -> list[ReconRecord]:
+    """[start, end) 内的对账记录，从新到旧。只读；记录读不懂时报错，由调用方如实标注。"""
+    records = []
+    for audit in repo.audits_between(RECON_ACTION, start, end, limit):
+        detail = {k: json.loads(v) for k, v in audit.detail}
+        if not isinstance(detail.get("recon_id"), str) or not isinstance(detail.get("items"), str):
+            raise ValueError("对账记录字段类型非法")
+        raw_items = json.loads(detail["items"])
+        if not isinstance(raw_items, list):
+            raise ValueError("对账记录 items 必须是列表")
+        records.append(
+            ReconRecord(
+                recon_id=detail["recon_id"],
+                kind=ReconKind(detail["kind"]),
+                at=audit.occurred_at,
+                clean=_parse_bool(detail["clean"], "clean"),
+                settled=_parse_bool(detail["settled"], "settled"),
+                items=tuple(raw_items),
+            )
+        )
+    return records
+
+
 class CorporateAction(ValueModel):
     """公司行动事件（D-04 提供）：每 denominator 股变为 numerator 股。
 
@@ -711,7 +756,9 @@ __all__ = (
     "ExecutionSource",
     "ReconError",
     "ReconKind",
+    "ReconRecord",
     "ReconReport",
     "Reconciler",
     "Status",
+    "recon_records_between",
 )

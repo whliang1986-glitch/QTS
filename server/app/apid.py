@@ -29,6 +29,7 @@ from server.api.auth import Authenticator
 from server.api.commands import CommandClient, IpcCommandGateway
 from server.api.security import Audit, ConfirmationBook, TokenAdmin, TokenAuthenticator
 from server.app.common import LOCK_WAIT_SECONDS, acquire_lock
+from server.app.daily_report import build_daily_report
 from server.app.diagnostics import Bundle, PreviewStore, build_bundle
 from server.app.supervisor import EXIT_BUSY, EXIT_OK, EXIT_REFUSED
 from server.ipc.protocol import Role
@@ -174,6 +175,7 @@ def build_apid_app(  # noqa: PLR0913 - 装配入口，依赖显式传入
         acks=db,
         audit_log=db,
         diagnostics=PreviewStore(diagnostics_builder(settings, ledger, alerts, db)),
+        daily_reports=lambda day: build_daily_report(day, ledger=ledger, alerts=alerts),
         confirmations=ConfirmationBook(ttl=settings.confirmation_ttl),
     )
     return create_app(deps)
