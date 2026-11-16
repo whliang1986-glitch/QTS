@@ -19,8 +19,10 @@ from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
+from server.domain.enums import Mode
 from server.domain.instrument import Instrument
 from server.oms.manager import OrderManager
 from server.risk.config import require_critical_components
@@ -77,14 +79,57 @@ class Assembled:
 
 
 def build_trading_core(repo: LedgerRepository, broker: Any, inputs: CoreInputs) -> Assembled:
-    """按固定顺序接好交易核心。broker：已构造（可未连接）的券商适配器。"""
+    """按固定顺序接好交易核心（生产 / tradingd）。broker：已构造（可未连接）的券商适配器。"""
     require_critical_components(inputs.components)
+    modes = ModeManager(repo, clock=inputs.clock)
+    return _assemble(repo, broker, inputs, modes=modes, actor=ACTOR)
+
+
+def build_backtest_core(
+    repo: LedgerRepository,
+    broker: Any,
+    inputs: CoreInputs,
+    *,
+    ledger_path: Path,
+    process_role: str = "workerd",
+) -> Assembled:
+    """按方案 A（T-04，Dylan 批准）构造回测专用的交易核心。
+
+    三条约束必须同时成立才开启 Mode.BACKTEST 交易放行：
+    1. 进程角色是 workerd；
+    2. 券商适配器来自 server.broker.fake（SimBroker / FakeBroker），绝不接真实适配器；
+    3. 账本是临时回测库（文件名不得为 ledger.db，且与 repo 底层库一致）。
+    """
+    require_critical_components(inputs.components)
+    if process_role != "workerd":
+        raise ValueError("回测上下文只能在 workerd 进程构造")
+    if inputs.mode_config.requested_mode is not Mode.BACKTEST:
+        raise ValueError("回测上下文的 requested_mode 必须是 Mode.BACKTEST")
+    broker_mod = type(broker).__module__
+    if not broker_mod.startswith("server.broker.fake"):
+        raise ValueError(f"回测上下文只能连接模拟券商，拒绝 {broker_mod}")
+    if ledger_path.name.lower() == "ledger.db":
+        raise ValueError("回测上下文禁止使用 ledger.db，必须使用独立的临时账本")
+    db_file = repo.database_path()
+    if db_file is None or db_file != ledger_path.resolve() or db_file.name.lower() == "ledger.db":
+        raise ValueError("回测上下文的 ledger_path 与账本连接不一致")
+    modes = ModeManager(repo, clock=inputs.clock, allow_backtest_mode=True)
+    return _assemble(repo, broker, inputs, modes=modes, actor="workerd")
+
+
+def _assemble(
+    repo: LedgerRepository,
+    broker: Any,
+    inputs: CoreInputs,
+    *,
+    modes: ModeManager,
+    actor: str,
+) -> Assembled:
     clock = inputs.clock
-    modes = ModeManager(repo, clock=clock)
 
     def halt(reason: str) -> None:
         try:
-            modes.safe_halt(reason, actor=ACTOR)
+            modes.safe_halt(reason, actor=actor)
         except Exception as exc:  # 写不进去：ModeManager 已闩锁拒绝；只记日志
             log_event(log, logging.ERROR, "SAFE HALT 写入失败", error=type(exc).__name__)
 
@@ -105,12 +150,12 @@ def build_trading_core(repo: LedgerRepository, broker: Any, inputs: CoreInputs) 
     )  # fmt: skip
     reconciler = Reconciler(
         repo, om, modes, account=broker, broker_orders=broker, executions=broker,
-        corporate_actions=inputs.corporate_actions, clock=clock,
+        corporate_actions=inputs.corporate_actions, clock=clock, actor=actor,
     )  # fmt: skip
     run_state = RunStateMachine(
         repo, om, modes, components=inputs.components, rule_set=rule_set,
         reconciled=reconciler.last_clean, broker_window=inputs.broker_window,
-        degraded_allowed=inputs.degraded_allowed, clock=clock,
+        degraded_allowed=inputs.degraded_allowed, clock=clock, actor=actor,
     )  # fmt: skip
     engine = RiskEngine(
         repo, om, modes, rule_set=rule_set, context=provider, clock=clock,
@@ -122,10 +167,17 @@ def build_trading_core(repo: LedgerRepository, broker: Any, inputs: CoreInputs) 
     core = TradingCore(
         repo, om, modes, mode_config=inputs.mode_config, broker_account=broker.account,
         engine=engine, reconciler=reconciler, run_state=run_state, emergency=emergency,
-        context=provider, clock=clock, intent_max_age=INTENT_MAX_AGE,
+        context=provider, clock=clock, actor=actor, intent_max_age=INTENT_MAX_AGE,
         session_day=inputs.session_day,
     )  # fmt: skip
     return Assembled(core, modes, run_state, reconciler)
 
 
-__all__ = ("ACTOR", "INTENT_MAX_AGE", "Assembled", "CoreInputs", "build_trading_core")
+__all__ = (
+    "ACTOR",
+    "INTENT_MAX_AGE",
+    "Assembled",
+    "CoreInputs",
+    "build_backtest_core",
+    "build_trading_core",
+)

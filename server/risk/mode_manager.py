@@ -105,10 +105,16 @@ class ModeManager:
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         new_id: Callable[[], str] = lambda: uuid4().hex,
+        allow_backtest_mode: bool = False,
     ) -> None:
+        if type(allow_backtest_mode) is not bool:
+            raise ValueError("allow_backtest_mode 必须是 bool")
         self._repo = repo
         self._clock = clock
         self._new_id = new_id
+        self._trading_modes = (
+            frozenset({Mode.PAPER, Mode.BACKTEST}) if allow_backtest_mode else TRADING_MODES
+        )
         self._refused: str | None = None  # 进程内闩锁
         self._verified: tuple[ModeConfig, Account] | None = None
 
@@ -128,7 +134,7 @@ class ModeManager:
             raise TradingHaltedError("尚未完成启动校验，拒绝新增风险")
         if state.mode is Mode.HALT or state.halt.halted:
             raise TradingHaltedError(f"处于 HALT：{state.halt.reason}")
-        if state.mode not in TRADING_MODES:
+        if state.mode not in self._trading_modes:
             raise TradingHaltedError(f"{state.mode.value} 模式不允许新增风险")
 
     def risk_reducing_allowed(self) -> bool:
@@ -144,7 +150,7 @@ class ModeManager:
             if state is None:
                 return False
             if not state.halt.halted:
-                return state.mode in TRADING_MODES
+                return state.mode in self._trading_modes
             return not self._in_safe_halt()
         except Exception:  # 账本读不出来：不放行
             return False

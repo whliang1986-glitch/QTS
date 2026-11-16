@@ -189,6 +189,14 @@ class LedgerRepository:
         """健康检查（R-08）：迁移版本与全部只追加触发器都在；不完整抛 StorageError。"""
         self._require_intact()
 
+    def database_path(self) -> Path | None:
+        """返回底层 SQLite 主库文件的绝对路径（内存库返回 None）。"""
+        with self._reading("账本文件路径") as conn:
+            for _seq, name, file in conn.exec_driver_sql("PRAGMA database_list"):
+                if name == "main" and file:
+                    return Path(str(file)).resolve()
+        return None
+
     def _require_intact(self) -> None:
         with self._reading("账本版本") as conn:
             try:
